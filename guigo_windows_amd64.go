@@ -972,6 +972,9 @@ func windowProc(hwnd, msg, wparam, lparam uintptr) uintptr {
 // setup 注册资源与桥接并等待注入完成后导航
 // 返回: error 初始化错误
 func (n *nativeWindow) setup() error {
+	if err := n.initializeTitleBarZoom(); err != nil {
+		return err
+	}
 	if err := n.initializeWindowMaterial(); err != nil {
 		return err
 	}

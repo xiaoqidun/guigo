@@ -38,6 +38,26 @@ type titleBarButtonInfo struct {
 	Rects  [6]rect
 }
 
+// initializeTitleBarZoom 禁止内容标题栏模式的整页捏合缩放，保持网页与原生按钮对齐
+// 返回: error WebView接口或缩放设置错误
+func (n *nativeWindow) initializeTitleBarZoom() error {
+	if n.options.TitleBar != TitleBarContent {
+		return nil
+	}
+	var settings *comObject
+	if err := hresult(com(n.webview, 3, uintptr(unsafe.Pointer(&settings)))); err != nil {
+		return err
+	}
+	defer release(settings)
+	iid := guid("{183E7052-1D03-43A0-AB99-98E043B66B39}")
+	var settings5 *comObject
+	if err := hresult(com(settings, 0, uintptr(unsafe.Pointer(&iid)), uintptr(unsafe.Pointer(&settings5)))); err != nil {
+		return err
+	}
+	defer release(settings5)
+	return hresult(com(settings5, 30, 0))
+}
+
 // titleBarInfo 在宿主线程查询标题栏布局
 // 返回: TitleBarInfo 标题栏信息, error 查询错误
 func (n *nativeWindow) titleBarInfo() (info TitleBarInfo, err error) {

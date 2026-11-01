@@ -34,6 +34,7 @@ const (
 	// TitleBarSystem 使用系统标题栏，为默认值
 	TitleBarSystem TitleBarMode = iota
 	// TitleBarContent 将内容延伸到标题栏，保留系统窗口按钮
+	// Windows下禁用整页捏合缩放，避免内容与系统按钮错位
 	TitleBarContent
 )
 
