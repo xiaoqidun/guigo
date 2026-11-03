@@ -38,7 +38,7 @@ type titleBarButtonInfo struct {
 	Rects  [6]rect
 }
 
-// initializeTitleBarZoom 禁止内容标题栏模式的整页捏合缩放，保持网页与原生按钮对齐
+// initializeTitleBarZoom 禁止内容标题栏模式的浏览器缩放和捏合缩放，保持网页与原生按钮对齐
 // 返回: error WebView接口或缩放设置错误
 func (n *nativeWindow) initializeTitleBarZoom() error {
 	if n.options.TitleBar != TitleBarContent {
@@ -49,6 +49,9 @@ func (n *nativeWindow) initializeTitleBarZoom() error {
 		return err
 	}
 	defer release(settings)
+	if err := hresult(com(settings, 18, 0)); err != nil {
+		return err
+	}
 	iid := guid("{183E7052-1D03-43A0-AB99-98E043B66B39}")
 	var settings5 *comObject
 	if err := hresult(com(settings, 0, uintptr(unsafe.Pointer(&iid)), uintptr(unsafe.Pointer(&settings5)))); err != nil {
