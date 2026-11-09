@@ -166,7 +166,7 @@ func (n *nativeWindow) titleBarBounds() (int32, rect) {
 			}
 		}
 		if left >= 0 && left < client.Right && bottom > 0 && bottom <= height+n.titleBarBorder() {
-			width = client.Right - left
+			height, width = bottom, client.Right-left
 		}
 	}
 	height = min(max(0, client.Bottom), height)

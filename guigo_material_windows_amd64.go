@@ -108,8 +108,7 @@ func (n *nativeWindow) extendWindowFrame() error {
 	if n.options.WindowMaterial != WindowSolid {
 		margins = [4]int32{-1, -1, -1, -1}
 	} else if n.options.TitleBar == TitleBarContent {
-		height, _ := n.titleBarBounds()
-		margins[2] = height + n.titleBarOffset()
+		margins[2] = n.titleBarMetric(4) + n.titleBarBorder() + n.titleBarOffset()
 	}
 	hr, _, _ := dwmapi.NewProc("DwmExtendFrameIntoClientArea").Call(n.hwnd, uintptr(unsafe.Pointer(&margins)))
 	return hresult(hr)
