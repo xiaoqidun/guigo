@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build amd64 || arm64
+//go:build !android && (amd64 || arm64)
 
 package guigo
 
@@ -78,9 +78,12 @@ type nativeWindow struct {
 	dialogsPending                                   map[uintptr]*linuxDialog
 	nextDialog                                       uintptr
 	iconDir                                          string
+	iconData                                         []byte
+	trays                                            map[uintptr]*linuxTray
 	bridgeToken                                      string
 	source, startupTimer                             uint32
 	shown                                            bool
+	hidden                                           bool
 	err                                              error
 }
 
@@ -236,6 +239,7 @@ func runLinux(parent context.Context, o Options) error {
 	n.initTitleBar()
 	defer n.freeTitleBarColors()
 	if len(data) != 0 {
+		n.iconData = data
 		n.iconDir, err = linuxIconDirectory()
 		if err != nil {
 			return err
@@ -484,7 +488,9 @@ func linuxLoadedPage(view uintptr, event int32, data uintptr) {
 			if n.options.Maximized && !n.options.FixedSize {
 				gtk.Maximize(n.window)
 			}
-			gtk.Present(n.window)
+			if !n.hidden {
+				gtk.Present(n.window)
+			}
 		}
 		n.ready = true
 		events := n.pendingEvents
@@ -569,11 +575,21 @@ func linuxMessage(manager, value, data uintptr) {
 // 返回: error 请求投递错误
 func (n *nativeWindow) activate() error {
 	return n.enqueue(func() {
+		n.hidden = false
 		if !n.shown {
 			return
 		}
 		gtk.Unminimize(n.window)
 		gtk.Present(n.window)
+	})
+}
+
+// hide 隐藏窗口并保留首次加载前的显隐意图
+// 返回: error 请求投递错误
+func (n *nativeWindow) hide() error {
+	return n.enqueue(func() {
+		n.hidden = true
+		gtk.Visible(n.window, false)
 	})
 }
 
@@ -655,6 +671,9 @@ func (n *nativeWindow) shutdown() {
 		}
 	}
 	if first {
+		for _, tray := range n.trays {
+			tray.release()
+		}
 		linuxPrintOperations.Range(func(key, value any) bool {
 			if value.(*linuxPrintOperation).owner == n {
 				linuxEndPrint(key.(uintptr), ErrClosed)

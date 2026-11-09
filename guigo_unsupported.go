@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build !(windows && amd64) && !(linux && (amd64 || arm64))
+//go:build !(windows && amd64) && !(linux && !android && (amd64 || arm64))
 
 package guigo
 
@@ -31,6 +31,12 @@ func SupportsWindowMaterial(material WindowMaterial) bool {
 // activate 返回未适配平台错误
 // 返回: error 平台错误
 func (n *nativeWindow) activate() error {
+	return ErrUnsupportedPlatform
+}
+
+// hide 返回未适配平台错误
+// 返回: error 平台错误
+func (n *nativeWindow) hide() error {
 	return ErrUnsupportedPlatform
 }
 

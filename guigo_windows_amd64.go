@@ -132,6 +132,9 @@ type nativeWindow struct {
 	dpi             uint32
 	iconData        []byte
 	icons           [2]uintptr
+	trays           map[uint32]*windowsTray
+	nextTrayID      uint32
+	activeTrayMenu  *windowsTray
 	environment     *comObject
 	controller      *comObject
 	webview         *comObject
@@ -148,6 +151,7 @@ type nativeWindow struct {
 	initializing    bool
 	ready           bool
 	shown           bool
+	hidden          bool
 	closing         bool
 	closePending    bool
 	closeRequested  bool
@@ -395,6 +399,9 @@ func run(parent context.Context, o Options) error {
 	}
 	defer func() {
 		n.cancel()
+		for _, tray := range n.trays {
+			tray.release()
+		}
 		var browser uintptr
 		if n.webview != nil {
 			var pid uint32
@@ -551,13 +558,33 @@ func run(parent context.Context, o Options) error {
 // 返回: error 请求投递错误
 func (n *nativeWindow) activate() error {
 	return n.enqueue(func() {
+		n.hidden = false
 		iconic, _, _ := user32.NewProc("IsIconic").Call(n.hwnd)
 		if iconic != 0 {
 			user32.NewProc("ShowWindow").Call(n.hwnd, 9)
-		} else if n.shown {
-			user32.NewProc("ShowWindow").Call(n.hwnd, 5)
+		} else if n.shown || n.ready {
+			n.show()
 		}
 		user32.NewProc("SetForegroundWindow").Call(n.hwnd)
+	})
+}
+
+// show 显示窗口并在首次显示时应用初始最大化配置
+func (n *nativeWindow) show() {
+	show := uintptr(5)
+	if !n.shown && n.options.Maximized && !n.options.FixedSize {
+		show = 3
+	}
+	n.shown = true
+	user32.NewProc("ShowWindow").Call(n.hwnd, show)
+}
+
+// hide 隐藏窗口并保留首次加载前的显隐意图
+// 返回: error 请求投递错误
+func (n *nativeWindow) hide() error {
+	return n.enqueue(func() {
+		n.hidden = true
+		user32.NewProc("ShowWindow").Call(n.hwnd, 0)
 	})
 }
 
@@ -661,6 +688,9 @@ func (n *nativeWindow) style() uintptr {
 // 入参: err 运行错误
 func (n *nativeWindow) fail(err error) {
 	n.err = err
+	if n.activeTrayMenu != nil {
+		n.activeTrayMenu.endMenu()
+	}
 	user32.NewProc("PostQuitMessage").Call(0)
 }
 
@@ -869,6 +899,9 @@ func (n *nativeWindow) resize() {
 func windowProc(hwnd, msg, wparam, lparam uintptr) uintptr {
 	n := active.Load()
 	if n != nil {
+		if n.trayProc(msg, wparam, lparam) {
+			return 0
+		}
 		if result, handled := n.titleBarProc(hwnd, msg, wparam, lparam); handled {
 			return result
 		}
@@ -1134,13 +1167,8 @@ func (n *nativeWindow) setup() error {
 			}
 			n.pendingEvents = nil
 		}
-		if !n.shown {
-			n.shown = true
-			show := uintptr(5)
-			if n.options.Maximized && !n.options.FixedSize {
-				show = 3
-			}
-			user32.NewProc("ShowWindow").Call(n.hwnd, show)
+		if !n.shown && !n.hidden {
+			n.show()
 		}
 		return 0
 	})
@@ -1148,6 +1176,9 @@ func (n *nativeWindow) setup() error {
 		return err
 	}
 	closed := n.callback("{5C19E9E0-092F-486B-AFFA-CA8231913039}", func(_ uintptr, args *comObject) uintptr {
+		if n.activeTrayMenu != nil {
+			n.activeTrayMenu.endMenu()
+		}
 		user32.NewProc("PostQuitMessage").Call(0)
 		return 0
 	})
@@ -1187,6 +1218,9 @@ func (n *nativeWindow) pixels(value int) int32 {
 
 // requestClose 异步检查宿主关闭条件，保留校验期间的新请求并触发浏览器beforeunload
 func (n *nativeWindow) requestClose() {
+	if n.activeTrayMenu != nil {
+		n.activeTrayMenu.endMenu()
+	}
 	if n.initializing {
 		n.cancel()
 		return
