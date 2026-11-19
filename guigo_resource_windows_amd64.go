@@ -17,9 +17,11 @@ package guigo
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"runtime"
 	"strings"
 	"sync"
@@ -178,23 +180,27 @@ func (w *resourceWriter) Write(b []byte) (int, error) {
 func (n *nativeWindow) resource(args *comObject) {
 	var request *comObject
 	if err := hresult(com(args, 3, uintptr(unsafe.Pointer(&request)))); err != nil {
-		n.fail(err)
+		n.reportError(err)
+		n.setResponse(args, nil, 500, "")
 		return
 	}
 	defer release(request)
 	uri, err := comString(request, 3)
 	if err != nil {
-		n.fail(err)
+		n.reportError(err)
+		n.setResponse(args, nil, 500, "")
 		return
 	}
 	method, err := comString(request, 5)
 	if err != nil {
-		n.fail(err)
+		n.reportError(err)
+		n.setResponse(args, nil, 500, "")
 		return
 	}
 	var content *comObject
 	if err := hresult(com(request, 7, uintptr(unsafe.Pointer(&content)))); err != nil {
-		n.fail(err)
+		n.reportError(err)
+		n.setResponse(args, nil, 500, "")
 		return
 	}
 	defer release(content)
@@ -211,7 +217,8 @@ func (n *nativeWindow) resource(args *comObject) {
 	}
 	req, err := http.NewRequestWithContext(requestContext, method, uri, input)
 	if err != nil {
-		n.fail(err)
+		n.reportError(err)
+		n.setResponse(args, nil, 500, "")
 		return
 	}
 	req.RequestURI = req.URL.RequestURI()
@@ -243,7 +250,8 @@ func (n *nativeWindow) resource(args *comObject) {
 	}
 	var deferral *comObject
 	if err := hresult(com(args, 6, uintptr(unsafe.Pointer(&deferral)))); err != nil {
-		n.fail(err)
+		n.reportError(err)
+		n.setResponse(args, nil, 500, "")
 		return
 	}
 	com(args, 1)
@@ -308,9 +316,12 @@ func (n *nativeWindow) resource(args *comObject) {
 		}
 		spool, err := newResponseSpool(req.Context(), &n.temporary)
 		if err != nil {
+			if !errors.Is(err, os.ErrClosed) && n.ctx.Err() == nil {
+				n.reportError(err)
+			}
 			_ = n.enqueue(func() {
+				n.respond(args, nil, 500, "")
 				n.finishResource(args)
-				n.fail(err)
 			})
 			return
 		}
@@ -347,9 +358,12 @@ func (n *nativeWindow) resource(args *comObject) {
 func (n *nativeWindow) deliver(args *comObject, spool *responseSpool, status int, headers http.Header) {
 	stream, err := spool.native(0)
 	if err != nil {
+		if n.ctx.Err() == nil {
+			n.reportError(err)
+		}
 		_ = n.enqueue(func() {
+			n.respond(args, nil, 500, "")
 			n.finishResource(args)
-			n.fail(err)
 		})
 		return
 	}
@@ -391,19 +405,30 @@ func (n *nativeWindow) finishResource(args *comObject) {
 	}
 }
 
+// setResponse 为单次WebView2资源请求写入原生响应
+// 入参: args 请求参数, stream 响应流, status 状态码, headers 响应头文本
+func (n *nativeWindow) setResponse(args, stream *comObject, status int, headers string) {
+	if n.environment == nil {
+		return
+	}
+	var response *comObject
+	if err := hresult(com(n.environment, 4, uintptr(unsafe.Pointer(stream)), uintptr(status), uintptr(unsafe.Pointer(wide(http.StatusText(status)))), uintptr(unsafe.Pointer(wide(headers))), uintptr(unsafe.Pointer(&response)))); err != nil {
+		if n.ctx.Err() == nil {
+			n.reportError(err)
+		}
+		return
+	}
+	defer release(response)
+	if err := hresult(com(args, 5, uintptr(unsafe.Pointer(response)))); err != nil && n.ctx.Err() == nil {
+		n.reportError(err)
+	}
+}
+
 // respond 创建WebView2资源响应
 // 入参: args 请求参数, stream 响应流, status 状态码, headers 响应头文本
 func (n *nativeWindow) respond(args, stream *comObject, status int, headers string) {
 	if _, ok := n.resources[args]; !ok {
 		return
 	}
-	var response *comObject
-	if err := hresult(com(n.environment, 4, uintptr(unsafe.Pointer(stream)), uintptr(status), uintptr(unsafe.Pointer(wide(http.StatusText(status)))), uintptr(unsafe.Pointer(wide(headers))), uintptr(unsafe.Pointer(&response)))); err != nil {
-		n.fail(err)
-		return
-	}
-	defer release(response)
-	if err := hresult(com(args, 5, uintptr(unsafe.Pointer(response)))); err != nil {
-		n.fail(err)
-	}
+	n.setResponse(args, stream, status, headers)
 }

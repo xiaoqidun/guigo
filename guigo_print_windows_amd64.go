@@ -18,8 +18,27 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"runtime"
+	"syscall"
 	"unsafe"
 )
+
+// comFloat64PC 保存单浮点参数COM调用蹦床入口地址
+var comFloat64PC = comFloat64ThunkPC()
+
+// comFloat64ThunkPC 返回单浮点参数COM调用蹦床入口地址
+// 返回: uintptr 蹦床入口地址
+func comFloat64ThunkPC() uintptr
+
+// comFloat64 通过Windows x64浮点ABI调用接收单个float64参数的COM虚函数
+// 入参: object 接口对象, index 方法索引, value 浮点参数
+// 返回: uintptr 调用结果
+func comFloat64(object *comObject, index int, value float64) uintptr {
+	fn := *(*uintptr)(unsafe.Add(unsafe.Pointer(object.table), uintptr(index)*unsafe.Sizeof(uintptr(0))))
+	r, _, _ := syscall.SyscallN(comFloat64PC, uintptr(unsafe.Pointer(object)), uintptr(math.Float64bits(value)), fn)
+	runtime.KeepAlive(object)
+	return r
+}
 
 // printInterface 获取当前WebView2的指定打印接口，调用方在STA线程释放
 // 入参: object 原生COM对象, id 打印接口标识
@@ -104,7 +123,11 @@ func (n *nativeWindow) printSettings(o PrintOptions) (*comObject, error) {
 			failure = hresult(com(settings, index, value))
 		}
 	}
-	double := func(index int, value float64) { set(index, uintptr(math.Float64bits(value))) }
+	double := func(index int, value float64) {
+		if failure == nil {
+			failure = hresult(comFloat64(settings, index, value))
+		}
+	}
 	if o.Orientation != "" {
 		value := uintptr(0)
 		if o.Orientation == "landscape" {
@@ -198,7 +221,7 @@ func (n *nativeWindow) print(ctx context.Context, o PrintOptions) (PrintResult, 
 			return
 		}
 		defer release(settings)
-		callback := n.callback("{8fd80075-ed08-42db-8570-f5d14977461e}", func(hr uintptr, status *comObject) uintptr {
+		cb, callback := newCallback("{8fd80075-ed08-42db-8570-f5d14977461e}", func(hr uintptr, status *comObject) uintptr {
 			n.printActive = false
 			failure := hresult(hr)
 			if failure == nil {
@@ -216,6 +239,7 @@ func (n *nativeWindow) print(ctx context.Context, o PrintOptions) (PrintResult, 
 			}
 			return 0
 		})
+		defer callbackRelease(cb)
 		n.printActive = true
 		if err := hresult(com(view, 113, uintptr(unsafe.Pointer(settings)), callback)); err != nil {
 			n.printActive = false

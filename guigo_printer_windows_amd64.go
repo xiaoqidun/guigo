@@ -222,8 +222,11 @@ func (n *nativeWindow) queryPrinter(ctx context.Context, o PrintOptions) (Printe
 	if o.Copies == 0 {
 		o.Copies = max(1, get(86))
 	}
+	requestedDuplex := o.Duplex
 	if o.Duplex == "" {
-		o.Duplex = map[int]string{2: "longEdge", 3: "shortEdge"}[get(94)]
+		if p.Duplex {
+			o.Duplex = map[int]string{2: "longEdge", 3: "shortEdge"}[get(94)]
+		}
 		if o.Duplex == "" {
 			o.Duplex = "simplex"
 		}
@@ -241,7 +244,8 @@ func (n *nativeWindow) queryPrinter(ctx context.Context, o PrintOptions) (Printe
 		}
 	}
 	o.Printer = name
-	fields := (binary.LittleEndian.Uint32(data[72:]) | 1 | 2 | 0x10 | 0x100 | 0x800 | 0x1000 | 0x8000) &^ 0x10000
+	setDuplex := p.Duplex && (requestedDuplex != "" || o.Duplex != "simplex")
+	fields := (binary.LittleEndian.Uint32(data[72:]) | 1 | 2 | 0x10 | 0x100 | 0x800 | 0x8000) &^ 0x10000
 	set(78, paperID)
 	if paperID == 0 {
 		fields |= 4 | 8
@@ -256,7 +260,10 @@ func (n *nativeWindow) queryPrinter(ctx context.Context, o PrintOptions) (Printe
 	}
 	set(84, 100)
 	set(86, o.Copies)
-	set(94, map[string]int{"simplex": 1, "longEdge": 2, "shortEdge": 3}[o.Duplex])
+	if setDuplex {
+		fields |= 0x1000
+		set(94, map[string]int{"simplex": 1, "longEdge": 2, "shortEdge": 3}[o.Duplex])
+	}
 	set(92, 1)
 	if o.Color == "color" {
 		set(92, 2)
@@ -278,7 +285,7 @@ func (n *nativeWindow) queryPrinter(ctx context.Context, o PrintOptions) (Printe
 	if int32(status) != 1 {
 		return p, fmt.Errorf("validate printer settings")
 	}
-	if get(76) != (map[string]int{"portrait": 1, "landscape": 2}[o.Orientation]) || get(94) != (map[string]int{"simplex": 1, "longEdge": 2, "shortEdge": 3}[o.Duplex]) {
+	if get(76) != (map[string]int{"portrait": 1, "landscape": 2}[o.Orientation]) || setDuplex && get(94) != (map[string]int{"simplex": 1, "longEdge": 2, "shortEdge": 3}[o.Duplex]) {
 		return p, fmt.Errorf("%w: driver changed device settings", ErrPrintUnsupported)
 	}
 	dc, _, err := printGDI.NewProc("CreateICW").Call(uintptr(unsafe.Pointer(wide("WINSPOOL"))), uintptr(unsafe.Pointer(wide(name))), 0, uintptr(unsafe.Pointer(&data[0])))

@@ -266,8 +266,9 @@ func callbackAdd(c *comCallback) uintptr {
 // 返回: uintptr 引用计数
 func callbackRelease(c *comCallback) uintptr {
 	n := c.Refs.Add(-1)
-	if n == 0 {
+	if n <= 0 {
 		callbackRoots.Delete(uintptr(unsafe.Pointer(c)))
+		return 0
 	}
 	return uintptr(n)
 }
@@ -284,17 +285,25 @@ func callbackInvoke(c *comCallback, a uintptr, b *comObject) (result uintptr) {
 	return c.Fn(a, b)
 }
 
-// callback 注册具有确定接口标识的回调
+// newCallback 创建初始引用计数为1的一次性COM回调
 // 入参: iid 接口标识, fn 回调函数
-// 返回: uintptr 回调地址
-func (n *nativeWindow) callback(iid string, fn func(uintptr, *comObject) uintptr) uintptr {
+// 返回: *comCallback 回调对象, uintptr 回调地址
+func newCallback(iid string, fn func(uintptr, *comObject) uintptr) (*comCallback, uintptr) {
 	var g syscall.GUID
 	ole32.NewProc("CLSIDFromString").Call(uintptr(unsafe.Pointer(wide(iid))), uintptr(unsafe.Pointer(&g)))
 	c := &comCallback{Table: &callbackTable, IID: g, Fn: fn}
 	c.Refs.Store(1)
-	n.callbacks = append(n.callbacks, c)
 	p := uintptr(unsafe.Pointer(c))
 	callbackRoots.Store(p, c)
+	return c, p
+}
+
+// callback 注册随窗口生命周期释放的COM回调
+// 入参: iid 接口标识, fn 回调函数
+// 返回: uintptr 回调地址
+func (n *nativeWindow) callback(iid string, fn func(uintptr, *comObject) uintptr) uintptr {
+	c, p := newCallback(iid, fn)
+	n.callbacks = append(n.callbacks, c)
 	return p
 }
 
@@ -445,6 +454,7 @@ func run(parent context.Context, o Options) error {
 		for _, c := range n.callbacks {
 			callbackRelease(c)
 		}
+		n.callbacks = nil
 	}()
 	if o.AppID != "" {
 		if err := n.setAppID(o.AppID); err != nil {
@@ -469,7 +479,7 @@ func run(parent context.Context, o Options) error {
 		return err
 	}
 	shell32.NewProc("DragAcceptFiles").Call(n.hwnd, 1)
-	envCB := n.callback("{4E8A3389-C9D8-4BD2-B6B5-124FEE6CC14D}", func(hr uintptr, env *comObject) uintptr {
+	envObj, envCB := newCallback("{4E8A3389-C9D8-4BD2-B6B5-124FEE6CC14D}", func(hr uintptr, env *comObject) uintptr {
 		if n.ctx.Err() != nil {
 			n.initializing = false
 			n.fail(n.ctx.Err())
@@ -490,7 +500,7 @@ func run(parent context.Context, o Options) error {
 			n.fail(err)
 			return 0
 		}
-		cb := n.callback("{6C4819F3-C9B7-4260-8127-C9F5BDE7F68C}", func(hr uintptr, controller *comObject) uintptr {
+		ctrlObj, cb := newCallback("{6C4819F3-C9B7-4260-8127-C9F5BDE7F68C}", func(hr uintptr, controller *comObject) uintptr {
 			n.initializing = false
 			if n.ctx.Err() != nil {
 				n.fail(n.ctx.Err())
@@ -515,13 +525,16 @@ func run(parent context.Context, o Options) error {
 		if n.contentWindow != 0 {
 			parent = n.contentWindow
 		}
-		if err := hresult(com(env, 3, parent, cb)); err != nil {
+		err = hresult(com(env, 3, parent, cb))
+		callbackRelease(ctrlObj)
+		if err != nil {
 			n.fail(err)
 		}
 		return 0
 	})
 	n.initializing = true
 	hr, _, _ = create.Call(1, runtimeType, uintptr(unsafe.Pointer(wide(o.UserDataDir))), 0, envCB)
+	callbackRelease(envObj)
 	if err := hresult(hr); err != nil {
 		return fmt.Errorf("create WebView2 (install Microsoft WebView2 Runtime): %w", err)
 	}
@@ -692,6 +705,17 @@ func (n *nativeWindow) fail(err error) {
 		n.activeTrayMenu.endMenu()
 	}
 	user32.NewProc("PostQuitMessage").Call(0)
+}
+
+// reportError 异步向宿主报告非致命运行错误
+// 入参: err 运行错误
+func (n *nativeWindow) reportError(err error) {
+	if err != nil && n.options.OnError != nil {
+		go func() {
+			defer func() { _ = recover() }()
+			n.options.OnError(err)
+		}()
+	}
 }
 
 // enqueue 将操作投递到STA线程
@@ -1123,28 +1147,6 @@ func (n *nativeWindow) setup() error {
 	if err := hresult(com(n.webview, 57, uintptr(unsafe.Pointer(wide("*"))), 0)); err != nil {
 		return err
 	}
-	completed := n.callback("{B99369F3-9B11-47B5-BC6F-8E7895FCEA17}", func(hr uintptr, _ *comObject) uintptr {
-		if err := hresult(hr); err != nil {
-			n.fail(err)
-			return 0
-		}
-		go func() {
-			if n.options.OnReady != nil {
-				n.options.OnReady(&Window{native: n})
-			}
-			_ = n.enqueue(func() {
-				if n.closeRequested {
-					return
-				}
-				n.titleBarReady = true
-				n.publishTitleBarChange(true)
-				if err := hresult(com(n.webview, 5, uintptr(unsafe.Pointer(wide(resourceURL(n.options.EntryPath)))))); err != nil {
-					n.fail(err)
-				}
-			})
-		}()
-		return 0
-	})
 	loaded := n.callback("{D33A35BF-1C49-4F98-93AB-006E0533FE1C}", func(_ uintptr, args *comObject) uintptr {
 		if n.ctx.Err() != nil {
 			n.fail(n.ctx.Err())
@@ -1185,6 +1187,29 @@ func (n *nativeWindow) setup() error {
 	if err := hresult(com(n.webview, 59, closed, uintptr(unsafe.Pointer(&token)))); err != nil {
 		return err
 	}
+	completedObj, completed := newCallback("{B99369F3-9B11-47B5-BC6F-8E7895FCEA17}", func(hr uintptr, _ *comObject) uintptr {
+		if err := hresult(hr); err != nil {
+			n.fail(err)
+			return 0
+		}
+		go func() {
+			if n.options.OnReady != nil {
+				n.options.OnReady(&Window{native: n})
+			}
+			_ = n.enqueue(func() {
+				if n.closeRequested {
+					return
+				}
+				n.titleBarReady = true
+				n.publishTitleBarChange(true)
+				if err := hresult(com(n.webview, 5, uintptr(unsafe.Pointer(wide(resourceURL(n.options.EntryPath)))))); err != nil {
+					n.fail(err)
+				}
+			})
+		}()
+		return 0
+	})
+	defer callbackRelease(completedObj)
 	return hresult(com(n.webview, 27, uintptr(unsafe.Pointer(wide(bridgeScript))), completed))
 }
 
@@ -1262,13 +1287,14 @@ func (n *nativeWindow) requestClose() {
 				}
 				return
 			}
-			callback := n.callback("{5C4889F0-5EF6-4C5A-952C-D8F1B92D0574}", func(hr uintptr, _ *comObject) uintptr {
+			cb, callback := newCallback("{5C4889F0-5EF6-4C5A-952C-D8F1B92D0574}", func(hr uintptr, _ *comObject) uintptr {
 				n.closeRequested = false
 				if err := hresult(hr); err != nil {
 					n.err = err
 				}
 				return 0
 			})
+			defer callbackRelease(cb)
 			n.closeRequested = true
 			if err := hresult(com(n.webview, 36, uintptr(unsafe.Pointer(wide("Page.close"))), uintptr(unsafe.Pointer(wide("{}"))), callback)); err != nil {
 				n.closeRequested = false

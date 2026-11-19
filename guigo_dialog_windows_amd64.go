@@ -95,15 +95,7 @@ func (n *nativeWindow) dialogs(o DialogOptions, mode int) (paths []string, err e
 				return err
 			}
 		}
-		folder, name := o.DefaultPath, o.DefaultName
-		if folder != "" {
-			if info, e := os.Stat(folder); e != nil || !info.IsDir() {
-				if name == "" {
-					name = filepath.Base(folder)
-				}
-				folder = filepath.Dir(folder)
-			}
-		}
+		folder, name := dialogDefaultLocation(o.DefaultPath, o.DefaultName)
 		if name != "" && mode != 2 {
 			if err := hresult(com(dialog, 15, uintptr(unsafe.Pointer(wide(name))))); err != nil {
 				return err
@@ -113,13 +105,9 @@ func (n *nativeWindow) dialogs(o DialogOptions, mode int) (paths []string, err e
 			var item *comObject
 			iid := guid("{43826D1E-E718-42EE-BC55-A1E261C37BFE}")
 			hr, _, _ := shell32.NewProc("SHCreateItemFromParsingName").Call(uintptr(unsafe.Pointer(wide(folder))), 0, uintptr(unsafe.Pointer(&iid)), uintptr(unsafe.Pointer(&item)))
-			if err := hresult(hr); err != nil {
-				return err
-			}
-			err := hresult(com(dialog, 12, uintptr(unsafe.Pointer(item))))
-			release(item)
-			if err != nil {
-				return err
+			if hresult(hr) == nil && item != nil {
+				_ = com(dialog, 12, uintptr(unsafe.Pointer(item)))
+				release(item)
 			}
 		}
 		if err := n.ctx.Err(); err != nil {
@@ -172,6 +160,33 @@ func (n *nativeWindow) dialogs(o DialogOptions, mode int) (paths []string, err e
 		return nil
 	})
 	return
+}
+
+// dialogDefaultLocation 归一化对话框默认目录与文件名，忽略不存在的目录
+// 入参: defaultPath 默认路径, defaultName 默认文件名
+// 返回: string 存在的绝对目录, string 默认文件名
+func dialogDefaultLocation(defaultPath, defaultName string) (string, string) {
+	if defaultPath == "" {
+		return "", defaultName
+	}
+	abs, err := filepath.Abs(defaultPath)
+	if err != nil {
+		return "", defaultName
+	}
+	if info, err := os.Stat(abs); err == nil && info.IsDir() {
+		return abs, defaultName
+	}
+	name := defaultName
+	if name == "" {
+		if base := filepath.Base(abs); base != "" && base != "." && base != string(filepath.Separator) {
+			name = base
+		}
+	}
+	parent := filepath.Dir(abs)
+	if info, err := os.Stat(parent); err == nil && info.IsDir() {
+		return parent, name
+	}
+	return "", name
 }
 
 // shellPath 获取原生文件系统路径
