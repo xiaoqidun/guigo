@@ -258,8 +258,8 @@ func (t *windowsTray) queueMenu(position uintptr) {
 		if err := n.invokeTop(func() error {
 			t.menuPending = false
 			return t.showMenu(position)
-		}); err != nil && !errors.Is(err, ErrClosed) && n.options.OnError != nil {
-			n.options.OnError(err)
+		}); err != nil && !errors.Is(err, ErrClosed) {
+			n.reportError(err)
 		}
 	}()
 }

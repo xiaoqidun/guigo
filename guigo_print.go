@@ -101,66 +101,6 @@ type PrintResult struct {
 	Submitted bool `json:"submitted"`
 }
 
-// PrintCapabilities 查询当前窗口的打印接口能力，可从后台协程调用
-// 入参: ctx 调用上下文
-// 返回: PrintCapabilities 打印机制能力, error 查询或取消错误
-func (w *Window) PrintCapabilities(ctx context.Context) (PrintCapabilities, error) {
-	if ctx == nil {
-		return PrintCapabilities{}, fmt.Errorf("nil print context")
-	}
-	if err := ctx.Err(); err != nil {
-		return PrintCapabilities{}, err
-	}
-	if w == nil || w.native == nil {
-		return PrintCapabilities{}, ErrClosed
-	}
-	return w.native.printCapabilities(ctx)
-}
-
-// ShowPrintUI 为当前顶层文档打开打印对话框，kind支持system、browser，空值采用system
-// Windows返回表示对话框请求已交付，不能据此释放内容或认定打印成功
-// 调用方可以监听页面afterprint，在对话框关闭后恢复界面；Linux取消返回ErrCanceled
-// 入参: ctx 调用上下文, kind 打印窗口类型
-// 返回: error 不支持、取消或窗口调用错误
-func (w *Window) ShowPrintUI(ctx context.Context, kind string) error {
-	if ctx == nil {
-		return fmt.Errorf("nil print context")
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if w == nil || w.native == nil {
-		return ErrClosed
-	}
-	if kind == "" {
-		kind = "system"
-	}
-	if kind != "system" && kind != "browser" {
-		return fmt.Errorf("invalid print dialog kind")
-	}
-	return w.native.showPrintUI(ctx, kind)
-}
-
-// Print 直接提交当前顶层文档，设备设置仍受打印机驱动能力约束
-// 返回前内容须保持不变；取消上下文不保证撤回已经提交给系统的作业
-// 入参: ctx 调用上下文, options 设备打印选项
-// 返回: PrintResult 提交结果, error 配置、提交或取消错误
-func (w *Window) Print(ctx context.Context, options PrintOptions) (PrintResult, error) {
-	if ctx == nil {
-		return PrintResult{}, fmt.Errorf("nil print context")
-	}
-	if err := ctx.Err(); err != nil {
-		return PrintResult{}, err
-	}
-	if w == nil || w.native == nil {
-		return PrintResult{}, ErrClosed
-	}
-	if err := validatePrint(options); err != nil {
-		return PrintResult{}, err
-	}
-	return w.native.print(ctx, clonePrintOptions(options))
-}
-
 // clonePrintOptions 隔离异步设备操作使用的可选设置，不保留调用方指针
 // 入参: o 调用方设备选项
 // 返回: PrintOptions 可选字段的独立副本
@@ -243,4 +183,64 @@ func printPageRanges(value string) ([][2]int32, error) {
 		ranges = append(ranges, [2]int32{int32(start - 1), int32(end - 1)})
 	}
 	return ranges, nil
+}
+
+// PrintCapabilities 查询当前窗口的打印接口能力，可从后台协程调用
+// 入参: ctx 调用上下文
+// 返回: PrintCapabilities 打印机制能力, error 查询或取消错误
+func (w *Window) PrintCapabilities(ctx context.Context) (PrintCapabilities, error) {
+	if ctx == nil {
+		return PrintCapabilities{}, fmt.Errorf("nil print context")
+	}
+	if err := ctx.Err(); err != nil {
+		return PrintCapabilities{}, err
+	}
+	if w == nil || w.native == nil {
+		return PrintCapabilities{}, ErrClosed
+	}
+	return w.native.printCapabilities(ctx)
+}
+
+// ShowPrintUI 为当前顶层文档打开打印对话框，kind支持system、browser，空值采用system
+// Windows返回表示对话框请求已交付，不能据此释放内容或认定打印成功
+// 调用方可以监听页面afterprint，在对话框关闭后恢复界面；Linux取消返回ErrCanceled
+// 入参: ctx 调用上下文, kind 打印窗口类型
+// 返回: error 不支持、取消或窗口调用错误
+func (w *Window) ShowPrintUI(ctx context.Context, kind string) error {
+	if ctx == nil {
+		return fmt.Errorf("nil print context")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if w == nil || w.native == nil {
+		return ErrClosed
+	}
+	if kind == "" {
+		kind = "system"
+	}
+	if kind != "system" && kind != "browser" {
+		return fmt.Errorf("invalid print dialog kind")
+	}
+	return w.native.showPrintUI(ctx, kind)
+}
+
+// Print 直接提交当前顶层文档，设备设置仍受打印机驱动能力约束
+// 返回前内容须保持不变；取消上下文不保证撤回已经提交给系统的作业
+// 入参: ctx 调用上下文, options 设备打印选项
+// 返回: PrintResult 提交结果, error 配置、提交或取消错误
+func (w *Window) Print(ctx context.Context, options PrintOptions) (PrintResult, error) {
+	if ctx == nil {
+		return PrintResult{}, fmt.Errorf("nil print context")
+	}
+	if err := ctx.Err(); err != nil {
+		return PrintResult{}, err
+	}
+	if w == nil || w.native == nil {
+		return PrintResult{}, ErrClosed
+	}
+	if err := validatePrint(options); err != nil {
+		return PrintResult{}, err
+	}
+	return w.native.print(ctx, clonePrintOptions(options))
 }

@@ -20,6 +20,16 @@ import (
 	"unsafe"
 )
 
+// destroyIcons 释放窗口独占图标句柄
+// 入参: icons 大小图标句柄
+func destroyIcons(icons [2]uintptr) {
+	for _, icon := range icons {
+		if icon != 0 {
+			user32.NewProc("DestroyIcon").Call(icon)
+		}
+	}
+}
+
 // updateIcons 按当前DPI更新窗口大小图标
 // 返回: error 错误信息
 func (n *nativeWindow) updateIcons() error {
@@ -49,14 +59,4 @@ func (n *nativeWindow) updateIcons() error {
 	destroyIcons(n.icons)
 	n.icons = icons
 	return nil
-}
-
-// destroyIcons 释放窗口独占图标句柄
-// 入参: icons 大小图标句柄
-func destroyIcons(icons [2]uintptr) {
-	for _, icon := range icons {
-		if icon != 0 {
-			user32.NewProc("DestroyIcon").Call(icon)
-		}
-	}
 }

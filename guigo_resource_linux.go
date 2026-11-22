@@ -31,7 +31,10 @@ import (
 	"unsafe"
 )
 
+// linuxHeaderID 为临时请求头回调分配递增标识
 var linuxHeaderID atomic.Uint64
+
+// linuxHeaderTargets 保存请求头遍历期间的目标头映射
 var linuxHeaderTargets sync.Map
 
 // linuxInput 持有原生请求流及取消标识
@@ -63,60 +66,6 @@ func linuxHeaders(key, value *byte, data uintptr) {
 	}
 }
 
-// Read 读取原生流并传递取消或读取错误
-// 入参: data 输出缓冲区
-// 返回: int 读取长度, error 读取错误
-func (r *linuxInput) Read(data []byte) (int, error) {
-	if len(data) == 0 {
-		return 0, nil
-	}
-	r.mu.Lock()
-	if r.closed {
-		r.mu.Unlock()
-		return 0, io.ErrClosedPipe
-	}
-	stream, cancel := gtk.Ref(r.stream), gtk.Ref(r.cancel)
-	r.mu.Unlock()
-	defer gtk.Unref(stream)
-	defer gtk.Unref(cancel)
-	var nativeErr *linuxError
-	count := gtk.InputRead(stream, unsafe.Pointer(&data[0]), uintptr(len(data)), cancel, &nativeErr)
-	if count < 0 {
-		return 0, nativeError(nativeErr)
-	}
-	if count == 0 {
-		return 0, io.EOF
-	}
-	return int(count), nil
-}
-
-// Close 释放请求流及取消标识
-// 返回: error 关闭错误
-func (r *linuxInput) Close() error {
-	if r.stop != nil {
-		r.stop()
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.closed {
-		return nil
-	}
-	r.closed = true
-	gtk.Cancel(r.cancel)
-	gtk.Unref(r.stream)
-	gtk.Unref(r.cancel)
-	return nil
-}
-
-// cancelRead 同步取消读取并避免访问已释放的原生标识
-func (r *linuxInput) cancelRead() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if !r.closed {
-		gtk.Cancel(r.cancel)
-	}
-}
-
 // linuxResource 获取原生请求并交给后台协程
 // 入参: request 请求对象, data 用户数据
 func linuxResource(request, data uintptr) {
@@ -125,7 +74,11 @@ func linuxResource(request, data uintptr) {
 		return
 	}
 	uri := gtk.RequestURI(request)
-	req, err := http.NewRequestWithContext(n.pageCtx, gtk.RequestMethod(request), uri, nil)
+	requestContext := n.pageCtx
+	if requestContext == nil {
+		requestContext = n.ctx
+	}
+	req, err := http.NewRequestWithContext(requestContext, gtk.RequestMethod(request), uri, nil)
 	if err != nil {
 		n.fail(err)
 		return
@@ -183,6 +136,10 @@ func linuxResource(request, data uintptr) {
 				http.Error(w, "Method Not Allowed", 405)
 				return
 			}
+			if calls == nil {
+				http.Error(w, "Call closed", 410)
+				return
+			}
 			call := calls.take(req.URL.Query().Get("id"))
 			if call == nil {
 				http.Error(w, "Call closed", 410)
@@ -228,11 +185,15 @@ func linuxResource(request, data uintptr) {
 					http.Error(w, "Invalid resource stream", 500)
 					return
 				}
-				w.header = resource.Header.Clone()
-				if w.header == nil {
-					w.header = make(http.Header)
+				w.header = make(http.Header, len(resource.Header))
+				for k, vs := range resource.Header {
+					for _, v := range vs {
+						w.header.Add(k, v)
+					}
 				}
-				w.header.Set("Content-Length", strconv.FormatInt(size, 10))
+				if w.header.Get("Content-Length") == "" {
+					w.header.Set("Content-Length", strconv.FormatInt(size, 10))
+				}
 				status := resource.StatusCode
 				if status == 0 {
 					status = 200
@@ -250,6 +211,60 @@ func linuxResource(request, data uintptr) {
 		}
 		n.options.Handler.ServeHTTP(w, req)
 	}()
+}
+
+// Read 读取原生流并传递取消或读取错误
+// 入参: data 输出缓冲区
+// 返回: int 读取长度, error 读取错误
+func (r *linuxInput) Read(data []byte) (int, error) {
+	if len(data) == 0 {
+		return 0, nil
+	}
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return 0, io.ErrClosedPipe
+	}
+	stream, cancel := gtk.Ref(r.stream), gtk.Ref(r.cancel)
+	r.mu.Unlock()
+	defer gtk.Unref(stream)
+	defer gtk.Unref(cancel)
+	var nativeErr *linuxError
+	count := gtk.InputRead(stream, unsafe.Pointer(&data[0]), uintptr(len(data)), cancel, &nativeErr)
+	if count < 0 {
+		return 0, nativeError(nativeErr)
+	}
+	if count == 0 {
+		return 0, io.EOF
+	}
+	return int(count), nil
+}
+
+// Close 释放请求流及取消标识
+// 返回: error 关闭错误
+func (r *linuxInput) Close() error {
+	if r.stop != nil {
+		r.stop()
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return nil
+	}
+	r.closed = true
+	gtk.Cancel(r.cancel)
+	gtk.Unref(r.stream)
+	gtk.Unref(r.cancel)
+	return nil
+}
+
+// cancelRead 同步取消读取并避免访问已释放的原生标识
+func (r *linuxInput) cancelRead() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.closed {
+		gtk.Cancel(r.cancel)
+	}
 }
 
 // Header 返回响应头集合
@@ -289,7 +304,9 @@ func (w *linuxWriter) WriteHeader(status int) {
 	headers := w.header.Clone()
 	size := int64(-1)
 	if value := headers.Get("Content-Length"); value != "" {
-		size, _ = strconv.ParseInt(value, 10, 64)
+		if parsed, parseErr := strconv.ParseInt(value, 10, 64); parseErr == nil && parsed >= 0 {
+			size = parsed
+		}
 	}
 	discard := func() { gtk.Unref(stream); _ = writer.Close(); stop() }
 	if err = w.window.enqueueCleanup(func() {

@@ -167,9 +167,59 @@ func forwardInstance(ctx context.Context, conn instanceConn, data []byte) error 
 	}
 }
 
+// instanceHash 生成固定长度的本机入口名称
+// 入参: identity 用户及会话标识, key 调用方实例键
+// 返回: string 入口摘要
+func instanceHash(identity, key string) string {
+	sum := sha256.Sum256([]byte(identity + "\x00" + key))
+	return hex.EncodeToString(sum[:])
+}
+
+// readInstanceMessage 读取长度受限的实例消息
+// 入参: reader 数据来源
+// 返回: []byte 消息, error 读取错误
+func readInstanceMessage(reader io.Reader) ([]byte, error) {
+	var size uint32
+	if err := binary.Read(reader, binary.LittleEndian, &size); err != nil {
+		return nil, err
+	}
+	if size > instanceLimit {
+		return nil, errors.New("instance message too large")
+	}
+	data := make([]byte, size)
+	_, err := io.ReadFull(reader, data)
+	return data, err
+}
+
+// writeInstanceMessage 写入长度受限的实例消息
+// 入参: writer 数据目标, data 消息
+// 返回: error 写入错误
+func writeInstanceMessage(writer io.Writer, data []byte) error {
+	if len(data) > instanceLimit {
+		return errors.New("instance message too large")
+	}
+	if err := binary.Write(writer, binary.LittleEndian, uint32(len(data))); err != nil {
+		return err
+	}
+	for len(data) > 0 {
+		n, err := writer.Write(data)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+		data = data[n:]
+	}
+	return nil
+}
+
 // Close 停止接收并释放实例入口，可重复调用
 // 返回: error 关闭错误
 func (i *Instance) Close() error {
+	if i == nil {
+		return nil
+	}
 	i.once.Do(func() {
 		i.err = i.listener.Close()
 		<-i.done
@@ -227,51 +277,4 @@ func (i *Instance) receive(ctx context.Context, conn instanceConn, receive func(
 		var accepted [1]byte
 		_, _ = io.ReadFull(conn, accepted[:])
 	}
-}
-
-// instanceHash 生成固定长度的本机入口名称
-// 入参: identity 用户及会话标识, key 调用方实例键
-// 返回: string 入口摘要
-func instanceHash(identity, key string) string {
-	sum := sha256.Sum256([]byte(identity + "\x00" + key))
-	return hex.EncodeToString(sum[:])
-}
-
-// readInstanceMessage 读取长度受限的实例消息
-// 入参: reader 数据来源
-// 返回: []byte 消息, error 读取错误
-func readInstanceMessage(reader io.Reader) ([]byte, error) {
-	var size uint32
-	if err := binary.Read(reader, binary.LittleEndian, &size); err != nil {
-		return nil, err
-	}
-	if size > instanceLimit {
-		return nil, errors.New("instance message too large")
-	}
-	data := make([]byte, size)
-	_, err := io.ReadFull(reader, data)
-	return data, err
-}
-
-// writeInstanceMessage 写入长度受限的实例消息
-// 入参: writer 数据目标, data 消息
-// 返回: error 写入错误
-func writeInstanceMessage(writer io.Writer, data []byte) error {
-	if len(data) > instanceLimit {
-		return errors.New("instance message too large")
-	}
-	if err := binary.Write(writer, binary.LittleEndian, uint32(len(data))); err != nil {
-		return err
-	}
-	for len(data) > 0 {
-		n, err := writer.Write(data)
-		if err != nil {
-			return err
-		}
-		if n == 0 {
-			return io.ErrShortWrite
-		}
-		data = data[n:]
-	}
-	return nil
 }

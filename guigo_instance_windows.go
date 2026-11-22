@@ -105,41 +105,6 @@ func listenInstance(address string) (instanceListener, error) {
 	return &pipeInstance{address: address, identity: identity, security: security, mutex: mutex, ctx: ctx, cancel: cancel}, nil
 }
 
-// Accept 等待管道连接并校验对端身份
-// 返回: instanceConn 连接, error 接收错误
-func (l *pipeInstance) Accept() (instanceConn, error) {
-	l.acceptMu.Lock()
-	defer l.acceptMu.Unlock()
-	for {
-		if err := l.ctx.Err(); err != nil {
-			return nil, err
-		}
-		name, _ := windows.UTF16PtrFromString(l.address)
-		attributes := windows.SecurityAttributes{Length: uint32(unsafe.Sizeof(windows.SecurityAttributes{})), SecurityDescriptor: l.security}
-		pipe, err := windows.CreateNamedPipe(name, windows.PIPE_ACCESS_DUPLEX|windows.FILE_FLAG_OVERLAPPED, windows.PIPE_TYPE_BYTE|windows.PIPE_REJECT_REMOTE_CLIENTS, 255, 4096, 4096, 0, &attributes)
-		if err != nil {
-			return nil, err
-		}
-		if err := connectInstancePipe(l.ctx, pipe); err != nil {
-			windows.CloseHandle(pipe)
-			return nil, err
-		}
-		var pid uint32
-		err = windows.GetNamedPipeClientProcessId(pipe, &pid)
-		if err == nil {
-			var identity string
-			identity, err = windowsInstanceIdentity(pid)
-			if err == nil && identity != l.identity {
-				err = os.ErrPermission
-			}
-		}
-		if err == nil {
-			return os.NewFile(uintptr(pipe), l.address), nil
-		}
-		windows.CloseHandle(pipe)
-	}
-}
-
 // connectInstancePipe 等待可取消的重叠管道连接
 // 入参: ctx 等待上下文, pipe 管道句柄
 // 返回: error 连接错误
@@ -168,18 +133,6 @@ func connectInstancePipe(ctx context.Context, pipe windows.Handle) error {
 		<-canceled
 	}
 	return err
-}
-
-// Close 停止等待并释放互斥入口
-// 返回: error 关闭错误
-func (l *pipeInstance) Close() error {
-	l.once.Do(func() {
-		l.cancel()
-		l.acceptMu.Lock()
-		defer l.acceptMu.Unlock()
-		l.err = windows.CloseHandle(l.mutex)
-	})
-	return l.err
 }
 
 // dialInstance 连接同一用户和权限的实例，并转交窗口激活许可
@@ -219,4 +172,51 @@ func dialInstance(ctx context.Context, address string) (instanceConn, error) {
 // 返回: bool 是否可重试
 func instanceUnavailable(err error) bool {
 	return errors.Is(err, windows.ERROR_FILE_NOT_FOUND) || errors.Is(err, windows.ERROR_PIPE_BUSY)
+}
+
+// Accept 等待管道连接并校验对端身份
+// 返回: instanceConn 连接, error 接收错误
+func (l *pipeInstance) Accept() (instanceConn, error) {
+	l.acceptMu.Lock()
+	defer l.acceptMu.Unlock()
+	for {
+		if err := l.ctx.Err(); err != nil {
+			return nil, err
+		}
+		name, _ := windows.UTF16PtrFromString(l.address)
+		attributes := windows.SecurityAttributes{Length: uint32(unsafe.Sizeof(windows.SecurityAttributes{})), SecurityDescriptor: l.security}
+		pipe, err := windows.CreateNamedPipe(name, windows.PIPE_ACCESS_DUPLEX|windows.FILE_FLAG_OVERLAPPED, windows.PIPE_TYPE_BYTE|windows.PIPE_REJECT_REMOTE_CLIENTS, 255, 4096, 4096, 0, &attributes)
+		if err != nil {
+			return nil, err
+		}
+		if err := connectInstancePipe(l.ctx, pipe); err != nil {
+			windows.CloseHandle(pipe)
+			return nil, err
+		}
+		var pid uint32
+		err = windows.GetNamedPipeClientProcessId(pipe, &pid)
+		if err == nil {
+			var identity string
+			identity, err = windowsInstanceIdentity(pid)
+			if err == nil && identity != l.identity {
+				err = os.ErrPermission
+			}
+		}
+		if err == nil {
+			return os.NewFile(uintptr(pipe), l.address), nil
+		}
+		windows.CloseHandle(pipe)
+	}
+}
+
+// Close 停止等待并释放互斥入口
+// 返回: error 关闭错误
+func (l *pipeInstance) Close() error {
+	l.once.Do(func() {
+		l.cancel()
+		l.acceptMu.Lock()
+		defer l.acceptMu.Unlock()
+		l.err = windows.CloseHandle(l.mutex)
+	})
+	return l.err
 }

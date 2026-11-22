@@ -28,6 +28,15 @@ import (
 	"github.com/ebitengine/purego"
 )
 
+// cups 保存按需加载的CUPS查询接口
+var cups cupsAPI
+
+// cupsOnce 保证CUPS查询接口只加载一次
+var cupsOnce sync.Once
+
+// cupsError 保存CUPS接口加载错误
+var cupsError error
+
 // cupsDestination 对应CUPS队列及当前用户保存的选项
 type cupsDestination struct {
 	Name, Instance *byte
@@ -60,15 +69,6 @@ type cupsAPI struct {
 	MediaSize     func(uintptr, *cupsDestination, uintptr, int32, int32, uint32, *cupsMedia) int32 `symbol:"cupsGetDestMediaBySize"`
 }
 
-// cups 保存按需加载的CUPS查询接口
-var cups cupsAPI
-
-// cupsOnce 保证CUPS查询接口只加载一次
-var cupsOnce sync.Once
-
-// cupsError 保存CUPS接口加载错误
-var cupsError error
-
 // loadCUPS 将可选设备查询与WebKitGTK基本打印能力分开，缺少CUPS时返回明确错误
 // 返回: error 设备查询库加载错误
 func loadCUPS() error {
@@ -92,54 +92,6 @@ func loadCUPS() error {
 		cups = api
 	})
 	return cupsError
-}
-
-// listPrinters 读取CUPS队列，按队列名称排除保存的重复实例
-// 入参: ctx 查询上下文
-// 返回: []PrinterInfo 系统打印队列, error 查询或取消错误
-func (n *nativeWindow) listPrinters(ctx context.Context) ([]PrinterInfo, error) {
-	n.mu.Lock()
-	closed := n.closed
-	n.mu.Unlock()
-	if closed {
-		return nil, ErrClosed
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if err := loadCUPS(); err != nil {
-		return nil, err
-	}
-	var destinations *cupsDestination
-	count := cups.Dests(0, &destinations)
-	defer cups.FreeDests(count, destinations)
-	if count < 0 || count > 65536 || count > 0 && destinations == nil {
-		return nil, fmt.Errorf("invalid CUPS destinations")
-	}
-	result := []PrinterInfo{}
-	for _, item := range unsafe.Slice(destinations, count) {
-		if item.Instance != nil {
-			continue
-		}
-		result = append(result, PrinterInfo{Name: nativeString(item.Name), Default: item.Default != 0})
-	}
-	return result, ctx.Err()
-}
-
-// queryPrinter 查询IPP纸张及边距，拒绝CUPS返回的近似尺寸
-// 入参: ctx 查询上下文, o 待核对设备设置
-// 返回: PrinterProfile 设备能力及当前纸面, error 配置、查询或取消错误
-func (n *nativeWindow) queryPrinter(ctx context.Context, o PrintOptions) (PrinterProfile, error) {
-	n.mu.Lock()
-	closed := n.closed
-	n.mu.Unlock()
-	if closed {
-		return PrinterProfile{}, ErrClosed
-	}
-	if err := loadCUPS(); err != nil {
-		return PrinterProfile{}, err
-	}
-	return queryCUPSPrinter(ctx, o, cups)
 }
 
 // queryCUPSPrinter 将独立CUPS能力快照转换为跨平台设备数据
@@ -256,6 +208,54 @@ func queryCUPSPrinter(ctx context.Context, o PrintOptions, cups cupsAPI) (Printe
 	}
 	p.PrintableArea = PrintRectangle{X: left, Y: top, Width: p.Width - left - right, Height: p.Height - top - bottom}
 	return p, ctx.Err()
+}
+
+// listPrinters 读取CUPS队列，按队列名称排除保存的重复实例
+// 入参: ctx 查询上下文
+// 返回: []PrinterInfo 系统打印队列, error 查询或取消错误
+func (n *nativeWindow) listPrinters(ctx context.Context) ([]PrinterInfo, error) {
+	n.mu.Lock()
+	closed := n.closed
+	n.mu.Unlock()
+	if closed {
+		return nil, ErrClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := loadCUPS(); err != nil {
+		return nil, err
+	}
+	var destinations *cupsDestination
+	count := cups.Dests(0, &destinations)
+	defer cups.FreeDests(count, destinations)
+	if count < 0 || count > 65536 || count > 0 && destinations == nil {
+		return nil, fmt.Errorf("invalid CUPS destinations")
+	}
+	result := []PrinterInfo{}
+	for _, item := range unsafe.Slice(destinations, count) {
+		if item.Instance != nil {
+			continue
+		}
+		result = append(result, PrinterInfo{Name: nativeString(item.Name), Default: item.Default != 0})
+	}
+	return result, ctx.Err()
+}
+
+// queryPrinter 查询IPP纸张及边距，拒绝CUPS返回的近似尺寸
+// 入参: ctx 查询上下文, o 待核对设备设置
+// 返回: PrinterProfile 设备能力及当前纸面, error 配置、查询或取消错误
+func (n *nativeWindow) queryPrinter(ctx context.Context, o PrintOptions) (PrinterProfile, error) {
+	n.mu.Lock()
+	closed := n.closed
+	n.mu.Unlock()
+	if closed {
+		return PrinterProfile{}, ErrClosed
+	}
+	if err := loadCUPS(); err != nil {
+		return PrinterProfile{}, err
+	}
+	return queryCUPSPrinter(ctx, o, cups)
 }
 
 // showPrinterProperties 保留不支持平台属性窗口的明确能力边界

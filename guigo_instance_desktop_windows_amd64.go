@@ -36,6 +36,24 @@ const instanceActiveProperty = "GUIGo.Instance.Active"
 // windowInstanceSequence 区分同一进程创建的不同窗口入口
 var windowInstanceSequence atomic.Uint32
 
+// instanceWindowSearches 保持同步枚举期间的查询对象，避免回调转换Go指针
+var instanceWindowSearches sync.Map
+
+// enumInstanceWindows 接收同步窗口枚举回调并筛选当前桌面的同组窗口
+var enumInstanceWindows = syscall.NewCallback(func(hwnd, parameter uintptr) uintptr {
+	value, _ := instanceWindowSearches.Load(parameter)
+	search := value.(*instanceWindowSearch)
+	id, _, _ := user32.NewProc("GetPropW").Call(hwnd, uintptr(unsafe.Pointer(search.property)))
+	if id == 0 || !instanceOnCurrentDesktop(search.manager, hwnd) {
+		return 1
+	}
+	var pid uint32
+	user32.NewProc("GetWindowThreadProcessId").Call(hwnd, uintptr(unsafe.Pointer(&pid)))
+	activated, _, _ := user32.NewProc("GetPropW").Call(hwnd, uintptr(unsafe.Pointer(wide(instanceActiveProperty))))
+	search.windows = append(search.windows, instanceWindow{hwnd: hwnd, id: id, address: fmt.Sprintf("%s.%d.%d", search.address, pid, id), activated: activated})
+	return 1
+})
+
 // windowInstance 将管道入口与实时窗口绑定，不保存启动时的虚拟桌面编号
 type windowInstance struct {
 	instanceListener
@@ -63,24 +81,6 @@ type instanceWindowSearch struct {
 	manager  *comObject
 	windows  []instanceWindow
 }
-
-// instanceWindowSearches 保持同步枚举期间的查询对象，避免回调转换Go指针
-var instanceWindowSearches sync.Map
-
-// enumInstanceWindows 接收同步窗口枚举回调并筛选当前桌面的同组窗口
-var enumInstanceWindows = syscall.NewCallback(func(hwnd, parameter uintptr) uintptr {
-	value, _ := instanceWindowSearches.Load(parameter)
-	search := value.(*instanceWindowSearch)
-	id, _, _ := user32.NewProc("GetPropW").Call(hwnd, uintptr(unsafe.Pointer(search.property)))
-	if id == 0 || !instanceOnCurrentDesktop(search.manager, hwnd) {
-		return 1
-	}
-	var pid uint32
-	user32.NewProc("GetWindowThreadProcessId").Call(hwnd, uintptr(unsafe.Pointer(&pid)))
-	activated, _, _ := user32.NewProc("GetPropW").Call(hwnd, uintptr(unsafe.Pointer(wide(instanceActiveProperty))))
-	search.windows = append(search.windows, instanceWindow{hwnd: hwnd, id: id, address: fmt.Sprintf("%s.%d.%d", search.address, pid, id), activated: activated})
-	return 1
-})
 
 // openWindowInstance 串行选择当前桌面的接收端，新入口登记窗口后释放选择锁
 // 入参: ctx 生命周期上下文, key 调用方实例键, data 消息, receive 接收回调
@@ -269,6 +269,37 @@ func dialWindowInstance(ctx context.Context, candidate instanceWindow, property 
 	}
 }
 
+// instanceDesktopManager 创建公开的虚拟桌面查询接口，系统不支持时返回nil
+// 返回: *comObject 查询接口或nil
+func instanceDesktopManager() *comObject {
+	class := guid("{AA509086-5CA9-4C25-8F95-589D3C07B48A}")
+	iid := guid("{A5CD92FF-29BE-454C-8D04-D82879FB3F1B}")
+	var manager *comObject
+	hr, _, _ := ole32.NewProc("CoCreateInstance").Call(uintptr(unsafe.Pointer(&class)), 0, 1, uintptr(unsafe.Pointer(&iid)), uintptr(unsafe.Pointer(&manager)))
+	if hresult(hr) != nil {
+		return nil
+	}
+	return manager
+}
+
+// instanceOnCurrentDesktop 查询窗口是否实际属于当前虚拟桌面，无法确认时不复用
+// 入参: manager 查询接口, hwnd 窗口句柄
+// 返回: bool 是否属于当前桌面
+func instanceOnCurrentDesktop(manager *comObject, hwnd uintptr) bool {
+	if manager == nil {
+		return false
+	}
+	var current int32
+	return hresult(com(manager, 3, hwnd, uintptr(unsafe.Pointer(&current)))) == nil && current != 0
+}
+
+// recordInstanceActivation 更新窗口最近激活时间，不改变窗口位置和桌面
+// 入参: hwnd 窗口句柄
+func recordInstanceActivation(hwnd uintptr) {
+	now, _, _ := kernel32.NewProc("GetTickCount64").Call()
+	user32.NewProc("SetPropW").Call(hwnd, uintptr(unsafe.Pointer(wide(instanceActiveProperty))), max(now, 1))
+}
+
 // attachWindow 登记同组窗口并结束启动等待，在窗口线程执行
 // 入参: window 原生窗口
 // 返回: error 登记错误
@@ -310,35 +341,4 @@ func (l *windowInstance) Close() error {
 	l.mu.Unlock()
 	l.once.Do(func() { close(l.bound) })
 	return l.instanceListener.Close()
-}
-
-// instanceDesktopManager 创建公开的虚拟桌面查询接口，系统不支持时返回nil
-// 返回: *comObject 查询接口或nil
-func instanceDesktopManager() *comObject {
-	class := guid("{AA509086-5CA9-4C25-8F95-589D3C07B48A}")
-	iid := guid("{A5CD92FF-29BE-454C-8D04-D82879FB3F1B}")
-	var manager *comObject
-	hr, _, _ := ole32.NewProc("CoCreateInstance").Call(uintptr(unsafe.Pointer(&class)), 0, 1, uintptr(unsafe.Pointer(&iid)), uintptr(unsafe.Pointer(&manager)))
-	if hresult(hr) != nil {
-		return nil
-	}
-	return manager
-}
-
-// instanceOnCurrentDesktop 查询窗口是否实际属于当前虚拟桌面，无法确认时不复用
-// 入参: manager 查询接口, hwnd 窗口句柄
-// 返回: bool 是否属于当前桌面
-func instanceOnCurrentDesktop(manager *comObject, hwnd uintptr) bool {
-	if manager == nil {
-		return false
-	}
-	var current int32
-	return hresult(com(manager, 3, hwnd, uintptr(unsafe.Pointer(&current)))) == nil && current != 0
-}
-
-// recordInstanceActivation 更新窗口最近激活时间，不改变窗口位置和桌面
-// 入参: hwnd 窗口句柄
-func recordInstanceActivation(hwnd uintptr) {
-	now, _, _ := kernel32.NewProc("GetTickCount64").Call()
-	user32.NewProc("SetPropW").Call(hwnd, uintptr(unsafe.Pointer(wide(instanceActiveProperty))), max(now, 1))
 }

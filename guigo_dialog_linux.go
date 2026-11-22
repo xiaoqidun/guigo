@@ -37,6 +37,76 @@ type linuxDialogResult struct {
 	err   error
 }
 
+// linuxDialogFinished 完成原生异步对话框并读取本地路径
+// 入参: object 对话框对象, result 异步结果, id 对话框标识
+func linuxDialogFinished(object, result, id uintptr) {
+	n := active.Load()
+	if n == nil {
+		return
+	}
+	dialog := n.dialogsPending[id]
+	if dialog == nil || dialog.object != object {
+		return
+	}
+	finish := gtk.OpenFinish
+	switch dialog.mode {
+	case 1:
+		finish = gtk.SaveFinish
+	case 2:
+		finish = gtk.DirectoryFinish
+	case 3:
+		finish = gtk.MultipleFinish
+	}
+	var nativeErr *linuxError
+	value := finish(object, result, &nativeErr)
+	if value == 0 {
+		canceled := false
+		if nativeErr != nil {
+			domain := nativeErr.Domain
+			code := nativeErr.Code
+			canceled = domain == gtk.DialogErrorQuark() && (code == 1 || code == 2) || domain == gtk.IOErrorQuark() && code == 19
+		}
+		err := nativeError(nativeErr)
+		if n.ctx.Err() != nil {
+			err = ErrClosed
+		} else if err == nil || canceled {
+			err = ErrCanceled
+		}
+		n.finishDialog(id, nil, err)
+		return
+	}
+	defer gtk.Unref(value)
+	if n.ctx.Err() != nil {
+		n.finishDialog(id, nil, ErrClosed)
+		return
+	}
+	var paths []string
+	var err error
+	appendFile := func(file uintptr) {
+		path := gtk.FilePath(file)
+		if path == nil {
+			err = errors.New("selected file has no local path")
+			return
+		}
+		paths = append(paths, nativeString(path))
+		gtk.Free(unsafe.Pointer(path))
+	}
+	if dialog.mode == 3 {
+		count := gtk.ListCount(value)
+		for i := uint32(0); i < count; i++ {
+			file := gtk.ListItem(value, i)
+			appendFile(file)
+			gtk.Unref(file)
+		}
+	} else {
+		appendFile(value)
+	}
+	if len(paths) == 0 && err == nil {
+		err = ErrCanceled
+	}
+	n.finishDialog(id, paths, err)
+}
+
 // dialog 选择单个文件或目录
 // 入参: o 对话框选项, mode 对话框类型
 // 返回: string 文件路径, error 对话框错误
@@ -140,76 +210,6 @@ func (n *nativeWindow) dialogs(o DialogOptions, mode int) ([]string, error) {
 	case <-n.done:
 		return nil, ErrClosed
 	}
-}
-
-// linuxDialogFinished 完成原生异步对话框并读取本地路径
-// 入参: object 对话框对象, result 异步结果, id 对话框标识
-func linuxDialogFinished(object, result, id uintptr) {
-	n := active.Load()
-	if n == nil {
-		return
-	}
-	dialog := n.dialogsPending[id]
-	if dialog == nil || dialog.object != object {
-		return
-	}
-	finish := gtk.OpenFinish
-	switch dialog.mode {
-	case 1:
-		finish = gtk.SaveFinish
-	case 2:
-		finish = gtk.DirectoryFinish
-	case 3:
-		finish = gtk.MultipleFinish
-	}
-	var nativeErr *linuxError
-	value := finish(object, result, &nativeErr)
-	if value == 0 {
-		canceled := false
-		if nativeErr != nil {
-			domain := nativeErr.Domain
-			code := nativeErr.Code
-			canceled = domain == gtk.DialogErrorQuark() && (code == 1 || code == 2) || domain == gtk.IOErrorQuark() && code == 19
-		}
-		err := nativeError(nativeErr)
-		if n.ctx.Err() != nil {
-			err = ErrClosed
-		} else if err == nil || canceled {
-			err = ErrCanceled
-		}
-		n.finishDialog(id, nil, err)
-		return
-	}
-	defer gtk.Unref(value)
-	if n.ctx.Err() != nil {
-		n.finishDialog(id, nil, ErrClosed)
-		return
-	}
-	var paths []string
-	var err error
-	appendFile := func(file uintptr) {
-		path := gtk.FilePath(file)
-		if path == nil {
-			err = errors.New("selected file has no local path")
-			return
-		}
-		paths = append(paths, nativeString(path))
-		gtk.Free(unsafe.Pointer(path))
-	}
-	if dialog.mode == 3 {
-		count := gtk.ListCount(value)
-		for i := uint32(0); i < count; i++ {
-			file := gtk.ListItem(value, i)
-			appendFile(file)
-			gtk.Unref(file)
-		}
-	} else {
-		appendFile(value)
-	}
-	if len(paths) == 0 && err == nil {
-		err = ErrCanceled
-	}
-	n.finishDialog(id, paths, err)
 }
 
 // finishDialog 回收对话框资源并通知等待方

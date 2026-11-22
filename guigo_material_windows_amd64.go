@@ -19,6 +19,7 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/windows"
+	"golang.org/x/sys/windows/registry"
 )
 
 // SupportsWindowMaterial 查询当前平台是否提供指定窗口材质，实际效果由系统外观设置决定
@@ -26,6 +27,18 @@ import (
 // 返回: bool 是否支持
 func SupportsWindowMaterial(material WindowMaterial) bool {
 	return material == WindowSolid || (material == WindowMicaAlt || material == WindowAcrylic) && windows.RtlGetVersion().BuildNumber >= 22621
+}
+
+// systemDark 读取Windows个性化设置判断是否偏好深色应用外观
+// 返回: bool 是否偏好深色外观
+func systemDark() bool {
+	key, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Themes\Personalize`, registry.QUERY_VALUE)
+	if err != nil {
+		return false
+	}
+	defer key.Close()
+	value, _, err := key.GetIntegerValue("AppsUseLightTheme")
+	return err == nil && value == 0
 }
 
 // setWindowMaterial 在宿主线程切换材质，失败时恢复当前窗口外观

@@ -32,6 +32,45 @@ func guid(text string) syscall.GUID {
 	return value
 }
 
+// dialogDefaultLocation 归一化对话框默认目录与文件名，忽略不存在的目录
+// 入参: defaultPath 默认路径, defaultName 默认文件名
+// 返回: string 存在的绝对目录, string 默认文件名
+func dialogDefaultLocation(defaultPath, defaultName string) (string, string) {
+	if defaultPath == "" {
+		return "", defaultName
+	}
+	abs, err := filepath.Abs(defaultPath)
+	if err != nil {
+		return "", defaultName
+	}
+	if info, err := os.Stat(abs); err == nil && info.IsDir() {
+		return abs, defaultName
+	}
+	name := defaultName
+	if name == "" {
+		if base := filepath.Base(abs); base != "" && base != "." && base != string(filepath.Separator) {
+			name = base
+		}
+	}
+	parent := filepath.Dir(abs)
+	if info, err := os.Stat(parent); err == nil && info.IsDir() {
+		return parent, name
+	}
+	return "", name
+}
+
+// shellPath 获取原生文件系统路径
+// 入参: item 文件系统对象
+// 返回: string 文件路径, error 读取错误
+func shellPath(item *comObject) (string, error) {
+	var value *uint16
+	if err := hresult(com(item, 5, 0x80058000, uintptr(unsafe.Pointer(&value)))); err != nil {
+		return "", err
+	}
+	defer ole32.NewProc("CoTaskMemFree").Call(uintptr(unsafe.Pointer(value)))
+	return utf16String(value), nil
+}
+
 // dialog 运行单结果原生对话框
 // 入参: o 对话框选项, mode 对话框类型
 // 返回: string 文件路径, error 对话框错误
@@ -160,43 +199,4 @@ func (n *nativeWindow) dialogs(o DialogOptions, mode int) (paths []string, err e
 		return nil
 	})
 	return
-}
-
-// dialogDefaultLocation 归一化对话框默认目录与文件名，忽略不存在的目录
-// 入参: defaultPath 默认路径, defaultName 默认文件名
-// 返回: string 存在的绝对目录, string 默认文件名
-func dialogDefaultLocation(defaultPath, defaultName string) (string, string) {
-	if defaultPath == "" {
-		return "", defaultName
-	}
-	abs, err := filepath.Abs(defaultPath)
-	if err != nil {
-		return "", defaultName
-	}
-	if info, err := os.Stat(abs); err == nil && info.IsDir() {
-		return abs, defaultName
-	}
-	name := defaultName
-	if name == "" {
-		if base := filepath.Base(abs); base != "" && base != "." && base != string(filepath.Separator) {
-			name = base
-		}
-	}
-	parent := filepath.Dir(abs)
-	if info, err := os.Stat(parent); err == nil && info.IsDir() {
-		return parent, name
-	}
-	return "", name
-}
-
-// shellPath 获取原生文件系统路径
-// 入参: item 文件系统对象
-// 返回: string 文件路径, error 读取错误
-func shellPath(item *comObject) (string, error) {
-	var value *uint16
-	if err := hresult(com(item, 5, 0x80058000, uintptr(unsafe.Pointer(&value)))); err != nil {
-		return "", err
-	}
-	defer ole32.NewProc("CoTaskMemFree").Call(uintptr(unsafe.Pointer(value)))
-	return utf16String(value), nil
 }

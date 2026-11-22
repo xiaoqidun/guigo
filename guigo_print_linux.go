@@ -26,14 +26,6 @@ import (
 	"github.com/ebitengine/purego"
 )
 
-// linuxPrintOperation 持有底层消费内容期间的打印对象
-type linuxPrintOperation struct {
-	owner            *nativeWindow
-	result           chan error
-	err              error
-	failed, finished uint64
-}
-
 // linuxPrintOperations 保存尚未结束消费内容的原生打印对象
 var linuxPrintOperations sync.Map
 
@@ -43,20 +35,12 @@ var linuxPrintFinishedCallback = purego.NewCallback(linuxPrintFinished)
 // linuxPrintFailedCallback 保存GTK打印失败回调地址
 var linuxPrintFailedCallback = purego.NewCallback(linuxPrintFailed)
 
-// printCapabilities 返回WebKitGTK支持的通用打印机制
-// 入参: ctx 查询上下文
-// 返回: PrintCapabilities 打印机制能力, error 查询或取消错误
-func (n *nativeWindow) printCapabilities(ctx context.Context) (PrintCapabilities, error) {
-	if err := ctx.Err(); err != nil {
-		return PrintCapabilities{}, err
-	}
-	n.mu.Lock()
-	closed := n.closed
-	n.mu.Unlock()
-	if closed {
-		return PrintCapabilities{}, ErrClosed
-	}
-	return PrintCapabilities{SystemDialog: true, DialogCompletion: true, Direct: true, PageRanges: true, DeviceSettings: true}, nil
+// linuxPrintOperation 持有底层消费内容期间的打印对象
+type linuxPrintOperation struct {
+	owner            *nativeWindow
+	result           chan error
+	err              error
+	failed, finished uint64
 }
 
 // linuxPrintFailed 保留底层错误，finished随后统一释放原生对象
@@ -64,7 +48,11 @@ func (n *nativeWindow) printCapabilities(ctx context.Context) (PrintCapabilities
 func linuxPrintFailed(operation uintptr, failure *linuxError, _ uintptr) {
 	if value, ok := linuxPrintOperations.Load(operation); ok {
 		job := value.(*linuxPrintOperation)
-		job.err = fmt.Errorf("printing failed: %s", nativeString(failure.Message))
+		if failure != nil && failure.Message != nil {
+			job.err = fmt.Errorf("printing failed: %s", nativeString(failure.Message))
+		} else {
+			job.err = fmt.Errorf("printing failed")
+		}
 	}
 }
 
@@ -89,6 +77,22 @@ func linuxEndPrint(operation uintptr, failure error) {
 		failure = job.err
 	}
 	job.result <- failure
+}
+
+// printCapabilities 返回WebKitGTK支持的通用打印机制
+// 入参: ctx 查询上下文
+// 返回: PrintCapabilities 打印机制能力, error 查询或取消错误
+func (n *nativeWindow) printCapabilities(ctx context.Context) (PrintCapabilities, error) {
+	if err := ctx.Err(); err != nil {
+		return PrintCapabilities{}, err
+	}
+	n.mu.Lock()
+	closed := n.closed
+	n.mu.Unlock()
+	if closed {
+		return PrintCapabilities{}, ErrClosed
+	}
+	return PrintCapabilities{SystemDialog: true, DialogCompletion: true, Direct: true, PageRanges: true, DeviceSettings: true}, nil
 }
 
 // showPrintUI 打开WebKitGTK系统打印对话框并等待底层消费结束

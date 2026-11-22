@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"unsafe"
@@ -73,10 +74,24 @@ func (n *nativeWindow) callResource(calls *callQueue, r *http.Request) (*Resourc
 	if call == nil {
 		return nil, fmt.Errorf("call is closed")
 	}
+	if r.Body == nil {
+		calls.finish(call)
+		return nil, fmt.Errorf("invalid binary request")
+	}
+	size := r.ContentLength
+	if size < 0 {
+		if parsed, err := strconv.ParseInt(r.Header.Get("X-Guigo-Length"), 10, 64); err == nil {
+			size = parsed
+		}
+	}
+	if size < 4 {
+		calls.finish(call)
+		return nil, fmt.Errorf("invalid binary size")
+	}
 	if body, ok := r.Body.(*requestBody); ok {
 		body.ctx = call.ctx
 	}
-	result := calls.run(call, n.options.Bindings, r.Body, r.ContentLength)
+	result := calls.run(call, n.options.Bindings, r.Body, size)
 	data := marshalReply(result)
 	return &Resource{Header: http.Header{"Content-Type": {"application/json"}, "Cache-Control": {"no-store"}}, Body: &memoryResource{bytes.NewReader(data)}}, nil
 }

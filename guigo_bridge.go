@@ -205,14 +205,14 @@ const bridgeScript = `(() => {
 	});
 })();`
 
-// localURL 判断请求是否属于WebView2宿主来源
+// localURL 判断请求是否属于宿主来源
 // 入参: raw 资源地址
 // 返回: bool 是否属于宿主来源
 func localURL(raw string) bool {
 	return localResource(resourceOrigin, raw)
 }
 
-// resourceURL 构造WebView2宿主资源地址
+// resourceURL 构造宿主资源地址
 // 入参: path 资源路径
 // 返回: string 宿主资源地址
 func resourceURL(path string) string {

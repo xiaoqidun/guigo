@@ -25,8 +25,11 @@ import (
 )
 
 var (
-	dwmapi           = syscall.NewLazyDLL("dwmapi.dll")
-	gdi32            = syscall.NewLazyDLL("gdi32.dll")
+	// dwmapi 延迟加载桌面窗口管理器动态库
+	dwmapi = syscall.NewLazyDLL("dwmapi.dll")
+	// gdi32 延迟加载图形设备接口动态库
+	gdi32 = syscall.NewLazyDLL("gdi32.dll")
+	// titleBarCallback 缓存内容标题栏子窗口过程回调地址
 	titleBarCallback = syscall.NewCallback(titleBarChildProc)
 )
 
@@ -36,6 +39,93 @@ type titleBarButtonInfo struct {
 	Bounds rect
 	States [6]uint32
 	Rects  [6]rect
+}
+
+// titleBarColor 将已校验的RGB颜色转换为Win32的COLORREF
+// 入参: value #RRGGBB颜色
+// 返回: uint32 Win32颜色值
+func titleBarColor(value string) uint32 {
+	rgb, _ := strconv.ParseUint(value[1:], 16, 24)
+	return uint32(rgb&0xff)<<16 | uint32(rgb&0xff00) | uint32(rgb>>16)
+}
+
+// titleBarRegion 创建物理像素GDI区域
+// 入参: r 物理像素矩形
+// 返回: uintptr 区域句柄, error 创建错误
+func titleBarRegion(r rect) (uintptr, error) {
+	region, _, err := gdi32.NewProc("CreateRectRgn").Call(uintptr(r.Left), uintptr(r.Top), uintptr(r.Right), uintptr(r.Bottom))
+	if region == 0 {
+		return 0, err
+	}
+	return region, nil
+}
+
+// combineTitleBarRegion 合并区域并释放临时矩形句柄
+// 入参: region 目标区域, r 物理矩形, mode 合并方式
+// 返回: error 合并错误
+func combineTitleBarRegion(region uintptr, r rect, mode uintptr) error {
+	part, err := titleBarRegion(r)
+	if err != nil {
+		return err
+	}
+	defer gdi32.NewProc("DeleteObject").Call(part)
+	ok, _, err := gdi32.NewProc("CombineRgn").Call(region, region, part, mode)
+	if ok == 0 {
+		return err
+	}
+	return nil
+}
+
+// applyTitleBarRegion 将区域所有权转交给窗口，失败时释放句柄
+// 入参: hwnd 自有窗口, region 区域句柄
+// 返回: error 应用错误
+func applyTitleBarRegion(hwnd, region uintptr) error {
+	ok, _, err := user32.NewProc("SetWindowRgn").Call(hwnd, region, 1)
+	if ok == 0 {
+		gdi32.NewProc("DeleteObject").Call(region)
+		return err
+	}
+	return nil
+}
+
+// dragRegionPixels 先裁剪再向内取整，防止坐标溢出及命中范围扩展到相邻控件
+// 入参: r 逻辑矩形, bounds 物理客户区, dpi 当前显示器DPI
+// 返回: rect 裁剪后的物理矩形
+func dragRegionPixels(r Rect, bounds rect, dpi uint32) rect {
+	scale := float64(dpi) / 96
+	width, height := float64(bounds.Right)/scale, float64(bounds.Bottom)/scale
+	left, top := min(width, max(0, r.X)), min(height, max(0, r.Y))
+	right, bottom := min(width, max(0, r.X+r.Width)), min(height, max(0, r.Y+r.Height))
+	if r.Width == 0 || r.Height == 0 || right <= left || bottom <= top {
+		return rect{}
+	}
+	pixels := rect{Left: int32(math.Ceil(left * scale)), Top: int32(math.Ceil(top * scale)), Right: min(bounds.Right, int32(math.Floor(right*scale))), Bottom: min(bounds.Bottom, int32(math.Floor(bottom*scale)))}
+	if pixels.Right <= pixels.Left || pixels.Bottom <= pixels.Top {
+		return rect{}
+	}
+	return pixels
+}
+
+// titleBarChildProc 将自有命中层的非客户区输入交给顶层窗口的系统处理
+// 入参: hwnd 子窗口, msg 消息类型, wparam 消息参数, lparam 消息参数
+// 返回: uintptr 消息处理结果
+func titleBarChildProc(hwnd, msg, wparam, lparam uintptr) uintptr {
+	n := active.Load()
+	if n != nil && hwnd == n.dragWindow {
+		switch {
+		case msg == 0x84:
+			result, _, _ := user32.NewProc("SendMessageW").Call(n.hwnd, msg, wparam, lparam)
+			return result
+		case msg >= 0xa0 && msg <= 0xad || msg == 0x7b:
+			result, _, _ := user32.NewProc("SendMessageW").Call(n.hwnd, msg, wparam, lparam)
+			return result
+		case msg == 0x20:
+			result, _, _ := user32.NewProc("SendMessageW").Call(n.hwnd, msg, n.hwnd, lparam)
+			return result
+		}
+	}
+	result, _, _ := user32.NewProc("DefWindowProcW").Call(hwnd, msg, wparam, lparam)
+	return result
 }
 
 // initializeTitleBarZoom 禁止内容标题栏模式的浏览器缩放和捏合缩放，保持网页与原生按钮对齐
@@ -240,14 +330,6 @@ func (n *nativeWindow) initializeTitleBar() error {
 	return n.layoutTitleBar()
 }
 
-// titleBarColor 将已校验的RGB颜色转换为Win32的COLORREF
-// 入参: value #RRGGBB颜色
-// 返回: uint32 Win32颜色值
-func titleBarColor(value string) uint32 {
-	rgb, _ := strconv.ParseUint(value[1:], 16, 24)
-	return uint32(rgb&0xff)<<16 | uint32(rgb&0xff00) | uint32(rgb>>16)
-}
-
 // applyTitleBarColors 同步系统标题栏配色，不替换窗口按钮或命中行为
 // 入参: focused 窗口是否激活
 // 返回: error 系统配色错误，不支持配色属性的系统保留原生绘制
@@ -291,63 +373,6 @@ func (n *nativeWindow) unregisterTitleBar() {
 		instance, _, _ := kernel32.NewProc("GetModuleHandleW").Call(0)
 		user32.NewProc("UnregisterClassW").Call(uintptr(unsafe.Pointer(wide("GUIGo.Native.Content"))), instance)
 	}
-}
-
-// titleBarRegion 创建物理像素GDI区域
-// 入参: r 物理像素矩形
-// 返回: uintptr 区域句柄, error 创建错误
-func titleBarRegion(r rect) (uintptr, error) {
-	region, _, err := gdi32.NewProc("CreateRectRgn").Call(uintptr(r.Left), uintptr(r.Top), uintptr(r.Right), uintptr(r.Bottom))
-	if region == 0 {
-		return 0, err
-	}
-	return region, nil
-}
-
-// combineTitleBarRegion 合并区域并释放临时矩形句柄
-// 入参: region 目标区域, r 物理矩形, mode 合并方式
-// 返回: error 合并错误
-func combineTitleBarRegion(region uintptr, r rect, mode uintptr) error {
-	part, err := titleBarRegion(r)
-	if err != nil {
-		return err
-	}
-	defer gdi32.NewProc("DeleteObject").Call(part)
-	ok, _, err := gdi32.NewProc("CombineRgn").Call(region, region, part, mode)
-	if ok == 0 {
-		return err
-	}
-	return nil
-}
-
-// applyTitleBarRegion 将区域所有权转交给窗口，失败时释放句柄
-// 入参: hwnd 自有窗口, region 区域句柄
-// 返回: error 应用错误
-func applyTitleBarRegion(hwnd, region uintptr) error {
-	ok, _, err := user32.NewProc("SetWindowRgn").Call(hwnd, region, 1)
-	if ok == 0 {
-		gdi32.NewProc("DeleteObject").Call(region)
-		return err
-	}
-	return nil
-}
-
-// dragRegionPixels 先裁剪再向内取整，防止坐标溢出及命中范围扩展到相邻控件
-// 入参: r 逻辑矩形, bounds 物理客户区, dpi 当前显示器DPI
-// 返回: rect 裁剪后的物理矩形
-func dragRegionPixels(r Rect, bounds rect, dpi uint32) rect {
-	scale := float64(dpi) / 96
-	width, height := float64(bounds.Right)/scale, float64(bounds.Bottom)/scale
-	left, top := min(width, max(0, r.X)), min(height, max(0, r.Y))
-	right, bottom := min(width, max(0, r.X+r.Width)), min(height, max(0, r.Y+r.Height))
-	if r.Width == 0 || r.Height == 0 || right <= left || bottom <= top {
-		return rect{}
-	}
-	pixels := rect{Left: int32(math.Ceil(left * scale)), Top: int32(math.Ceil(top * scale)), Right: min(bounds.Right, int32(math.Floor(right*scale))), Bottom: min(bounds.Bottom, int32(math.Floor(bottom*scale)))}
-	if pixels.Right <= pixels.Left || pixels.Bottom <= pixels.Top {
-		return rect{}
-	}
-	return pixels
 }
 
 // layoutTitleBar 更新自有窗口的裁剪、层次和DWM原生按钮区域
@@ -419,28 +444,6 @@ func (n *nativeWindow) layoutDragRegions() error {
 		return err
 	}
 	return applyTitleBarRegion(n.dragWindow, drag)
-}
-
-// titleBarChildProc 将自有命中层的非客户区输入交给顶层窗口的系统处理
-// 入参: hwnd 子窗口, msg 消息类型, wparam 消息参数, lparam 消息参数
-// 返回: uintptr 消息处理结果
-func titleBarChildProc(hwnd, msg, wparam, lparam uintptr) uintptr {
-	n := active.Load()
-	if n != nil && hwnd == n.dragWindow {
-		switch {
-		case msg == 0x84:
-			result, _, _ := user32.NewProc("SendMessageW").Call(n.hwnd, msg, wparam, lparam)
-			return result
-		case msg >= 0xa0 && msg <= 0xad || msg == 0x7b:
-			result, _, _ := user32.NewProc("SendMessageW").Call(n.hwnd, msg, wparam, lparam)
-			return result
-		case msg == 0x20:
-			result, _, _ := user32.NewProc("SendMessageW").Call(n.hwnd, msg, n.hwnd, lparam)
-			return result
-		}
-	}
-	result, _, _ := user32.NewProc("DefWindowProcW").Call(hwnd, msg, wparam, lparam)
-	return result
 }
 
 // titleBarButtonHit 根据系统按钮的实际矩形识别未由DWM处理的命中
@@ -624,8 +627,8 @@ func (n *nativeWindow) deliverTitleBarChanges() {
 			}
 			func() {
 				defer func() {
-					if value := recover(); value != nil && n.options.OnError != nil {
-						go n.options.OnError(fmt.Errorf("title bar callback panic: %v", value))
+					if value := recover(); value != nil {
+						n.reportError(fmt.Errorf("title bar callback panic: %v", value))
 					}
 				}()
 				n.options.OnTitleBarChanged(info)

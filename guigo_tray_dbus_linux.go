@@ -26,6 +26,15 @@ import (
 	"github.com/ebitengine/purego"
 )
 
+// gdbus 保存托盘总线入口
+var gdbus gdbusAPI
+
+// gdbusOnce 保证托盘总线入口和回调只初始化一次
+var gdbusOnce sync.Once
+
+// gdbusError 保存托盘总线加载错误
+var gdbusError error
+
 // gdbusAPI 保存系统GIO和GLib的定长参数入口，避免C可变参数调用
 type gdbusAPI struct {
 	Address     func(int32, uintptr, **linuxError) *byte                                                                      `symbol:"g_dbus_address_get_for_bus_sync"`
@@ -53,15 +62,6 @@ type gdbusAPI struct {
 	Variant     func(uintptr) uintptr                                                                                         `symbol:"g_variant_get_variant"`
 	String      func(uintptr, uintptr) *byte                                                                                  `symbol:"g_variant_get_string"`
 }
-
-// gdbus 保存托盘总线入口
-var gdbus gdbusAPI
-
-// gdbusOnce 保证托盘总线入口和回调只初始化一次
-var gdbusOnce sync.Once
-
-// gdbusError 保存托盘总线加载错误
-var gdbusError error
 
 // loadGDBus 按需绑定GTK运行时已有的GIO，不引入额外Go模块或系统组件
 // 返回: error 动态库或符号加载错误

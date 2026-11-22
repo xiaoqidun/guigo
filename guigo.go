@@ -249,10 +249,10 @@ type envelope struct {
 	Code      string `json:"code,omitempty"`
 }
 
-// Error 返回错误说明
-// 返回: string 错误信息
-func (e *BridgeError) Error() string {
-	return e.Message
+// SystemDark 返回系统当前是否偏好深色外观，未适配平台或查询失败时返回false
+// 返回: bool 是否偏好深色外观
+func SystemDark() bool {
+	return systemDark()
 }
 
 // DefaultUserDataDir 返回应用的默认浏览器数据目录，不创建或删除目录
@@ -302,103 +302,6 @@ func Run(ctx context.Context, options Options) error {
 	return run(ctx, options)
 }
 
-// Emit 向页面发送命名事件，返回值表示消息已交给宿主而非页面已消费
-// 入参: name 非空事件名称, value 可JSON编码的数据
-// 返回: error 错误信息
-func (w *Window) Emit(name string, value any) error {
-	if w == nil || w.native == nil {
-		return ErrClosed
-	}
-	if name == "" {
-		return errors.New("empty event name")
-	}
-	b, err := json.Marshal(envelope{Type: "event", Name: name, Value: value})
-	if err != nil {
-		return err
-	}
-	return w.native.emit(string(b))
-}
-
-// Close 请求关闭窗口，OnClosing和页面beforeunload可以取消此次请求
-// 返回: error 请求投递错误
-func (w *Window) Close() error {
-	if w == nil || w.native == nil {
-		return ErrClosed
-	}
-	return w.native.close()
-}
-
-// Hide 隐藏窗口但保留宿主，首次页面加载完成后仍保持隐藏，可用Activate恢复
-// 调用方应保留托盘或其他恢复入口
-// 返回: error 请求投递错误
-func (w *Window) Hide() error {
-	if w == nil || w.native == nil {
-		return ErrClosed
-	}
-	return w.native.hide()
-}
-
-// Activate 请求恢复并显示窗口，是否获得焦点由桌面系统决定
-// 首屏加载完成前调用时，窗口仍按正常启动流程显示
-// 返回: error 请求投递错误
-func (w *Window) Activate() error {
-	if w == nil || w.native == nil {
-		return ErrClosed
-	}
-	return w.native.activate()
-}
-
-// SetTitle 修改窗口标题
-// 入参: title 窗口标题
-// 返回: error 错误信息
-func (w *Window) SetTitle(title string) error {
-	if w == nil || w.native == nil {
-		return ErrClosed
-	}
-	if strings.ContainsRune(title, 0) {
-		return errors.New("title contains NUL")
-	}
-	return w.native.setTitle(title)
-}
-
-// TitleBarInfo 返回当前标题栏布局和窗口状态
-// 返回: TitleBarInfo 标题栏信息, error 查询错误
-func (w *Window) TitleBarInfo() (TitleBarInfo, error) {
-	if w == nil || w.native == nil {
-		return TitleBarInfo{}, ErrClosed
-	}
-	return w.native.titleBarInfo()
-}
-
-// SetTitleBarColors 更新内容标题栏配色，零值恢复系统外观，系统标题栏模式返回错误
-// 入参: colors 激活及失焦配色，非零值必须完整提供四种#RRGGBB颜色
-// 返回: error 配色、模式或窗口错误
-func (w *Window) SetTitleBarColors(colors TitleBarColors) error {
-	if w == nil || w.native == nil {
-		return ErrClosed
-	}
-	if err := validateTitleBarColors(colors); err != nil {
-		return err
-	}
-	return w.native.setTitleBarColors(colors)
-}
-
-// SetWindowMaterial 更新窗口背景材质，不支持的材质返回错误
-// 入参: material 窗口材质，纯色关闭系统背景材质
-// 返回: error 材质或窗口错误
-func (w *Window) SetWindowMaterial(material WindowMaterial) error {
-	if w == nil || w.native == nil {
-		return ErrClosed
-	}
-	if material != WindowSolid && material != WindowMicaAlt && material != WindowAcrylic {
-		return errors.New("invalid window material")
-	}
-	if !SupportsWindowMaterial(material) {
-		return ErrUnsupportedPlatform
-	}
-	return w.native.setWindowMaterial(material)
-}
-
 // validateTitleBarColors 校验内容标题栏的完整配色或系统默认值
 // 入参: colors 标题栏配色
 // 返回: error 配色错误
@@ -415,98 +318,6 @@ func validateTitleBarColors(colors TitleBarColors) error {
 		}
 	}
 	return nil
-}
-
-// SetDragRegions 替换内容标题栏的原生拖动区域，空切片清除区域，系统模式返回错误
-// 区域使用客户区逻辑像素，不随页面缩放变化，调用方负责排除交互控件并随布局更新
-// 超出客户区的部分裁剪，系统按钮及调整大小的边缘优先，不改变页面内容或注入JS接口
-// 入参: regions 拖动矩形集合，调用时复制，坐标和尺寸必须有限且尺寸非负
-// 返回: error 设置错误
-func (w *Window) SetDragRegions(regions []Rect) error {
-	if w == nil || w.native == nil {
-		return ErrClosed
-	}
-	regions = append([]Rect(nil), regions...)
-	for _, r := range regions {
-		for _, v := range []float64{r.X, r.Y, r.Width, r.Height, r.X + r.Width, r.Y + r.Height} {
-			if math.IsNaN(v) || math.IsInf(v, 0) {
-				return errors.New("drag region must be finite")
-			}
-		}
-		if r.Width < 0 || r.Height < 0 {
-			return errors.New("invalid drag region dimensions")
-		}
-	}
-	return w.native.setDragRegions(regions)
-}
-
-// SetSize 修改客户区尺寸并遵循约束
-// 入参: width 客户区宽度, height 客户区高度
-// 返回: error 错误信息
-func (w *Window) SetSize(width, height int) error {
-	if w == nil || w.native == nil {
-		return ErrClosed
-	}
-	return w.native.setSize(width, height)
-}
-
-// ResourceURL 返回当前平台的宿主资源地址，不支持的平台返回空字符串
-// 入参: path 资源路径
-// 返回: string 宿主资源地址
-func (w *Window) ResourceURL(path string) string {
-	return resourceURL(path)
-}
-
-// OpenFile 选择单个已有文件
-// 入参: o 对话框选项
-// 返回: string 文件路径, error 错误信息，用户取消返回ErrCanceled
-func (w *Window) OpenFile(o DialogOptions) (string, error) {
-	if w == nil || w.native == nil {
-		return "", ErrClosed
-	}
-	if err := validateDialog(o); err != nil {
-		return "", err
-	}
-	return w.native.dialog(o, 0)
-}
-
-// OpenFiles 选择多个已有文件
-// 入参: o 对话框选项
-// 返回: []string 文件路径, error 错误信息，用户取消返回ErrCanceled
-func (w *Window) OpenFiles(o DialogOptions) ([]string, error) {
-	if w == nil || w.native == nil {
-		return nil, ErrClosed
-	}
-	if err := validateDialog(o); err != nil {
-		return nil, err
-	}
-	return w.native.dialogs(o, 3)
-}
-
-// SaveFile 选择保存路径并提示覆盖已有文件
-// 入参: o 对话框选项
-// 返回: string 保存路径, error 错误信息，用户取消返回ErrCanceled
-func (w *Window) SaveFile(o DialogOptions) (string, error) {
-	if w == nil || w.native == nil {
-		return "", ErrClosed
-	}
-	if err := validateDialog(o); err != nil {
-		return "", err
-	}
-	return w.native.dialog(o, 1)
-}
-
-// OpenDirectory 选择已有目录
-// 入参: o 对话框选项
-// 返回: string 目录路径, error 错误信息，用户取消返回ErrCanceled
-func (w *Window) OpenDirectory(o DialogOptions) (string, error) {
-	if w == nil || w.native == nil {
-		return "", ErrClosed
-	}
-	if err := validateDialog(o); err != nil {
-		return "", err
-	}
-	return w.native.dialog(o, 2)
 }
 
 // validateDialog 检查传入原生对话框的字符串
@@ -692,4 +503,199 @@ func validate(o *Options) error {
 	}
 	o.Bindings = bindings
 	return nil
+}
+
+// Error 返回错误说明
+// 返回: string 错误信息
+func (e *BridgeError) Error() string {
+	return e.Message
+}
+
+// Emit 向页面发送命名事件，返回值表示消息已交给宿主而非页面已消费
+// 入参: name 非空事件名称, value 可JSON编码的数据
+// 返回: error 错误信息
+func (w *Window) Emit(name string, value any) error {
+	if w == nil || w.native == nil {
+		return ErrClosed
+	}
+	if name == "" {
+		return errors.New("empty event name")
+	}
+	b, err := json.Marshal(envelope{Type: "event", Name: name, Value: value})
+	if err != nil {
+		return err
+	}
+	return w.native.emit(string(b))
+}
+
+// Close 请求关闭窗口，OnClosing和页面beforeunload可以取消此次请求
+// 返回: error 请求投递错误
+func (w *Window) Close() error {
+	if w == nil || w.native == nil {
+		return ErrClosed
+	}
+	return w.native.close()
+}
+
+// Hide 隐藏窗口但保留宿主，首次页面加载完成后仍保持隐藏，可用Activate恢复
+// 调用方应保留托盘或其他恢复入口
+// 返回: error 请求投递错误
+func (w *Window) Hide() error {
+	if w == nil || w.native == nil {
+		return ErrClosed
+	}
+	return w.native.hide()
+}
+
+// Activate 请求恢复并显示窗口，是否获得焦点由桌面系统决定
+// 首屏加载完成前调用时，窗口仍按正常启动流程显示
+// 返回: error 请求投递错误
+func (w *Window) Activate() error {
+	if w == nil || w.native == nil {
+		return ErrClosed
+	}
+	return w.native.activate()
+}
+
+// SetTitle 修改窗口标题
+// 入参: title 窗口标题
+// 返回: error 错误信息
+func (w *Window) SetTitle(title string) error {
+	if w == nil || w.native == nil {
+		return ErrClosed
+	}
+	if strings.ContainsRune(title, 0) {
+		return errors.New("title contains NUL")
+	}
+	return w.native.setTitle(title)
+}
+
+// TitleBarInfo 返回当前标题栏布局和窗口状态
+// 返回: TitleBarInfo 标题栏信息, error 查询错误
+func (w *Window) TitleBarInfo() (TitleBarInfo, error) {
+	if w == nil || w.native == nil {
+		return TitleBarInfo{}, ErrClosed
+	}
+	return w.native.titleBarInfo()
+}
+
+// SetTitleBarColors 更新内容标题栏配色，零值恢复系统外观，系统标题栏模式返回错误
+// 入参: colors 激活及失焦配色，非零值必须完整提供四种#RRGGBB颜色
+// 返回: error 配色、模式或窗口错误
+func (w *Window) SetTitleBarColors(colors TitleBarColors) error {
+	if w == nil || w.native == nil {
+		return ErrClosed
+	}
+	if err := validateTitleBarColors(colors); err != nil {
+		return err
+	}
+	return w.native.setTitleBarColors(colors)
+}
+
+// SetWindowMaterial 更新窗口背景材质，不支持的材质返回错误
+// 入参: material 窗口材质，纯色关闭系统背景材质
+// 返回: error 材质或窗口错误
+func (w *Window) SetWindowMaterial(material WindowMaterial) error {
+	if w == nil || w.native == nil {
+		return ErrClosed
+	}
+	if material != WindowSolid && material != WindowMicaAlt && material != WindowAcrylic {
+		return errors.New("invalid window material")
+	}
+	if !SupportsWindowMaterial(material) {
+		return ErrUnsupportedPlatform
+	}
+	return w.native.setWindowMaterial(material)
+}
+
+// SetDragRegions 替换内容标题栏的原生拖动区域，空切片清除区域，系统模式返回错误
+// 区域使用客户区逻辑像素，不随页面缩放变化，调用方负责排除交互控件并随布局更新
+// 超出客户区的部分裁剪，系统按钮及调整大小的边缘优先，不改变页面内容或注入JS接口
+// 入参: regions 拖动矩形集合，调用时复制，坐标和尺寸必须有限且尺寸非负
+// 返回: error 设置错误
+func (w *Window) SetDragRegions(regions []Rect) error {
+	if w == nil || w.native == nil {
+		return ErrClosed
+	}
+	regions = append([]Rect(nil), regions...)
+	for _, r := range regions {
+		for _, v := range []float64{r.X, r.Y, r.Width, r.Height, r.X + r.Width, r.Y + r.Height} {
+			if math.IsNaN(v) || math.IsInf(v, 0) {
+				return errors.New("drag region must be finite")
+			}
+		}
+		if r.Width < 0 || r.Height < 0 {
+			return errors.New("invalid drag region dimensions")
+		}
+	}
+	return w.native.setDragRegions(regions)
+}
+
+// SetSize 修改客户区尺寸并遵循约束
+// 入参: width 客户区宽度, height 客户区高度
+// 返回: error 错误信息
+func (w *Window) SetSize(width, height int) error {
+	if w == nil || w.native == nil {
+		return ErrClosed
+	}
+	return w.native.setSize(width, height)
+}
+
+// ResourceURL 返回当前平台的宿主资源地址，不支持的平台返回空字符串
+// 入参: path 资源路径
+// 返回: string 宿主资源地址
+func (w *Window) ResourceURL(path string) string {
+	return resourceURL(path)
+}
+
+// OpenFile 选择单个已有文件
+// 入参: o 对话框选项
+// 返回: string 文件路径, error 错误信息，用户取消返回ErrCanceled
+func (w *Window) OpenFile(o DialogOptions) (string, error) {
+	if w == nil || w.native == nil {
+		return "", ErrClosed
+	}
+	if err := validateDialog(o); err != nil {
+		return "", err
+	}
+	return w.native.dialog(o, 0)
+}
+
+// OpenFiles 选择多个已有文件
+// 入参: o 对话框选项
+// 返回: []string 文件路径, error 错误信息，用户取消返回ErrCanceled
+func (w *Window) OpenFiles(o DialogOptions) ([]string, error) {
+	if w == nil || w.native == nil {
+		return nil, ErrClosed
+	}
+	if err := validateDialog(o); err != nil {
+		return nil, err
+	}
+	return w.native.dialogs(o, 3)
+}
+
+// SaveFile 选择保存路径并提示覆盖已有文件
+// 入参: o 对话框选项
+// 返回: string 保存路径, error 错误信息，用户取消返回ErrCanceled
+func (w *Window) SaveFile(o DialogOptions) (string, error) {
+	if w == nil || w.native == nil {
+		return "", ErrClosed
+	}
+	if err := validateDialog(o); err != nil {
+		return "", err
+	}
+	return w.native.dialog(o, 1)
+}
+
+// OpenDirectory 选择已有目录
+// 入参: o 对话框选项
+// 返回: string 目录路径, error 错误信息，用户取消返回ErrCanceled
+func (w *Window) OpenDirectory(o DialogOptions) (string, error) {
+	if w == nil || w.native == nil {
+		return "", ErrClosed
+	}
+	if err := validateDialog(o); err != nil {
+		return "", err
+	}
+	return w.native.dialog(o, 2)
 }

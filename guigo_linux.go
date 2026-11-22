@@ -38,10 +38,19 @@ import (
 // resourceOrigin 为WebKitGTK拦截的内部资源来源
 const resourceOrigin = "guigo://localhost"
 
+// active 保存当前运行的Linux窗口宿主
 var active atomic.Pointer[nativeWindow]
+
+// linuxRunning 标记当前进程是否已有运行中的窗口循环
 var linuxRunning atomic.Bool
+
+// linuxThread 保证进程内固定GTK线程只启动一次
 var linuxThread sync.Once
+
+// linuxRuns 传递待固定GTK线程执行的窗口运行请求
 var linuxRuns = make(chan linuxRun)
+
+// linuxCallbacks 缓存供原生信号调用的回调地址
 var linuxCallbacks = struct {
 	tick, closing, closed, loaded, message, scheme, headers, policy, failed, dialog, drop, loadFailed, startup uintptr
 	titleChanged, titlePosition, dragPosition                                                                  uintptr
@@ -304,21 +313,6 @@ func runLinux(parent context.Context, o Options) error {
 	return parent.Err()
 }
 
-// newView 使用固定参数属性接口创建浏览器对象
-// 返回: uintptr 浏览器对象
-func (n *nativeWindow) newView() uintptr {
-	names := [][]byte{[]byte("web-context\x00"), []byte("network-session\x00"), []byte("user-content-manager\x00")}
-	pointers := [3]*byte{&names[0][0], &names[1][0], &names[2][0]}
-	objects := [3]uintptr{n.webContext, n.session, n.manager}
-	var values [3]nativeValue
-	for i := range values {
-		gtk.ValueInit(&values[i], 80)
-		gtk.ValueObject(&values[i], objects[i])
-		defer gtk.ValueUnset(&values[i])
-	}
-	return gtk.ObjectNew(gtk.ViewType(), 3, &pointers[0], &values[0])
-}
-
 // linuxIconDirectory 创建仅用于图标的私有临时目录
 // 返回: string 目录路径, error 创建错误
 func linuxIconDirectory() (string, error) {
@@ -405,29 +399,6 @@ func linuxBridgeScript(token string) string {
  })();`
 }
 
-// enqueue 将操作交给GTK所属线程
-// 入参: fn 原生操作
-// 返回: error 关闭错误
-func (n *nativeWindow) enqueue(fn func()) error {
-	return n.enqueueCleanup(fn, nil)
-}
-
-// enqueueCleanup 将操作及资源释放函数交给GTK线程
-// 入参: fn 原生操作, discard 关闭时的清理操作
-// 返回: error 关闭错误
-func (n *nativeWindow) enqueueCleanup(fn, discard func()) error {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if n.closed {
-		return ErrClosed
-	}
-	n.queue = append(n.queue, linuxJob{run: fn, discard: discard})
-	if n.source == 0 {
-		n.source = gtk.Idle(0, linuxCallbacks.tick, 0, 0)
-	}
-	return nil
-}
-
 // linuxTick 处理跨线程操作及上下文取消
 // 入参: data 原生用户数据
 // 返回: uintptr 是否继续计时
@@ -455,17 +426,6 @@ func linuxTick(data uintptr) uintptr {
 		n.shutdown()
 	}
 	return 0
-}
-
-// newPage 更新页面上下文及调用队列
-func (n *nativeWindow) newPage() {
-	if n.pageCancel != nil {
-		n.pageCancel()
-	}
-	n.pageCtx, n.pageCancel = context.WithCancel(n.ctx)
-	n.calls = newCallQueue(n.pageCtx)
-	n.generation++
-	n.ready = false
 }
 
 // linuxLoadedPage 跟踪导航并发送等待中的事件
@@ -499,25 +459,6 @@ func linuxLoadedPage(view uintptr, event int32, data uintptr) {
 			n.evaluate(raw)
 		}
 	}
-}
-
-// evaluate 将消息投递到当前页面
-// 入参: raw JSON消息
-func (n *nativeWindow) evaluate(raw string) {
-	gtk.Evaluate(n.view, "window.__guigoReceive?.("+raw+")", -1, 0, 0, 0, 0, 0)
-}
-
-// emit 在线程队列中发送事件
-// 入参: raw JSON消息
-// 返回: error 关闭错误
-func (n *nativeWindow) emit(raw string) error {
-	return n.enqueue(func() {
-		if !n.ready {
-			n.pendingEvents = append(n.pendingEvents, raw)
-		} else {
-			n.evaluate(raw)
-		}
-	})
 }
 
 // linuxMessage 解析页面消息并启动异步调用
@@ -571,6 +512,253 @@ func linuxMessage(manager, value, data uintptr) {
 	}
 }
 
+// linuxClosing 截获用户关闭请求
+// 入参: window 窗口对象, data 用户数据
+// 返回: uintptr 是否阻止默认销毁
+func linuxClosing(window, data uintptr) uintptr {
+	if n := active.Load(); n != nil && n.window == window {
+		n.requestClose()
+	}
+	return 1
+}
+
+// linuxClosed 完成WebKit允许的关闭请求
+// 入参: view 浏览器对象, data 用户数据
+func linuxClosed(view, data uintptr) {
+	if n := active.Load(); n != nil && n.view == view {
+		n.shutdown()
+	}
+}
+
+// linuxTitleChanged 跟踪当前窗口及原生按钮布局变化
+// 入参: object 原生对象, property 属性定义, data 用户数据
+func linuxTitleChanged(object, property, data uintptr) {
+	n := active.Load()
+	if n != nil && (object == n.window || object == n.captionControls[0] || object == n.captionControls[1]) {
+		n.queueTitleInfo()
+	}
+}
+
+// linuxTitlePosition 将真实GTK控件分配在内容区顶部的左右两侧
+// 入参: overlay 叠放容器, child 原生控件, allocation 输出分配区域, data 用户数据
+// 返回: uintptr 是否提供分配区域
+func linuxTitlePosition(overlay, child uintptr, allocation *linuxRectangle, data uintptr) uintptr {
+	n := active.Load()
+	if n == nil || overlay != n.captionOverlay || allocation == nil {
+		return 0
+	}
+	height, widths := n.measureTitleControls()
+	for side, controls := range n.captionControls {
+		if child == controls {
+			*allocation = linuxRectangle{Width: widths[side], Height: height}
+			if side == 1 {
+				allocation.X = gtk.WidgetWidth(overlay) - allocation.Width
+			}
+			n.queueTitleInfo()
+			return 1
+		}
+	}
+	return 0
+}
+
+// linuxDragPosition 将拖动命中区裁剪到WebView逻辑坐标，不包含窗口阴影和原生边框
+// 入参: overlay 叠放容器, child 拖动控件, allocation 输出分配区域, data 用户数据
+// 返回: uintptr 是否提供分配区域
+func linuxDragPosition(overlay, child uintptr, allocation *linuxRectangle, data uintptr) uintptr {
+	n := active.Load()
+	if n == nil || overlay != n.dragOverlay || allocation == nil {
+		return 0
+	}
+	for _, handle := range n.dragHandles {
+		if child == handle.widget {
+			*allocation = linuxClipDragRegion(handle.region, gtk.WidgetWidth(n.view), gtk.WidgetHeight(n.view))
+			return 1
+		}
+	}
+	return 0
+}
+
+// linuxClipDragRegion 向内取整并裁剪区域，避免将相邻交互内容作为拖动命中区
+// 入参: region 逻辑矩形, width 内容宽度, height 内容高度
+// 返回: linuxRectangle GTK分配区域
+func linuxClipDragRegion(region Rect, width, height int32) linuxRectangle {
+	x := math.Ceil(max(0, min(float64(width), region.X)))
+	y := math.Ceil(max(0, min(float64(height), region.Y)))
+	right := math.Floor(max(x, min(float64(width), region.X+region.Width)))
+	bottom := math.Floor(max(y, min(float64(height), region.Y+region.Height)))
+	return linuxRectangle{X: int32(x), Y: int32(y), Width: int32(right - x), Height: int32(bottom - y)}
+}
+
+// openURL 使用系统浏览器打开外部链接
+// 入参: raw 外部地址
+// 返回: error 启动错误
+func openURL(raw string) error {
+	linuxLoadMu.Lock()
+	path := linuxLoadedPath
+	linuxLoadMu.Unlock()
+	if err := loadLinux(path); err != nil {
+		return err
+	}
+	var nativeErr *linuxError
+	if !gtk.LaunchURI(raw, 0, &nativeErr) {
+		if err := nativeError(nativeErr); err != nil {
+			return err
+		}
+		return errors.New("could not launch default URI handler")
+	}
+	return nil
+}
+
+// linuxPolicy 限制页面导航到受信来源
+// 入参: view 浏览器对象, decision 导航决策, kind 决策类型, data 用户数据
+// 返回: uintptr 是否已经处理
+func linuxPolicy(view, decision uintptr, kind int32, data uintptr) uintptr {
+	if kind != 0 && kind != 1 {
+		return 0
+	}
+	n := active.Load()
+	if n == nil || n.view != view {
+		return 0
+	}
+	action := gtk.NavigationAction(decision)
+	uri := gtk.NavigationURI(gtk.ActionRequest(action))
+	if kind == 0 && localURL(uri) {
+		return 0
+	}
+	gtk.PolicyIgnore(decision)
+	if externalURL(uri) {
+		go func() {
+			if err := openURL(uri); err != nil {
+				n.fail(err)
+			}
+		}()
+	}
+	return 1
+}
+
+// linuxProcessFailed 报告浏览器进程异常并关闭窗口
+// 入参: view 浏览器对象, reason 退出原因, data 用户数据
+func linuxProcessFailed(view uintptr, reason int32, data uintptr) {
+	if n := active.Load(); n != nil && n.view == view {
+		n.err = fmt.Errorf("WebKit web process terminated: %d", reason)
+		n.fail(n.err)
+		n.shutdown()
+	}
+}
+
+// linuxDrop 读取GdkFileList并异步通知业务
+// 入参: target 拖放目标, value 文件列表, x 横坐标, y 纵坐标, data 用户数据
+// 返回: uintptr 是否接收文件
+func linuxDrop(target, value uintptr, x, y float64, data uintptr) uintptr {
+	n := active.Load()
+	if n == nil || target == 0 || n.dropTarget != target || n.options.OnDrop == nil {
+		return 0
+	}
+	n.mu.Lock()
+	closed := n.closed
+	n.mu.Unlock()
+	if closed || n.ctx.Err() != nil {
+		return 0
+	}
+	list := gtk.DropFiles(gtk.ValueBoxed(value))
+	defer gtk.ListFree(list)
+	var paths []string
+	for list != nil {
+		p := gtk.FilePath(list.Data)
+		if p != nil {
+			paths = append(paths, nativeString(p))
+			gtk.Free(unsafe.Pointer(p))
+		}
+		list = list.Next
+	}
+	if len(paths) == 0 {
+		return 0
+	}
+	go func() {
+		defer func() {
+			if v := recover(); v != nil {
+				n.fail(fmt.Errorf("OnDrop panic: %v", v))
+			}
+		}()
+		n.mu.Lock()
+		closed := n.closed
+		n.mu.Unlock()
+		if closed || n.ctx.Err() != nil || active.Load() != n {
+			return
+		}
+		n.options.OnDrop(paths)
+	}()
+	return 1
+}
+
+// newView 使用固定参数属性接口创建浏览器对象
+// 返回: uintptr 浏览器对象
+func (n *nativeWindow) newView() uintptr {
+	names := [][]byte{[]byte("web-context\x00"), []byte("network-session\x00"), []byte("user-content-manager\x00")}
+	pointers := [3]*byte{&names[0][0], &names[1][0], &names[2][0]}
+	objects := [3]uintptr{n.webContext, n.session, n.manager}
+	var values [3]nativeValue
+	for i := range values {
+		gtk.ValueInit(&values[i], 80)
+		gtk.ValueObject(&values[i], objects[i])
+		defer gtk.ValueUnset(&values[i])
+	}
+	return gtk.ObjectNew(gtk.ViewType(), 3, &pointers[0], &values[0])
+}
+
+// enqueue 将操作交给GTK所属线程
+// 入参: fn 原生操作
+// 返回: error 关闭错误
+func (n *nativeWindow) enqueue(fn func()) error {
+	return n.enqueueCleanup(fn, nil)
+}
+
+// enqueueCleanup 将操作及资源释放函数交给GTK线程
+// 入参: fn 原生操作, discard 关闭时的清理操作
+// 返回: error 关闭错误
+func (n *nativeWindow) enqueueCleanup(fn, discard func()) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.closed {
+		return ErrClosed
+	}
+	n.queue = append(n.queue, linuxJob{run: fn, discard: discard})
+	if n.source == 0 {
+		n.source = gtk.Idle(0, linuxCallbacks.tick, 0, 0)
+	}
+	return nil
+}
+
+// newPage 更新页面上下文及调用队列
+func (n *nativeWindow) newPage() {
+	if n.pageCancel != nil {
+		n.pageCancel()
+	}
+	n.pageCtx, n.pageCancel = context.WithCancel(n.ctx)
+	n.calls = newCallQueue(n.pageCtx)
+	n.generation++
+	n.ready = false
+}
+
+// evaluate 将消息投递到当前页面
+// 入参: raw JSON消息
+func (n *nativeWindow) evaluate(raw string) {
+	gtk.Evaluate(n.view, "window.__guigoReceive?.("+raw+")", -1, 0, 0, 0, 0, 0)
+}
+
+// emit 在线程队列中发送事件
+// 入参: raw JSON消息
+// 返回: error 关闭错误
+func (n *nativeWindow) emit(raw string) error {
+	return n.enqueue(func() {
+		if !n.ready {
+			n.pendingEvents = append(n.pendingEvents, raw)
+		} else {
+			n.evaluate(raw)
+		}
+	})
+}
+
 // activate 首次显示后请求桌面恢复最小化窗口并激活
 // 返回: error 请求投递错误
 func (n *nativeWindow) activate() error {
@@ -597,16 +785,6 @@ func (n *nativeWindow) hide() error {
 // 返回: error 关闭错误
 func (n *nativeWindow) close() error {
 	return n.enqueue(n.requestClose)
-}
-
-// linuxClosing 截获用户关闭请求
-// 入参: window 窗口对象, data 用户数据
-// 返回: uintptr 是否阻止默认销毁
-func linuxClosing(window, data uintptr) uintptr {
-	if n := active.Load(); n != nil && n.window == window {
-		n.requestClose()
-	}
-	return 1
 }
 
 // requestClose 异步检查业务关闭回调，保留校验期间的新请求并触发beforeunload
@@ -642,14 +820,6 @@ func (n *nativeWindow) requestClose() {
 			gtk.TryClose(n.view)
 		})
 	}()
-}
-
-// linuxClosed 完成WebKit允许的关闭请求
-// 入参: view 浏览器对象, data 用户数据
-func linuxClosed(view, data uintptr) {
-	if n := active.Load(); n != nil && n.view == view {
-		n.shutdown()
-	}
 }
 
 // shutdown 取消所有页面操作并退出主循环
@@ -940,171 +1110,10 @@ func (n *nativeWindow) queueTitleInfo() {
 	}
 }
 
-// linuxTitleChanged 跟踪当前窗口及原生按钮布局变化
-// 入参: object 原生对象, property 属性定义, data 用户数据
-func linuxTitleChanged(object, property, data uintptr) {
-	n := active.Load()
-	if n != nil && (object == n.window || object == n.captionControls[0] || object == n.captionControls[1]) {
-		n.queueTitleInfo()
-	}
-}
-
-// linuxTitlePosition 将真实GTK控件分配在内容区顶部的左右两侧
-// 入参: overlay 叠放容器, child 原生控件, allocation 输出分配区域, data 用户数据
-// 返回: uintptr 是否提供分配区域
-func linuxTitlePosition(overlay, child uintptr, allocation *linuxRectangle, data uintptr) uintptr {
-	n := active.Load()
-	if n == nil || overlay != n.captionOverlay || allocation == nil {
-		return 0
-	}
-	height, widths := n.measureTitleControls()
-	for side, controls := range n.captionControls {
-		if child == controls {
-			*allocation = linuxRectangle{Width: widths[side], Height: height}
-			if side == 1 {
-				allocation.X = gtk.WidgetWidth(overlay) - allocation.Width
-			}
-			n.queueTitleInfo()
-			return 1
-		}
-	}
-	return 0
-}
-
-// linuxDragPosition 将拖动命中区裁剪到WebView逻辑坐标，不包含窗口阴影和原生边框
-// 入参: overlay 叠放容器, child 拖动控件, allocation 输出分配区域, data 用户数据
-// 返回: uintptr 是否提供分配区域
-func linuxDragPosition(overlay, child uintptr, allocation *linuxRectangle, data uintptr) uintptr {
-	n := active.Load()
-	if n == nil || overlay != n.dragOverlay || allocation == nil {
-		return 0
-	}
-	for _, handle := range n.dragHandles {
-		if child == handle.widget {
-			*allocation = linuxClipDragRegion(handle.region, gtk.WidgetWidth(n.view), gtk.WidgetHeight(n.view))
-			return 1
-		}
-	}
-	return 0
-}
-
-// linuxClipDragRegion 向内取整并裁剪区域，避免将相邻交互内容作为拖动命中区
-// 入参: region 逻辑矩形, width 内容宽度, height 内容高度
-// 返回: linuxRectangle GTK分配区域
-func linuxClipDragRegion(region Rect, width, height int32) linuxRectangle {
-	x := math.Ceil(max(0, min(float64(width), region.X)))
-	y := math.Ceil(max(0, min(float64(height), region.Y)))
-	right := math.Floor(max(x, min(float64(width), region.X+region.Width)))
-	bottom := math.Floor(max(y, min(float64(height), region.Y+region.Height)))
-	return linuxRectangle{X: int32(x), Y: int32(y), Width: int32(right - x), Height: int32(bottom - y)}
-}
-
-// openURL 使用系统浏览器打开外部链接
-// 入参: raw 外部地址
-// 返回: error 启动错误
-func openURL(raw string) error {
-	linuxLoadMu.Lock()
-	path := linuxLoadedPath
-	linuxLoadMu.Unlock()
-	if err := loadLinux(path); err != nil {
-		return err
-	}
-	var nativeErr *linuxError
-	if !gtk.LaunchURI(raw, 0, &nativeErr) {
-		if err := nativeError(nativeErr); err != nil {
-			return err
-		}
-		return errors.New("could not launch default URI handler")
-	}
-	return nil
-}
-
-// linuxPolicy 限制页面导航到受信来源
-// 入参: view 浏览器对象, decision 导航决策, kind 决策类型, data 用户数据
-// 返回: uintptr 是否已经处理
-func linuxPolicy(view, decision uintptr, kind int32, data uintptr) uintptr {
-	if kind != 0 && kind != 1 {
-		return 0
-	}
-	n := active.Load()
-	if n == nil || n.view != view {
-		return 0
-	}
-	action := gtk.NavigationAction(decision)
-	uri := gtk.NavigationURI(gtk.ActionRequest(action))
-	if kind == 0 && localURL(uri) {
-		return 0
-	}
-	gtk.PolicyIgnore(decision)
-	if externalURL(uri) {
-		go func() {
-			if err := openURL(uri); err != nil {
-				n.fail(err)
-			}
-		}()
-	}
-	return 1
-}
-
-// linuxProcessFailed 报告浏览器进程异常并关闭窗口
-// 入参: view 浏览器对象, reason 退出原因, data 用户数据
-func linuxProcessFailed(view uintptr, reason int32, data uintptr) {
-	if n := active.Load(); n != nil && n.view == view {
-		n.err = fmt.Errorf("WebKit web process terminated: %d", reason)
-		n.fail(n.err)
-		n.shutdown()
-	}
-}
-
 // fail 异步报告错误并隔离用户回调异常
 // 入参: err 异步错误
 func (n *nativeWindow) fail(err error) {
 	if err != nil && n.options.OnError != nil {
 		go func() { defer func() { _ = recover() }(); n.options.OnError(err) }()
 	}
-}
-
-// linuxDrop 读取GdkFileList并异步通知业务
-// 入参: target 拖放目标, value 文件列表, x 横坐标, y 纵坐标, data 用户数据
-// 返回: uintptr 是否接收文件
-func linuxDrop(target, value uintptr, x, y float64, data uintptr) uintptr {
-	n := active.Load()
-	if n == nil || target == 0 || n.dropTarget != target || n.options.OnDrop == nil {
-		return 0
-	}
-	n.mu.Lock()
-	closed := n.closed
-	n.mu.Unlock()
-	if closed || n.ctx.Err() != nil {
-		return 0
-	}
-	list := gtk.DropFiles(gtk.ValueBoxed(value))
-	defer gtk.ListFree(list)
-	var paths []string
-	for list != nil {
-		p := gtk.FilePath(list.Data)
-		if p != nil {
-			paths = append(paths, nativeString(p))
-			gtk.Free(unsafe.Pointer(p))
-		}
-		list = list.Next
-	}
-	if len(paths) == 0 {
-		return 0
-	}
-	go func() {
-		defer func() {
-			if v := recover(); v != nil {
-				n.fail(fmt.Errorf("OnDrop panic: %v", v))
-			}
-		}()
-		n.mu.Lock()
-		closed := n.closed
-		n.mu.Unlock()
-		if closed || n.ctx.Err() != nil || active.Load() != n {
-			return
-		}
-		n.options.OnDrop(paths)
-	}()
-	return 1
 }

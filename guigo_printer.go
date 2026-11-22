@@ -83,6 +83,41 @@ type PrinterProfile struct {
 	Fingerprint string `json:"fingerprint"`
 }
 
+// validatePrinterProfile 统一检查返回区域及作业能力，并计算可复查的设备指纹
+// 入参: p 待校验设备信息，成功时写入指纹
+// 返回: error 设备能力或区域错误
+func validatePrinterProfile(p *PrinterProfile) error {
+	if err := validatePrint(p.Options); err != nil {
+		return err
+	}
+	r := p.PrintableArea
+	for _, v := range []float64{p.Width, p.Height, r.X, r.Y, r.Width, r.Height} {
+		if math.IsNaN(v) || math.IsInf(v, 0) || v < 0 {
+			return fmt.Errorf("invalid printer geometry")
+		}
+	}
+	if p.Printer.Name == "" || p.Width <= 0 || p.Height <= 0 || r.Width <= 0 || r.Height <= 0 || r.X+r.Width > p.Width+0.1 || r.Y+r.Height > p.Height+0.1 {
+		return fmt.Errorf("invalid printer printable area")
+	}
+	if p.Options.Color == "color" && !p.Color || p.Options.Duplex != "" && p.Options.Duplex != "simplex" && !p.Duplex || p.MaxCopies > 0 && p.Options.Copies > p.MaxCopies {
+		return fmt.Errorf("%w: device settings", ErrPrintUnsupported)
+	}
+	p.Fingerprint = ""
+	stable := *p
+	stable.Options.Scale = 0
+	stable.Options.Margins = nil
+	stable.Options.PageRanges = ""
+	stable.Options.PagesPerSide = 0
+	stable.Options.Backgrounds, stable.Options.HeadersFooters = nil, nil
+	data, err := json.Marshal(stable)
+	if err != nil {
+		return err
+	}
+	sum := sha256.Sum256(data)
+	p.Fingerprint = hex.EncodeToString(sum[:])
+	return nil
+}
+
 // ListPrinters 查询当前系统队列，返回空列表时没有可用设备，调用方可提供文件输出
 // 入参: ctx 查询上下文
 // 返回: []PrinterInfo 系统打印队列, error 查询或取消错误
@@ -147,39 +182,4 @@ func (w *Window) ShowPrinterProperties(ctx context.Context, printer string) erro
 		return err
 	}
 	return w.native.showPrinterProperties(ctx, printer)
-}
-
-// validatePrinterProfile 统一检查返回区域及作业能力，并计算可复查的设备指纹
-// 入参: p 待校验设备信息，成功时写入指纹
-// 返回: error 设备能力或区域错误
-func validatePrinterProfile(p *PrinterProfile) error {
-	if err := validatePrint(p.Options); err != nil {
-		return err
-	}
-	r := p.PrintableArea
-	for _, v := range []float64{p.Width, p.Height, r.X, r.Y, r.Width, r.Height} {
-		if math.IsNaN(v) || math.IsInf(v, 0) || v < 0 {
-			return fmt.Errorf("invalid printer geometry")
-		}
-	}
-	if p.Printer.Name == "" || p.Width <= 0 || p.Height <= 0 || r.Width <= 0 || r.Height <= 0 || r.X+r.Width > p.Width+0.1 || r.Y+r.Height > p.Height+0.1 {
-		return fmt.Errorf("invalid printer printable area")
-	}
-	if p.Options.Color == "color" && !p.Color || p.Options.Duplex != "" && p.Options.Duplex != "simplex" && !p.Duplex || p.MaxCopies > 0 && p.Options.Copies > p.MaxCopies {
-		return fmt.Errorf("%w: device settings", ErrPrintUnsupported)
-	}
-	p.Fingerprint = ""
-	stable := *p
-	stable.Options.Scale = 0
-	stable.Options.Margins = nil
-	stable.Options.PageRanges = ""
-	stable.Options.PagesPerSide = 0
-	stable.Options.Backgrounds, stable.Options.HeadersFooters = nil, nil
-	data, err := json.Marshal(stable)
-	if err != nil {
-		return err
-	}
-	sum := sha256.Sum256(data)
-	p.Fingerprint = hex.EncodeToString(sum[:])
-	return nil
 }

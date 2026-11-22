@@ -28,6 +28,33 @@ func SupportsWindowMaterial(material WindowMaterial) bool {
 	return false
 }
 
+// systemDark 返回未适配平台的默认浅色外观
+// 返回: bool 未适配平台返回false
+func systemDark() bool {
+	return false
+}
+
+// resourceURL 返回未适配平台的空资源地址
+// 入参: path 资源路径
+// 返回: string 空地址
+func resourceURL(path string) string {
+	return ""
+}
+
+// openURL 返回平台不支持错误
+// 入参: raw 外部地址
+// 返回: error 平台错误
+func openURL(raw string) error {
+	return ErrUnsupportedPlatform
+}
+
+// run 返回平台不支持错误
+// 入参: parent 运行上下文, o 宿主选项
+// 返回: error 平台错误
+func run(parent context.Context, o Options) error {
+	return ErrUnsupportedPlatform
+}
+
 // activate 返回未适配平台错误
 // 返回: error 平台错误
 func (n *nativeWindow) activate() error {
@@ -80,27 +107,6 @@ func (n *nativeWindow) showPrintUI(ctx context.Context, kind string) error {
 // 返回: PrintResult 空提交结果, error 平台错误
 func (n *nativeWindow) print(ctx context.Context, o PrintOptions) (PrintResult, error) {
 	return PrintResult{}, ErrUnsupportedPlatform
-}
-
-// resourceURL 返回未适配平台的空资源地址
-// 入参: path 资源路径
-// 返回: string 空地址
-func resourceURL(path string) string {
-	return ""
-}
-
-// openURL 返回平台不支持错误
-// 入参: raw 外部地址
-// 返回: error 平台错误
-func openURL(raw string) error {
-	return ErrUnsupportedPlatform
-}
-
-// run 返回平台不支持错误
-// 入参: parent 运行上下文, o 宿主选项
-// 返回: error 平台错误
-func run(parent context.Context, o Options) error {
-	return ErrUnsupportedPlatform
 }
 
 // emit 返回平台不支持错误

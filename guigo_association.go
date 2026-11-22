@@ -20,18 +20,18 @@ import (
 	"strings"
 )
 
-// ErrAssociationElevationRequired 表示所有用户范围需要以管理员权限运行
-var ErrAssociationElevationRequired = errors.New("administrator privileges required")
-
-// AssociationScope 指定独立管理的文件关联范围
-type AssociationScope string
-
 const (
 	// AssociationUser 仅登记当前用户的文件关联
 	AssociationUser AssociationScope = "user"
 	// AssociationMachine 登记所有用户可用的文件关联，需要管理员权限
 	AssociationMachine AssociationScope = "machine"
 )
+
+// ErrAssociationElevationRequired 表示所有用户范围需要以管理员权限运行
+var ErrAssociationElevationRequired = errors.New("administrator privileges required")
+
+// AssociationScope 指定独立管理的文件关联范围
+type AssociationScope string
 
 // FileAssociation 定义应用支持的文件类型
 type FileAssociation struct {

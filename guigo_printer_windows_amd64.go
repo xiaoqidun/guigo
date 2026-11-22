@@ -54,46 +54,6 @@ func windowsDefaultPrinter() string {
 	return syscall.UTF16ToString(buffer)
 }
 
-// listPrinters 枚举已安装本地和连接队列，不连接远端设备读取详细驱动数据
-// 入参: ctx 查询上下文
-// 返回: []PrinterInfo 系统打印队列, error 查询或取消错误
-func (n *nativeWindow) listPrinters(ctx context.Context) ([]PrinterInfo, error) {
-	n.mu.Lock()
-	closed := n.closed
-	n.mu.Unlock()
-	if closed {
-		return nil, ErrClosed
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	var size, count uint32
-	proc := winspool.NewProc("EnumPrintersW")
-	proc.Call(6, 0, 4, 0, 0, uintptr(unsafe.Pointer(&size)), uintptr(unsafe.Pointer(&count)))
-	if size == 0 {
-		return []PrinterInfo{}, ctx.Err()
-	}
-	if size > 64<<20 {
-		return nil, fmt.Errorf("printer list too large")
-	}
-	buffer := make([]byte, size)
-	ok, _, err := proc.Call(6, 0, 4, uintptr(unsafe.Pointer(&buffer[0])), uintptr(size), uintptr(unsafe.Pointer(&size)), uintptr(unsafe.Pointer(&count)))
-	if ok == 0 {
-		return nil, err
-	}
-	if uint64(count)*uint64(unsafe.Sizeof(printerInfo4{})) > uint64(len(buffer)) {
-		return nil, fmt.Errorf("invalid printer list")
-	}
-	defaultName := windowsDefaultPrinter()
-	result := make([]PrinterInfo, 0, count)
-	for _, item := range unsafe.Slice((*printerInfo4)(unsafe.Pointer(&buffer[0])), count) {
-		name := windowsWideString(item.Name)
-		result = append(result, PrinterInfo{Name: name, Default: name == defaultName})
-	}
-	runtime.KeepAlive(buffer)
-	return result, ctx.Err()
-}
-
 // windowsWideString 复制系统提供的UTF16字符串
 // 入参: value 系统UTF16字符串指针
 // 返回: string 字符串副本
@@ -134,6 +94,46 @@ func windowsPrintMode(name string) ([]byte, uintptr, error) {
 		return nil, 0, fmt.Errorf("read printer settings")
 	}
 	return data, printer, nil
+}
+
+// listPrinters 枚举已安装本地和连接队列，不连接远端设备读取详细驱动数据
+// 入参: ctx 查询上下文
+// 返回: []PrinterInfo 系统打印队列, error 查询或取消错误
+func (n *nativeWindow) listPrinters(ctx context.Context) ([]PrinterInfo, error) {
+	n.mu.Lock()
+	closed := n.closed
+	n.mu.Unlock()
+	if closed {
+		return nil, ErrClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	var size, count uint32
+	proc := winspool.NewProc("EnumPrintersW")
+	proc.Call(6, 0, 4, 0, 0, uintptr(unsafe.Pointer(&size)), uintptr(unsafe.Pointer(&count)))
+	if size == 0 {
+		return []PrinterInfo{}, ctx.Err()
+	}
+	if size > 64<<20 {
+		return nil, fmt.Errorf("printer list too large")
+	}
+	buffer := make([]byte, size)
+	ok, _, err := proc.Call(6, 0, 4, uintptr(unsafe.Pointer(&buffer[0])), uintptr(size), uintptr(unsafe.Pointer(&size)), uintptr(unsafe.Pointer(&count)))
+	if ok == 0 {
+		return nil, err
+	}
+	if uint64(count)*uint64(unsafe.Sizeof(printerInfo4{})) > uint64(len(buffer)) {
+		return nil, fmt.Errorf("invalid printer list")
+	}
+	defaultName := windowsDefaultPrinter()
+	result := make([]PrinterInfo, 0, count)
+	for _, item := range unsafe.Slice((*printerInfo4)(unsafe.Pointer(&buffer[0])), count) {
+		name := windowsWideString(item.Name)
+		result = append(result, PrinterInfo{Name: name, Default: name == defaultName})
+	}
+	runtime.KeepAlive(buffer)
+	return result, ctx.Err()
 }
 
 // queryPrinter 查询当前纸张、方向对应的驱动可打印区域，毫米换算使用设备DPI

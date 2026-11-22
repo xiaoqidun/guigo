@@ -73,6 +73,21 @@ const linuxTrayXML = `<node>
 </interface>
 </node>`
 
+// linuxTrays 按数字标识保存原生回调对应的托盘
+var linuxTrays sync.Map
+
+// linuxTrayIDs 分配独立托盘标识
+var linuxTrayIDs atomic.Uint64
+
+// linuxTrayVTable 保存总线对象回调表
+var linuxTrayVTable [11]uintptr
+
+// linuxTraySignal 接收宿主变更通知
+var linuxTraySignal uintptr
+
+// linuxTrayClosedSignal 接收连接关闭通知
+var linuxTrayClosedSignal uintptr
+
 // linuxTray 的配置与原生字段仅由GTK线程访问
 type linuxTray struct {
 	owner            *nativeWindow
@@ -94,20 +109,145 @@ type linuxTray struct {
 	revision         uint32
 }
 
-// linuxTrays 按数字标识保存原生回调对应的托盘
-var linuxTrays sync.Map
+// trayPixmap 将PNG缩放为托盘常用尺寸，按网络字节序生成ARGB像素
+// 入参: data PNG数据，空值使用桌面默认图标
+// 返回: string GVariant像素数组, error 解码错误
+func trayPixmap(data []byte) (string, error) {
+	if len(data) == 0 {
+		return "@a(iiay) []", nil
+	}
+	img, err := png.Decode(bytes.NewReader(data))
+	if err != nil {
+		return "", err
+	}
+	var text strings.Builder
+	text.WriteString("@a(iiay) [")
+	for i, size := range []int{32, 64} {
+		if i != 0 {
+			text.WriteByte(',')
+		}
+		fmt.Fprintf(&text, "(%d,%d,@ay [", size, size)
+		for y := 0; y < size; y++ {
+			for x := 0; x < size; x++ {
+				if x != 0 || y != 0 {
+					text.WriteByte(',')
+				}
+				pixel := color.NRGBAModel.Convert(img.At(x*img.Bounds().Dx()/size, y*img.Bounds().Dy()/size)).(color.NRGBA)
+				fmt.Fprintf(&text, "0x%02x,0x%02x,0x%02x,0x%02x", pixel.A, pixel.R, pixel.G, pixel.B)
+			}
+		}
+		text.WriteString("])")
+	}
+	text.WriteByte(']')
+	return text.String(), nil
+}
 
-// linuxTrayIDs 分配独立托盘标识
-var linuxTrayIDs atomic.Uint64
+// linuxTrayHostChanged 在宿主注销或监视服务丢失时恢复窗口，避免用户失去入口
+// 入参: connection 总线连接, sender 发送者, path 对象路径, iface 接口, signal 信号名, params 信号参数, data 托盘标识
+func linuxTrayHostChanged(connection uintptr, sender, path, iface, signal *byte, params, data uintptr) {
+	if nativeString(signal) == "NameOwnerChanged" && trayString(params, 1) == "" {
+		return
+	}
+	if value, ok := linuxTrays.Load(data); ok {
+		t := value.(*linuxTray)
+		t.release()
+		t.owner.activate()
+	}
+}
 
-// linuxTrayVTable 保存总线对象回调表
-var linuxTrayVTable [11]uintptr
+// linuxTrayConnectionClosed 可能由GIO工作线程触发，只排队操作GTK资源
+// 入参: connection 总线连接, vanished 远端断开标志, failure 原生错误, data 托盘标识
+func linuxTrayConnectionClosed(connection uintptr, vanished int32, failure, data uintptr) {
+	if value, ok := linuxTrays.Load(data); ok {
+		t := value.(*linuxTray)
+		t.owner.enqueue(func() {
+			if !t.closed {
+				t.release()
+				t.owner.activate()
+			}
+		})
+	}
+}
 
-// linuxTraySignal 接收宿主变更通知
-var linuxTraySignal uintptr
+// linuxTrayMethod 为原生调用返回唯一响应，原生侧随后释放invocation
+// 入参: connection 总线连接, sender 发送者, path 对象路径, iface 接口, method 方法名, params 请求参数, invocation 调用对象, data 托盘标识
+func linuxTrayMethod(connection uintptr, sender, path, iface, method *byte, params, invocation, data uintptr) {
+	value, ok := linuxTrays.Load(data)
+	if !ok {
+		gdbus.ReturnError(invocation, "org.freedesktop.DBus.Error.Disconnected", "tray closed")
+		return
+	}
+	t := value.(*linuxTray)
+	text := "()"
+	var err error
+	if nativeString(iface) == trayMenuInterface {
+		text, err = t.menuReply(nativeString(method), params)
+	} else if nativeString(method) == "Activate" {
+		if !t.options.MenuOnActivate && t.options.OnActivate != nil {
+			go t.options.OnActivate()
+		}
+	} else if nativeString(method) == "SecondaryActivate" {
+		if t.options.OnSecondaryActivate != nil {
+			go t.options.OnSecondaryActivate()
+		}
+	}
+	if err == nil {
+		var result uintptr
+		result, err = trayVariant(text)
+		if err == nil {
+			gdbus.Return(invocation, result)
+			gdbus.Unref(result)
+			return
+		}
+	}
+	gdbus.ReturnError(invocation, "org.freedesktop.DBus.Error.InvalidArgs", err.Error())
+}
 
-// linuxTrayClosedSignal 接收连接关闭通知
-var linuxTrayClosedSignal uintptr
+// linuxTrayProperty 返回完整GVariant引用，所有权交给GDBus
+// 入参: connection 总线连接, sender 发送者, path 对象路径, iface 接口, property 属性名, failure 原生错误输出, data 托盘标识
+// 返回: uintptr 属性值
+func linuxTrayProperty(connection uintptr, sender, path, iface, property *byte, failure **linuxError, data uintptr) uintptr {
+	value, ok := linuxTrays.Load(data)
+	if !ok {
+		return 0
+	}
+	t := value.(*linuxTray)
+	var text string
+	if nativeString(iface) == trayNotifierInterface {
+		switch nativeString(property) {
+		case "Category":
+			text = `"ApplicationStatus"`
+		case "Id":
+			text = trayQuote(fmt.Sprintf("%s-%d", t.owner.options.AppID, t.id))
+		case "Title":
+			text = trayQuote(t.options.Title)
+		case "Status":
+			text = `"Active"`
+		case "IconName":
+			text = trayQuote(t.iconName())
+		case "IconPixmap":
+			text = t.pixmap
+		case "ToolTip":
+			text = fmt.Sprintf("(%s, %s, %s, \"\")", trayQuote(t.iconName()), t.pixmap, trayQuote(t.options.Title))
+		case "ItemIsMenu":
+			text = fmt.Sprint(t.options.MenuOnActivate)
+		case "Menu":
+			text = `objectpath "/MenuBar"`
+		}
+	} else {
+		switch nativeString(property) {
+		case "Version":
+			text = "uint32 3"
+		case "TextDirection":
+			text = `"ltr"`
+		case "Status":
+			text = `"normal"`
+		case "IconThemePath":
+			text = "@as []"
+		}
+	}
+	return gdbus.Parse(0, text, 0, 0, failure)
+}
 
 // newTray 导出对象后在后台注册宿主，避免宿主回查属性时阻塞GTK回调
 // 入参: options 托盘配置
@@ -220,39 +360,6 @@ func (t *linuxTray) setOptions(options TrayOptions) error {
 	return updateErr
 }
 
-// trayPixmap 将PNG缩放为托盘常用尺寸，按网络字节序生成ARGB像素
-// 入参: data PNG数据，空值使用桌面默认图标
-// 返回: string GVariant像素数组, error 解码错误
-func trayPixmap(data []byte) (string, error) {
-	if len(data) == 0 {
-		return "@a(iiay) []", nil
-	}
-	img, err := png.Decode(bytes.NewReader(data))
-	if err != nil {
-		return "", err
-	}
-	var text strings.Builder
-	text.WriteString("@a(iiay) [")
-	for i, size := range []int{32, 64} {
-		if i != 0 {
-			text.WriteByte(',')
-		}
-		fmt.Fprintf(&text, "(%d,%d,@ay [", size, size)
-		for y := 0; y < size; y++ {
-			for x := 0; x < size; x++ {
-				if x != 0 || y != 0 {
-					text.WriteByte(',')
-				}
-				pixel := color.NRGBAModel.Convert(img.At(x*img.Bounds().Dx()/size, y*img.Bounds().Dy()/size)).(color.NRGBA)
-				fmt.Fprintf(&text, "0x%02x,0x%02x,0x%02x,0x%02x", pixel.A, pixel.R, pixel.G, pixel.B)
-			}
-		}
-		text.WriteString("])")
-	}
-	text.WriteByte(']')
-	return text.String(), nil
-}
-
 // iconName 仅在未指定PNG时使用通用应用图标
 // 返回: string 桌面图标名称
 func (t *linuxTray) iconName() string {
@@ -338,111 +445,4 @@ func (t *linuxTray) release() {
 		gtk.Unref(t.connection)
 		t.connection = 0
 	}
-}
-
-// linuxTrayHostChanged 在宿主注销或监视服务丢失时恢复窗口，避免用户失去入口
-// 入参: connection 总线连接, sender 发送者, path 对象路径, iface 接口, signal 信号名, params 信号参数, data 托盘标识
-func linuxTrayHostChanged(connection uintptr, sender, path, iface, signal *byte, params, data uintptr) {
-	if nativeString(signal) == "NameOwnerChanged" && trayString(params, 1) == "" {
-		return
-	}
-	if value, ok := linuxTrays.Load(data); ok {
-		t := value.(*linuxTray)
-		t.release()
-		t.owner.activate()
-	}
-}
-
-// linuxTrayConnectionClosed 可能由GIO工作线程触发，只排队操作GTK资源
-// 入参: connection 总线连接, vanished 远端断开标志, failure 原生错误, data 托盘标识
-func linuxTrayConnectionClosed(connection uintptr, vanished int32, failure, data uintptr) {
-	if value, ok := linuxTrays.Load(data); ok {
-		t := value.(*linuxTray)
-		t.owner.enqueue(func() {
-			if !t.closed {
-				t.release()
-				t.owner.activate()
-			}
-		})
-	}
-}
-
-// linuxTrayMethod 为原生调用返回唯一响应，原生侧随后释放invocation
-// 入参: connection 总线连接, sender 发送者, path 对象路径, iface 接口, method 方法名, params 请求参数, invocation 调用对象, data 托盘标识
-func linuxTrayMethod(connection uintptr, sender, path, iface, method *byte, params, invocation, data uintptr) {
-	value, ok := linuxTrays.Load(data)
-	if !ok {
-		gdbus.ReturnError(invocation, "org.freedesktop.DBus.Error.Disconnected", "tray closed")
-		return
-	}
-	t := value.(*linuxTray)
-	text := "()"
-	var err error
-	if nativeString(iface) == trayMenuInterface {
-		text, err = t.menuReply(nativeString(method), params)
-	} else if nativeString(method) == "Activate" {
-		if !t.options.MenuOnActivate && t.options.OnActivate != nil {
-			go t.options.OnActivate()
-		}
-	} else if nativeString(method) == "SecondaryActivate" {
-		if t.options.OnSecondaryActivate != nil {
-			go t.options.OnSecondaryActivate()
-		}
-	}
-	if err == nil {
-		var result uintptr
-		result, err = trayVariant(text)
-		if err == nil {
-			gdbus.Return(invocation, result)
-			gdbus.Unref(result)
-			return
-		}
-	}
-	gdbus.ReturnError(invocation, "org.freedesktop.DBus.Error.InvalidArgs", err.Error())
-}
-
-// linuxTrayProperty 返回完整GVariant引用，所有权交给GDBus
-// 入参: connection 总线连接, sender 发送者, path 对象路径, iface 接口, property 属性名, failure 原生错误输出, data 托盘标识
-// 返回: uintptr 属性值
-func linuxTrayProperty(connection uintptr, sender, path, iface, property *byte, failure **linuxError, data uintptr) uintptr {
-	value, ok := linuxTrays.Load(data)
-	if !ok {
-		return 0
-	}
-	t := value.(*linuxTray)
-	var text string
-	if nativeString(iface) == trayNotifierInterface {
-		switch nativeString(property) {
-		case "Category":
-			text = `"ApplicationStatus"`
-		case "Id":
-			text = trayQuote(fmt.Sprintf("%s-%d", t.owner.options.AppID, t.id))
-		case "Title":
-			text = trayQuote(t.options.Title)
-		case "Status":
-			text = `"Active"`
-		case "IconName":
-			text = trayQuote(t.iconName())
-		case "IconPixmap":
-			text = t.pixmap
-		case "ToolTip":
-			text = fmt.Sprintf("(%s, %s, %s, \"\")", trayQuote(t.iconName()), t.pixmap, trayQuote(t.options.Title))
-		case "ItemIsMenu":
-			text = fmt.Sprint(t.options.MenuOnActivate)
-		case "Menu":
-			text = `objectpath "/MenuBar"`
-		}
-	} else {
-		switch nativeString(property) {
-		case "Version":
-			text = "uint32 3"
-		case "TextDirection":
-			text = `"ltr"`
-		case "Status":
-			text = `"normal"`
-		case "IconThemePath":
-			text = "@as []"
-		}
-	}
-	return gdbus.Parse(0, text, 0, 0, failure)
 }

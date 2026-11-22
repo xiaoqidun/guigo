@@ -37,7 +37,9 @@ const (
 )
 
 var (
+	// streamRoots 持有活动原生流对象防止被垃圾回收
 	streamRoots sync.Map
+	// streamTable 保存原生IStream虚函数表地址
 	streamTable [14]uintptr
 )
 
@@ -91,28 +93,6 @@ type streamStat struct {
 	Reserved uint32
 }
 
-// Close 关闭临时文件并回收已停用的空目录
-// 返回: error 关闭错误
-func (f *temporaryFile) Close() error {
-	err := f.File.Close()
-	f.directory.mu.Lock()
-	defer f.directory.mu.Unlock()
-	if f.directory.closed {
-		os.Remove(f.directory.path)
-	}
-	return err
-}
-
-// close 停止创建临时文件并回收空目录
-func (d *temporaryDirectory) close() {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.closed = true
-	if d.path != "" {
-		os.Remove(d.path)
-	}
-}
-
 // init 固定原生流回调入口
 func init() {
 	streamTable = [14]uintptr{
@@ -133,50 +113,6 @@ func init() {
 	}
 }
 
-// create 创建句柄关闭后由系统删除的临时文件
-// 入参: prefix 文件名前缀
-// 返回: *temporaryFile 临时文件, error 创建错误
-func (d *temporaryDirectory) create(prefix string) (*temporaryFile, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if d.closed {
-		return nil, os.ErrClosed
-	}
-	for i := 0; d.path == "" && i < 100; i++ {
-		n, err := rand.Int(rand.Reader, big.NewInt(10000000))
-		if err != nil {
-			return nil, err
-		}
-		path := filepath.Join(os.TempDir(), fmt.Sprintf("guigo-%07d", n.Int64()))
-		if err := os.Mkdir(path, 0700); err != nil {
-			if os.IsExist(err) {
-				continue
-			}
-			return nil, err
-		}
-		d.path = path
-	}
-	if d.path == "" {
-		return nil, os.ErrExist
-	}
-	for i := 0; i < 100; i++ {
-		n, err := rand.Int(rand.Reader, big.NewInt(10000000))
-		if err != nil {
-			return nil, err
-		}
-		path := filepath.Join(d.path, fmt.Sprintf("%s%07d.tmp", prefix, n.Int64()))
-		handle, err := syscall.CreateFile(wide(path), temporaryFileAccess, syscall.FILE_SHARE_READ|syscall.FILE_SHARE_WRITE|syscall.FILE_SHARE_DELETE, nil, syscall.CREATE_NEW, temporaryFileFlags, 0)
-		if err == syscall.ERROR_FILE_EXISTS || err == syscall.ERROR_ALREADY_EXISTS {
-			continue
-		}
-		if err != nil {
-			return nil, err
-		}
-		return &temporaryFile{File: os.NewFile(uintptr(handle), path), directory: d}, nil
-	}
-	return nil, os.ErrExist
-}
-
 // newResponseSpool 创建可增量读取的临时存储
 // 入参: ctx 运行上下文, directory 临时目录
 // 返回: *responseSpool 响应存储, error 创建错误
@@ -189,84 +125,6 @@ func newResponseSpool(ctx context.Context, directory *temporaryDirectory) (*resp
 	s.cond = sync.NewCond(&s.mu)
 	s.stop = context.AfterFunc(ctx, func() { s.finish(ctx.Err()) })
 	return s, nil
-}
-
-// Write 增量追加内容并唤醒原生读取器
-// 入参: b 待写入数据
-// 返回: int 写入字节数, error 写入错误
-func (s *responseSpool) Write(b []byte) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.complete {
-		if s.err != nil {
-			return 0, s.err
-		}
-		return 0, io.ErrClosedPipe
-	}
-	if _, err := s.file.Seek(s.size, io.SeekStart); err != nil {
-		return 0, err
-	}
-	n, err := s.file.(io.Writer).Write(b)
-	s.size += int64(n)
-	if err != nil {
-		s.err = err
-		s.complete = true
-	}
-	s.cond.Broadcast()
-	return n, err
-}
-
-// finish 标记流结束或取消
-// 入参: err 结束错误
-func (s *responseSpool) finish(err error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if !s.complete {
-		s.complete = true
-		s.err = err
-	}
-	s.cond.Broadcast()
-}
-
-// drop 释放生产者或流引用并回收临时文件
-func (s *responseSpool) drop() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.refs--
-	if s.refs == 0 {
-		if s.stop != nil {
-			s.stop()
-		}
-		s.file.Close()
-	}
-}
-
-// native 创建独立位置的COM流
-// 入参: offset 初始偏移
-// 返回: *comObject 原生流, error 创建错误
-func (s *responseSpool) native(offset int64) (*comObject, error) {
-	s.mu.Lock()
-	s.refs++
-	s.mu.Unlock()
-	stream := &nativeStream{table: &streamTable, spool: s, offset: offset}
-	stream.refs.Store(1)
-	p := uintptr(unsafe.Pointer(stream))
-	streamRoots.Store(p, stream)
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-	hr, _, _ := ole32.NewProc("CoInitializeEx").Call(0, 0)
-	if hresult(hr) == nil {
-		defer ole32.NewProc("CoUninitialize").Call()
-	} else if uint32(hr) != 0x80010106 {
-		streamRelease(stream)
-		return nil, hresult(hr)
-	}
-	hr, _, _ = ole32.NewProc("CoCreateFreeThreadedMarshaler").Call(p, uintptr(unsafe.Pointer(&stream.marshal)))
-	if err := hresult(hr); err != nil {
-		streamRelease(stream)
-		return nil, err
-	}
-	return (*comObject)(unsafe.Pointer(stream)), nil
 }
 
 // streamQuery 提供流接口和敏捷对象标记
@@ -466,4 +324,148 @@ func streamRevert(stream *nativeStream) uintptr {
 // 返回: uintptr HRESULT结果
 func streamRegion(stream *nativeStream, offset, count uint64, kind uint32) uintptr {
 	return 0x80030001
+}
+
+// Close 关闭临时文件并回收已停用的空目录
+// 返回: error 关闭错误
+func (f *temporaryFile) Close() error {
+	err := f.File.Close()
+	f.directory.mu.Lock()
+	defer f.directory.mu.Unlock()
+	if f.directory.closed {
+		os.Remove(f.directory.path)
+	}
+	return err
+}
+
+// close 停止创建临时文件并回收空目录
+func (d *temporaryDirectory) close() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.closed = true
+	if d.path != "" {
+		os.Remove(d.path)
+	}
+}
+
+// create 创建句柄关闭后由系统删除的临时文件
+// 入参: prefix 文件名前缀
+// 返回: *temporaryFile 临时文件, error 创建错误
+func (d *temporaryDirectory) create(prefix string) (*temporaryFile, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.closed {
+		return nil, os.ErrClosed
+	}
+	for i := 0; d.path == "" && i < 100; i++ {
+		n, err := rand.Int(rand.Reader, big.NewInt(10000000))
+		if err != nil {
+			return nil, err
+		}
+		path := filepath.Join(os.TempDir(), fmt.Sprintf("guigo-%07d", n.Int64()))
+		if err := os.Mkdir(path, 0700); err != nil {
+			if os.IsExist(err) {
+				continue
+			}
+			return nil, err
+		}
+		d.path = path
+	}
+	if d.path == "" {
+		return nil, os.ErrExist
+	}
+	for i := 0; i < 100; i++ {
+		n, err := rand.Int(rand.Reader, big.NewInt(10000000))
+		if err != nil {
+			return nil, err
+		}
+		path := filepath.Join(d.path, fmt.Sprintf("%s%07d.tmp", prefix, n.Int64()))
+		handle, err := syscall.CreateFile(wide(path), temporaryFileAccess, syscall.FILE_SHARE_READ|syscall.FILE_SHARE_WRITE|syscall.FILE_SHARE_DELETE, nil, syscall.CREATE_NEW, temporaryFileFlags, 0)
+		if err == syscall.ERROR_FILE_EXISTS || err == syscall.ERROR_ALREADY_EXISTS {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		return &temporaryFile{File: os.NewFile(uintptr(handle), path), directory: d}, nil
+	}
+	return nil, os.ErrExist
+}
+
+// Write 增量追加内容并唤醒原生读取器
+// 入参: b 待写入数据
+// 返回: int 写入字节数, error 写入错误
+func (s *responseSpool) Write(b []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.complete {
+		if s.err != nil {
+			return 0, s.err
+		}
+		return 0, io.ErrClosedPipe
+	}
+	if _, err := s.file.Seek(s.size, io.SeekStart); err != nil {
+		return 0, err
+	}
+	n, err := s.file.(io.Writer).Write(b)
+	s.size += int64(n)
+	if err != nil {
+		s.err = err
+		s.complete = true
+	}
+	s.cond.Broadcast()
+	return n, err
+}
+
+// finish 标记流结束或取消
+// 入参: err 结束错误
+func (s *responseSpool) finish(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.complete {
+		s.complete = true
+		s.err = err
+	}
+	s.cond.Broadcast()
+}
+
+// drop 释放生产者或流引用并回收临时文件
+func (s *responseSpool) drop() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.refs--
+	if s.refs == 0 {
+		if s.stop != nil {
+			s.stop()
+		}
+		s.file.Close()
+	}
+}
+
+// native 创建独立位置的COM流
+// 入参: offset 初始偏移
+// 返回: *comObject 原生流, error 创建错误
+func (s *responseSpool) native(offset int64) (*comObject, error) {
+	s.mu.Lock()
+	s.refs++
+	s.mu.Unlock()
+	stream := &nativeStream{table: &streamTable, spool: s, offset: offset}
+	stream.refs.Store(1)
+	p := uintptr(unsafe.Pointer(stream))
+	streamRoots.Store(p, stream)
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	hr, _, _ := ole32.NewProc("CoInitializeEx").Call(0, 0)
+	if hresult(hr) == nil {
+		defer ole32.NewProc("CoUninitialize").Call()
+	} else if uint32(hr) != 0x80010106 {
+		streamRelease(stream)
+		return nil, hresult(hr)
+	}
+	hr, _, _ = ole32.NewProc("CoCreateFreeThreadedMarshaler").Call(p, uintptr(unsafe.Pointer(&stream.marshal)))
+	if err := hresult(hr); err != nil {
+		streamRelease(stream)
+		return nil, err
+	}
+	return (*comObject)(unsafe.Pointer(stream)), nil
 }

@@ -14,7 +14,10 @@
 
 package guigo
 
-import "unsafe"
+import (
+	"fmt"
+	"unsafe"
+)
 
 // fileDrop 读取WebView2提供的原生文件路径
 // 入参: args 拖放消息参数
@@ -54,6 +57,13 @@ func (n *nativeWindow) fileDrop(args *comObject) {
 		release(object)
 	}
 	if len(paths) > 0 {
-		go n.options.OnDrop(paths)
+		go func() {
+			defer func() {
+				if v := recover(); v != nil {
+					n.reportError(fmt.Errorf("OnDrop panic: %v", v))
+				}
+			}()
+			n.options.OnDrop(paths)
+		}()
 	}
 }

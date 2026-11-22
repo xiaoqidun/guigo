@@ -79,55 +79,6 @@ type Tray struct {
 	err        error
 }
 
-// NewTray 为当前窗口创建独立托盘，可创建多个，随窗口销毁而释放
-// Windows使用系统通知区域，Linux需要支持StatusNotifierItem和DBusMenu的桌面宿主
-// 无可用宿主时返回ErrTrayUnavailable，未适配的平台返回ErrUnsupportedPlatform
-// 入参: options 托盘配置，图标及菜单数据在返回前复制
-// 返回: *Tray 托盘句柄, error 创建错误
-func (w *Window) NewTray(options TrayOptions) (*Tray, error) {
-	if w == nil || w.native == nil {
-		return nil, ErrClosed
-	}
-	return w.native.newTray(options)
-}
-
-// Available 查询托盘是否已注册且尚未关闭，不表示当前图标一定展开显示
-// 返回: bool 托盘当前是否可用
-func (t *Tray) Available() bool {
-	return t != nil && !t.closed.Load() && t.available.Load()
-}
-
-// SetOptions 完整替换托盘配置，包括回调，零值含义与NewTray相同
-// 更新时可关闭已展开的菜单，已开始执行的回调不受影响
-// 入参: options 新托盘配置，图标及菜单数据在返回前复制
-// 返回: error 配置或更新错误，已关闭时返回ErrClosed
-func (t *Tray) SetOptions(options TrayOptions) error {
-	if t == nil || t.setOptions == nil || t.closed.Load() {
-		return ErrClosed
-	}
-	return t.setOptions(options)
-}
-
-// Close 移除托盘，不关闭窗口，重复调用或窗口已销毁时返回成功
-// 已开始执行的回调不受影响
-// 返回: error 移除错误
-func (t *Tray) Close() error {
-	if t == nil {
-		return nil
-	}
-	t.once.Do(func() {
-		t.closed.Store(true)
-		t.available.Store(false)
-		if t.close != nil {
-			t.err = t.close()
-			if errors.Is(t.err, ErrClosed) {
-				t.err = nil
-			}
-		}
-	})
-	return t.err
-}
-
 // prepareTray 校验并复制配置，统一使用窗口标题及图标作为默认值
 // 入参: options 托盘配置, title 默认标题, icon 默认PNG数据
 // 返回: TrayOptions 独立配置快照, error 配置错误
@@ -185,4 +136,53 @@ func prepareTrayItems(items []TrayItem, seen map[string]bool) ([]TrayItem, error
 		result[i] = item
 	}
 	return result, nil
+}
+
+// NewTray 为当前窗口创建独立托盘，可创建多个，随窗口销毁而释放
+// Windows使用系统通知区域，Linux需要支持StatusNotifierItem和DBusMenu的桌面宿主
+// 无可用宿主时返回ErrTrayUnavailable，未适配的平台返回ErrUnsupportedPlatform
+// 入参: options 托盘配置，图标及菜单数据在返回前复制
+// 返回: *Tray 托盘句柄, error 创建错误
+func (w *Window) NewTray(options TrayOptions) (*Tray, error) {
+	if w == nil || w.native == nil {
+		return nil, ErrClosed
+	}
+	return w.native.newTray(options)
+}
+
+// Available 查询托盘是否已注册且尚未关闭，不表示当前图标一定展开显示
+// 返回: bool 托盘当前是否可用
+func (t *Tray) Available() bool {
+	return t != nil && !t.closed.Load() && t.available.Load()
+}
+
+// SetOptions 完整替换托盘配置，包括回调，零值含义与NewTray相同
+// 更新时可关闭已展开的菜单，已开始执行的回调不受影响
+// 入参: options 新托盘配置，图标及菜单数据在返回前复制
+// 返回: error 配置或更新错误，已关闭时返回ErrClosed
+func (t *Tray) SetOptions(options TrayOptions) error {
+	if t == nil || t.setOptions == nil || t.closed.Load() {
+		return ErrClosed
+	}
+	return t.setOptions(options)
+}
+
+// Close 移除托盘，不关闭窗口，重复调用或窗口已销毁时返回成功
+// 已开始执行的回调不受影响
+// 返回: error 移除错误
+func (t *Tray) Close() error {
+	if t == nil {
+		return nil
+	}
+	t.once.Do(func() {
+		t.closed.Store(true)
+		t.available.Store(false)
+		if t.close != nil {
+			t.err = t.close()
+			if errors.Is(t.err, ErrClosed) {
+				t.err = nil
+			}
+		}
+	})
+	return t.err
 }

@@ -25,9 +25,16 @@ import (
 	"github.com/ebitengine/purego"
 )
 
+// gtk 保存已加载的GTK与WebKitGTK动态库函数入口
 var gtk linuxAPI
+
+// linuxLoadMu 串行化Linux原生运行时的加载状态检查
 var linuxLoadMu sync.Mutex
+
+// linuxLoadedPath 记录已加载的WebKitGTK动态库路径
 var linuxLoadedPath string
+
+// linuxLoaded 标记Linux原生运行时是否已完成加载
 var linuxLoaded bool
 
 // linuxError 对应GLib错误结构的原生布局

@@ -33,18 +33,26 @@ import (
 const resourceOrigin = "https://guigo.localhost"
 
 var (
-	user32        = syscall.NewLazyDLL("user32.dll")
-	ole32         = syscall.NewLazyDLL("ole32.dll")
-	shell32       = syscall.NewLazyDLL("shell32.dll")
-	kernel32      = syscall.NewLazyDLL("kernel32.dll")
-	active        atomic.Pointer[nativeWindow]
-	wndCallback   = syscall.NewCallback(windowProc)
+	// user32 延迟加载Win32窗口管理动态库
+	user32 = syscall.NewLazyDLL("user32.dll")
+	// ole32 延迟加载COM运行时动态库
+	ole32 = syscall.NewLazyDLL("ole32.dll")
+	// shell32 延迟加载系统外壳动态库
+	shell32 = syscall.NewLazyDLL("shell32.dll")
+	// kernel32 延迟加载系统内核动态库
+	kernel32 = syscall.NewLazyDLL("kernel32.dll")
+	// active 保存当前运行的Windows窗口宿主
+	active atomic.Pointer[nativeWindow]
+	// wndCallback 缓存主窗口过程回调地址
+	wndCallback = syscall.NewCallback(windowProc)
+	// callbackTable 保存COM回调虚函数表地址
 	callbackTable = [4]uintptr{
 		syscall.NewCallback(callbackQuery),
 		syscall.NewCallback(callbackAdd),
 		syscall.NewCallback(callbackRelease),
 		syscall.NewCallback(callbackInvoke),
 	}
+	// callbackRoots 持有活动COM回调对象防止被垃圾回收
 	callbackRoots sync.Map
 )
 
@@ -296,15 +304,6 @@ func newCallback(iid string, fn func(uintptr, *comObject) uintptr) (*comCallback
 	p := uintptr(unsafe.Pointer(c))
 	callbackRoots.Store(p, c)
 	return c, p
-}
-
-// callback 注册随窗口生命周期释放的COM回调
-// 入参: iid 接口标识, fn 回调函数
-// 返回: uintptr 回调地址
-func (n *nativeWindow) callback(iid string, fn func(uintptr, *comObject) uintptr) uintptr {
-	c, p := newCallback(iid, fn)
-	n.callbacks = append(n.callbacks, c)
-	return p
 }
 
 // run 创建窗口和WebView2并处理原生消息
@@ -567,6 +566,174 @@ func run(parent context.Context, o Options) error {
 	return parent.Err()
 }
 
+// waitBrowserExit 在清理阶段继续处理COM消息并等待浏览器释放用户目录
+// 入参: process 浏览器进程句柄
+func waitBrowserExit(process uintptr) {
+	for i := 0; i < 50; i++ {
+		status, _, _ := user32.NewProc("MsgWaitForMultipleObjects").Call(1, uintptr(unsafe.Pointer(&process)), 0, 100, 0x4ff)
+		if status == 0 {
+			return
+		}
+		var msg message
+		for {
+			ok, _, _ := user32.NewProc("PeekMessageW").Call(uintptr(unsafe.Pointer(&msg)), 0, 0, 0, 1)
+			if ok == 0 {
+				break
+			}
+			if msg.Message != 0x12 {
+				user32.NewProc("TranslateMessage").Call(uintptr(unsafe.Pointer(&msg)))
+				user32.NewProc("DispatchMessageW").Call(uintptr(unsafe.Pointer(&msg)))
+			}
+		}
+	}
+}
+
+// centerPosition 计算工作区内的可见窗口位置，保留负坐标显示器原点
+// 入参: bounds 可见边框, work 显示器工作区
+// 返回: point 窗口左上角坐标
+func centerPosition(bounds, work rect) point {
+	return point{
+		X: work.Left + max(0, (work.Right-work.Left-(bounds.Right-bounds.Left))/2),
+		Y: work.Top + max(0, (work.Bottom-work.Top-(bounds.Bottom-bounds.Top))/2),
+	}
+}
+
+// windowProc 处理Win32消息
+// 入参: hwnd 窗口句柄, msg 消息类型, wparam 消息参数, lparam 消息参数
+// 返回: uintptr 消息处理结果
+func windowProc(hwnd, msg, wparam, lparam uintptr) uintptr {
+	n := active.Load()
+	if n != nil {
+		if n.trayProc(msg, wparam, lparam) {
+			return 0
+		}
+		if result, handled := n.titleBarProc(hwnd, msg, wparam, lparam); handled {
+			return result
+		}
+		switch msg {
+		case 0x14:
+			if n.options.WindowMaterial != WindowSolid {
+				var bounds rect
+				user32.NewProc("GetClientRect").Call(hwnd, uintptr(unsafe.Pointer(&bounds)))
+				brush, _, _ := gdi32.NewProc("GetStockObject").Call(4)
+				user32.NewProc("FillRect").Call(wparam, uintptr(unsafe.Pointer(&bounds)), brush)
+				return 1
+			}
+		case 0x8001:
+			n.mu.Lock()
+			q := n.queue
+			n.queue = nil
+			n.mu.Unlock()
+			for _, fn := range q {
+				fn.run()
+			}
+			return 0
+		case 5:
+			n.resize()
+			return 0
+		case 3:
+			if n.controller != nil {
+				com(n.controller, 23)
+			}
+		case 6:
+			if wparam&0xffff != 0 && n.options.Instance != nil {
+				recordInstanceActivation(hwnd)
+			}
+			n.scheduleTitleBarChange()
+		case 0x10:
+			n.requestClose()
+			return 0
+		case 0x2e0:
+			n.dpi = uint32(wparam & 0xffff)
+			r := *(**rect)(unsafe.Pointer(&lparam))
+			user32.NewProc("SetWindowPos").Call(hwnd, 0, uintptr(r.Left), uintptr(r.Top), uintptr(r.Right-r.Left), uintptr(r.Bottom-r.Top), 0x14)
+			if err := n.updateIcons(); err != nil {
+				n.reportError(err)
+			}
+			n.resize()
+			return 0
+		case 0x24:
+			info := *(**[5]point)(unsafe.Pointer(&lparam))
+			o := n.options
+			minw, minh, maxw, maxh := o.MinWidth, o.MinHeight, o.MaxWidth, o.MaxHeight
+			if o.FixedSize {
+				minw = o.Width
+				maxw = o.Width
+				minh = o.Height
+				maxh = o.Height
+			}
+			r := rect{}
+			if err := n.adjustRect(&r); err != nil {
+				n.fail(err)
+				return 0
+			}
+			dx, dy := r.Right-r.Left, r.Bottom-r.Top
+			if minw > 0 {
+				info[3].X = n.pixels(minw) + dx
+			}
+			if minh > 0 {
+				info[3].Y = n.pixels(minh) + dy
+			}
+			if maxw > 0 {
+				info[4].X = n.pixels(maxw) + dx
+				if info[1].X > info[4].X {
+					info[1].X = info[4].X
+				}
+			}
+			if maxh > 0 {
+				info[4].Y = n.pixels(maxh) + dy
+				if info[1].Y > info[4].Y {
+					info[1].Y = info[4].Y
+				}
+			}
+			return 0
+		case 0x233:
+			count, _, _ := shell32.NewProc("DragQueryFileW").Call(wparam, 0xffffffff, 0, 0)
+			paths := make([]string, 0, count)
+			for i := uintptr(0); i < count; i++ {
+				size, _, _ := shell32.NewProc("DragQueryFileW").Call(wparam, i, 0, 0)
+				b := make([]uint16, size+1)
+				shell32.NewProc("DragQueryFileW").Call(wparam, i, uintptr(unsafe.Pointer(&b[0])), size+1)
+				paths = append(paths, syscall.UTF16ToString(b))
+			}
+			shell32.NewProc("DragFinish").Call(wparam)
+			if n.options.OnDrop != nil {
+				go func() {
+					defer func() {
+						if v := recover(); v != nil {
+							n.reportError(fmt.Errorf("OnDrop panic: %v", v))
+						}
+					}()
+					n.options.OnDrop(paths)
+				}()
+			}
+			return 0
+		}
+	}
+	r, _, _ := user32.NewProc("DefWindowProcW").Call(hwnd, msg, wparam, lparam)
+	return r
+}
+
+// openURL 调用系统浏览器并返回ShellExecute失败信息
+// 入参: raw 外部地址
+// 返回: error 打开错误
+func openURL(raw string) error {
+	result, _, _ := shell32.NewProc("ShellExecuteW").Call(0, uintptr(unsafe.Pointer(wide("open"))), uintptr(unsafe.Pointer(wide(raw))), 0, 0, 1)
+	if result <= 32 {
+		return fmt.Errorf("open external URL failed (%d)", result)
+	}
+	return nil
+}
+
+// callback 注册随窗口生命周期释放的COM回调
+// 入参: iid 接口标识, fn 回调函数
+// 返回: uintptr 回调地址
+func (n *nativeWindow) callback(iid string, fn func(uintptr, *comObject) uintptr) uintptr {
+	c, p := newCallback(iid, fn)
+	n.callbacks = append(n.callbacks, c)
+	return p
+}
+
 // activate 恢复最小化窗口并请求前台激活
 // 返回: error 请求投递错误
 func (n *nativeWindow) activate() error {
@@ -663,28 +830,6 @@ func (n *nativeWindow) invokeTop(fn func() error) error {
 		return err
 	case <-n.done:
 		return ErrClosed
-	}
-}
-
-// waitBrowserExit 在清理阶段继续处理COM消息并等待浏览器释放用户目录
-// 入参: process 浏览器进程句柄
-func waitBrowserExit(process uintptr) {
-	for i := 0; i < 50; i++ {
-		status, _, _ := user32.NewProc("MsgWaitForMultipleObjects").Call(1, uintptr(unsafe.Pointer(&process)), 0, 100, 0x4ff)
-		if status == 0 {
-			return
-		}
-		var msg message
-		for {
-			ok, _, _ := user32.NewProc("PeekMessageW").Call(uintptr(unsafe.Pointer(&msg)), 0, 0, 0, 1)
-			if ok == 0 {
-				break
-			}
-			if msg.Message != 0x12 {
-				user32.NewProc("TranslateMessage").Call(uintptr(unsafe.Pointer(&msg)))
-				user32.NewProc("DispatchMessageW").Call(uintptr(unsafe.Pointer(&msg)))
-			}
-		}
 	}
 }
 
@@ -861,16 +1006,6 @@ func (n *nativeWindow) center(monitor uintptr) error {
 	return nil
 }
 
-// centerPosition 计算工作区内的可见窗口位置，保留负坐标显示器原点
-// 入参: bounds 可见边框, work 显示器工作区
-// 返回: point 窗口左上角坐标
-func centerPosition(bounds, work rect) point {
-	return point{
-		X: work.Left + max(0, (work.Right-work.Left-(bounds.Right-bounds.Left))/2),
-		Y: work.Top + max(0, (work.Bottom-work.Top-(bounds.Bottom-bounds.Top))/2),
-	}
-}
-
 // setClientSize 在宿主线程应用逻辑客户区尺寸及约束
 // 入参: w 客户区宽度, h 客户区高度
 // 返回: error 调整错误
@@ -915,115 +1050,6 @@ func (n *nativeWindow) resize() {
 		com(n.controller, 6, uintptr(unsafe.Pointer(&r)))
 	}
 	n.scheduleTitleBarChange()
-}
-
-// windowProc 处理Win32消息
-// 入参: hwnd 窗口句柄, msg 消息类型, wparam 消息参数, lparam 消息参数
-// 返回: uintptr 消息处理结果
-func windowProc(hwnd, msg, wparam, lparam uintptr) uintptr {
-	n := active.Load()
-	if n != nil {
-		if n.trayProc(msg, wparam, lparam) {
-			return 0
-		}
-		if result, handled := n.titleBarProc(hwnd, msg, wparam, lparam); handled {
-			return result
-		}
-		switch msg {
-		case 0x14:
-			if n.options.WindowMaterial != WindowSolid {
-				var bounds rect
-				user32.NewProc("GetClientRect").Call(hwnd, uintptr(unsafe.Pointer(&bounds)))
-				brush, _, _ := gdi32.NewProc("GetStockObject").Call(4)
-				user32.NewProc("FillRect").Call(wparam, uintptr(unsafe.Pointer(&bounds)), brush)
-				return 1
-			}
-		case 0x8001:
-			n.mu.Lock()
-			q := n.queue
-			n.queue = nil
-			n.mu.Unlock()
-			for _, fn := range q {
-				fn.run()
-			}
-			return 0
-		case 5:
-			n.resize()
-			return 0
-		case 3:
-			if n.controller != nil {
-				com(n.controller, 23)
-			}
-		case 6:
-			if wparam&0xffff != 0 && n.options.Instance != nil {
-				recordInstanceActivation(hwnd)
-			}
-			n.scheduleTitleBarChange()
-		case 0x10:
-			n.requestClose()
-			return 0
-		case 0x2e0:
-			n.dpi = uint32(wparam & 0xffff)
-			r := *(**rect)(unsafe.Pointer(&lparam))
-			user32.NewProc("SetWindowPos").Call(hwnd, 0, uintptr(r.Left), uintptr(r.Top), uintptr(r.Right-r.Left), uintptr(r.Bottom-r.Top), 0x14)
-			if err := n.updateIcons(); err != nil && n.options.OnError != nil {
-				go n.options.OnError(err)
-			}
-			n.resize()
-			return 0
-		case 0x24:
-			info := *(**[5]point)(unsafe.Pointer(&lparam))
-			o := n.options
-			minw, minh, maxw, maxh := o.MinWidth, o.MinHeight, o.MaxWidth, o.MaxHeight
-			if o.FixedSize {
-				minw = o.Width
-				maxw = o.Width
-				minh = o.Height
-				maxh = o.Height
-			}
-			r := rect{}
-			if err := n.adjustRect(&r); err != nil {
-				n.fail(err)
-				return 0
-			}
-			dx, dy := r.Right-r.Left, r.Bottom-r.Top
-			if minw > 0 {
-				info[3].X = n.pixels(minw) + dx
-			}
-			if minh > 0 {
-				info[3].Y = n.pixels(minh) + dy
-			}
-			if maxw > 0 {
-				info[4].X = n.pixels(maxw) + dx
-				if info[1].X > info[4].X {
-					info[1].X = info[4].X
-				}
-			}
-			if maxh > 0 {
-				info[4].Y = n.pixels(maxh) + dy
-				if info[1].Y > info[4].Y {
-					info[1].Y = info[4].Y
-				}
-			}
-			return 0
-		case 0x233:
-			count, _, _ := shell32.NewProc("DragQueryFileW").Call(wparam, 0xffffffff, 0, 0)
-			paths := make([]string, 0, count)
-			for i := uintptr(0); i < count; i++ {
-				size, _, _ := shell32.NewProc("DragQueryFileW").Call(wparam, i, 0, 0)
-				b := make([]uint16, size+1)
-				shell32.NewProc("DragQueryFileW").Call(wparam, i, uintptr(unsafe.Pointer(&b[0])), size+1)
-				paths = append(paths, syscall.UTF16ToString(b))
-			}
-			shell32.NewProc("DragFinish").Call(wparam)
-			if n.options.OnDrop != nil {
-				go n.options.OnDrop(paths)
-			}
-			return 0
-		}
-	}
-	r, _, _ := user32.NewProc("DefWindowProcW").Call(hwnd, msg, wparam, lparam)
-	return r
 }
 
 // setup 注册资源与桥接并等待注入完成后导航
@@ -1194,7 +1220,14 @@ func (n *nativeWindow) setup() error {
 		}
 		go func() {
 			if n.options.OnReady != nil {
-				n.options.OnReady(&Window{native: n})
+				func() {
+					defer func() {
+						if v := recover(); v != nil {
+							n.reportError(fmt.Errorf("OnReady panic: %v", v))
+						}
+					}()
+					n.options.OnReady(&Window{native: n})
+				}()
 			}
 			_ = n.enqueue(func() {
 				if n.closeRequested {
@@ -1213,23 +1246,12 @@ func (n *nativeWindow) setup() error {
 	return hresult(com(n.webview, 27, uintptr(unsafe.Pointer(wide(bridgeScript))), completed))
 }
 
-// openURL 调用系统浏览器并返回ShellExecute失败信息
-// 入参: raw 外部地址
-// 返回: error 打开错误
-func openURL(raw string) error {
-	result, _, _ := shell32.NewProc("ShellExecuteW").Call(0, uintptr(unsafe.Pointer(wide("open"))), uintptr(unsafe.Pointer(wide(raw))), 0, 0, 1)
-	if result <= 32 {
-		return fmt.Errorf("open external URL failed (%d)", result)
-	}
-	return nil
-}
-
 // external 异步打开外部地址并通知宿主错误
 // 入参: raw 外部地址
 func (n *nativeWindow) external(raw string) {
 	go func() {
-		if err := OpenURL(raw); err != nil && n.options.OnError != nil {
-			n.options.OnError(err)
+		if err := OpenURL(raw); err != nil {
+			n.reportError(err)
 		}
 	}()
 }
@@ -1270,8 +1292,9 @@ func (n *nativeWindow) requestClose() {
 		if n.options.OnClosing != nil {
 			func() {
 				defer func() {
-					if recover() != nil {
+					if v := recover(); v != nil {
 						allowed = false
+						n.reportError(fmt.Errorf("OnClosing panic: %v", v))
 					}
 				}()
 				allowed = n.options.OnClosing(n.ctx)

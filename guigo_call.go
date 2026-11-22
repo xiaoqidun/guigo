@@ -60,6 +60,9 @@ type pageContextKey struct{}
 // 入参: ctx 处理器收到的调用上下文
 // 返回: context.Context 页面上下文，非宿主上下文原样返回
 func PageContext(ctx context.Context) context.Context {
+	if ctx == nil {
+		return nil
+	}
 	if page, ok := ctx.Value(pageContextKey{}).(context.Context); ok {
 		return page
 	}
@@ -71,6 +74,91 @@ func PageContext(ctx context.Context) context.Context {
 // 返回: *callQueue 调用队列
 func newCallQueue(ctx context.Context) *callQueue {
 	return &callQueue{ctx: ctx, items: make(map[string]*pendingCall), slots: make(chan struct{}, 8)}
+}
+
+// readBinaryCall 读取元信息与原始字节并还原参数
+// 入参: ctx 调用上下文, body 请求流, size 请求长度
+// 返回: any 参数, error 解码错误
+func readBinaryCall(ctx context.Context, body io.Reader, size int64) (any, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	var prefix [4]byte
+	if _, err := io.ReadFull(body, prefix[:]); err != nil {
+		return nil, err
+	}
+	length := int64(binary.LittleEndian.Uint32(prefix[:]))
+	if length > 4<<20 || size < length+4 {
+		return nil, errors.New("invalid binary header")
+	}
+	header := make([]byte, int(length))
+	if _, err := io.ReadFull(body, header); err != nil {
+		return nil, err
+	}
+	var packet binaryCall
+	if err := json.Unmarshal(header, &packet); err != nil {
+		return nil, err
+	}
+	remaining := size - length - 4
+	for _, part := range packet.Parts {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if part.Size < 0 || part.Size > remaining || part.Size > int64(int(^uint(0)>>1)) {
+			return nil, errors.New("invalid binary size")
+		}
+		data := make([]byte, int(part.Size))
+		for offset := 0; offset < len(data); {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			end := min(offset+(256<<10), len(data))
+			if _, err := io.ReadFull(body, data[offset:end]); err != nil {
+				return nil, err
+			}
+			offset = end
+		}
+		if err := assignBinary(&packet.Args, part.Path, data); err != nil {
+			return nil, err
+		}
+		remaining -= part.Size
+	}
+	if remaining != 0 {
+		return nil, errors.New("unexpected binary data")
+	}
+	return packet.Args, nil
+}
+
+// assignBinary 将原始字节写入元信息指定位置
+// 入参: value 参数位置, path 字段路径, data 原始字节
+// 返回: error 路径错误
+func assignBinary(value *any, path []string, data []byte) error {
+	if len(path) == 0 {
+		if *value != nil {
+			return errors.New("invalid binary target")
+		}
+		*value = data
+		return nil
+	}
+	switch parent := (*value).(type) {
+	case map[string]any:
+		child, ok := parent[path[0]]
+		if !ok {
+			break
+		}
+		if err := assignBinary(&child, path[1:], data); err != nil {
+			return err
+		}
+		parent[path[0]] = child
+		return nil
+	case []any:
+		i, err := strconv.Atoi(path[0])
+		if err != nil || i < 0 || i >= len(parent) {
+			break
+		}
+		return assignBinary(&parent[i], path[1:], data)
+	}
+	return errors.New("invalid binary path")
 }
 
 // add 登记调用并限制待处理数量
@@ -177,7 +265,19 @@ func (q *callQueue) run(call *pendingCall, bindings map[string]HandlerFunc, body
 		call.message.Args = args
 	}
 	reply := dispatch(call.ctx, bindings, call.message)
-	if result, ok := reply.Value.(Result); ok {
+	var result Result
+	var hasResult bool
+	switch value := reply.Value.(type) {
+	case Result:
+		result, hasResult = value, true
+	case *Result:
+		if value != nil {
+			result, hasResult = *value, true
+		} else {
+			reply.Value = nil
+		}
+	}
+	if hasResult {
 		reply.Value = result.Value
 		if result.Discard != nil {
 			q.mu.Lock()
@@ -197,89 +297,4 @@ func (q *callQueue) run(call *pendingCall, bindings map[string]HandlerFunc, body
 		reply.ErrorName = "AbortError"
 	}
 	return reply
-}
-
-// readBinaryCall 读取元信息与原始字节并还原参数
-// 入参: ctx 调用上下文, body 请求流, size 请求长度
-// 返回: any 参数, error 解码错误
-func readBinaryCall(ctx context.Context, body io.Reader, size int64) (any, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	var prefix [4]byte
-	if _, err := io.ReadFull(body, prefix[:]); err != nil {
-		return nil, err
-	}
-	length := int64(binary.LittleEndian.Uint32(prefix[:]))
-	if length > 4<<20 || size < length+4 {
-		return nil, errors.New("invalid binary header")
-	}
-	header := make([]byte, int(length))
-	if _, err := io.ReadFull(body, header); err != nil {
-		return nil, err
-	}
-	var packet binaryCall
-	if err := json.Unmarshal(header, &packet); err != nil {
-		return nil, err
-	}
-	remaining := size - length - 4
-	for _, part := range packet.Parts {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		if part.Size < 0 || part.Size > remaining || part.Size > int64(int(^uint(0)>>1)) {
-			return nil, errors.New("invalid binary size")
-		}
-		data := make([]byte, int(part.Size))
-		for offset := 0; offset < len(data); {
-			if err := ctx.Err(); err != nil {
-				return nil, err
-			}
-			end := min(offset+(256<<10), len(data))
-			if _, err := io.ReadFull(body, data[offset:end]); err != nil {
-				return nil, err
-			}
-			offset = end
-		}
-		if err := assignBinary(&packet.Args, part.Path, data); err != nil {
-			return nil, err
-		}
-		remaining -= part.Size
-	}
-	if remaining != 0 {
-		return nil, errors.New("unexpected binary data")
-	}
-	return packet.Args, nil
-}
-
-// assignBinary 将原始字节写入元信息指定位置
-// 入参: value 参数位置, path 字段路径, data 原始字节
-// 返回: error 路径错误
-func assignBinary(value *any, path []string, data []byte) error {
-	if len(path) == 0 {
-		if *value != nil {
-			return errors.New("invalid binary target")
-		}
-		*value = data
-		return nil
-	}
-	switch parent := (*value).(type) {
-	case map[string]any:
-		child, ok := parent[path[0]]
-		if !ok {
-			break
-		}
-		if err := assignBinary(&child, path[1:], data); err != nil {
-			return err
-		}
-		parent[path[0]] = child
-		return nil
-	case []any:
-		i, err := strconv.Atoi(path[0])
-		if err != nil || i < 0 || i >= len(parent) {
-			break
-		}
-		return assignBinary(&parent[i], path[1:], data)
-	}
-	return errors.New("invalid binary path")
 }

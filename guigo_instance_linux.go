@@ -54,28 +54,6 @@ func listenInstance(address string) (instanceListener, error) {
 	return &unixInstance{UnixListener: listener}, nil
 }
 
-// Close 释放抽象套接字入口，可重复调用
-// 返回: error 关闭错误
-func (l *unixInstance) Close() error {
-	l.once.Do(func() { l.err = l.UnixListener.Close() })
-	return l.err
-}
-
-// Accept 接收并校验同一用户的本机连接
-// 返回: instanceConn 连接, error 接收错误
-func (l *unixInstance) Accept() (instanceConn, error) {
-	for {
-		conn, err := l.AcceptUnix()
-		if err != nil {
-			return nil, err
-		}
-		if err := checkInstancePeer(conn); err == nil {
-			return conn, nil
-		}
-		conn.Close()
-	}
-}
-
 // dialInstance 连接并验证已有实例的用户身份
 // 入参: ctx 连接上下文, address 入口地址
 // 返回: instanceConn 连接, error 连接错误
@@ -115,4 +93,26 @@ func checkInstancePeer(conn *net.UnixConn) error {
 // 返回: bool 是否可重试
 func instanceUnavailable(err error) bool {
 	return errors.Is(err, unix.ECONNREFUSED) || errors.Is(err, unix.ENOENT)
+}
+
+// Close 释放抽象套接字入口，可重复调用
+// 返回: error 关闭错误
+func (l *unixInstance) Close() error {
+	l.once.Do(func() { l.err = l.UnixListener.Close() })
+	return l.err
+}
+
+// Accept 接收并校验同一用户的本机连接
+// 返回: instanceConn 连接, error 接收错误
+func (l *unixInstance) Accept() (instanceConn, error) {
+	for {
+		conn, err := l.AcceptUnix()
+		if err != nil {
+			return nil, err
+		}
+		if err := checkInstancePeer(conn); err == nil {
+			return conn, nil
+		}
+		conn.Close()
+	}
 }

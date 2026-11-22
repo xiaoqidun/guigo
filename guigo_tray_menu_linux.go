@@ -22,6 +22,19 @@ import (
 	"strings"
 )
 
+// trayNames 读取菜单属性过滤列表
+// 入参: params 请求参数, index 列表所在位置
+// 返回: map[string]bool 属性名集合
+func trayNames(params uintptr, index uintptr) map[string]bool {
+	values := gdbus.Child(params, index)
+	defer gdbus.Unref(values)
+	names := map[string]bool{}
+	for i := uintptr(0); i < gdbus.Count(values); i++ {
+		names[trayString(values, i)] = true
+	}
+	return names
+}
+
 // updateMenu 保留现有菜单项的原生标识，移除的标识不再复用，避免旧事件选择新项
 // 入参: options 完整新配置
 func (t *linuxTray) updateMenu(options TrayOptions) {
@@ -125,19 +138,6 @@ func (t *linuxTray) menuLayout(id, depth int32, names map[string]bool) string {
 		}
 	}
 	return fmt.Sprintf("(int32 %d, %s, @av [%s])", id, t.itemProperties(id, names), strings.Join(children, ","))
-}
-
-// trayNames 读取菜单属性过滤列表
-// 入参: params 请求参数, index 列表所在位置
-// 返回: map[string]bool 属性名集合
-func trayNames(params uintptr, index uintptr) map[string]bool {
-	values := gdbus.Child(params, index)
-	defer gdbus.Unref(values)
-	names := map[string]bool{}
-	for i := uintptr(0); i < gdbus.Count(values); i++ {
-		names[trayString(values, i)] = true
-	}
-	return names
 }
 
 // click 将菜单动作交给调用方的后台回调
