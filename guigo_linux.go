@@ -291,14 +291,19 @@ func runLinux(parent context.Context, o Options) error {
 	}()
 	go func() {
 		if o.OnReady != nil {
+			panicked := false
 			func() {
 				defer func() {
 					if v := recover(); v != nil {
+						panicked = true
 						n.fail(fmt.Errorf("OnReady panic: %v", v))
 					}
 				}()
 				o.OnReady(&Window{native: n})
 			}()
+			if panicked {
+				return
+			}
 		}
 		n.startTitleCallbacks()
 		_ = n.enqueue(func() {

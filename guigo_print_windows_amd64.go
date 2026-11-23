@@ -221,11 +221,11 @@ func (n *nativeWindow) print(ctx context.Context, o PrintOptions) (PrintResult, 
 			return
 		}
 		defer release(settings)
-		cb, callback := newCallback("{8fd80075-ed08-42db-8570-f5d14977461e}", func(hr uintptr, status *comObject) uintptr {
+		cb, callback := newScalarCallback("{8fd80075-ed08-42db-8570-f5d14977461e}", func(hr, status uintptr) uintptr {
 			n.printActive = false
 			failure := hresult(hr)
 			if failure == nil {
-				switch uintptr(unsafe.Pointer(status)) {
+				switch uint32(status) {
 				case 0:
 				case 1:
 					failure = fmt.Errorf("printer unavailable")

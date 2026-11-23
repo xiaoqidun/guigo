@@ -52,6 +52,13 @@ var (
 		syscall.NewCallback(callbackRelease),
 		syscall.NewCallback(callbackInvoke),
 	}
+	// scalarCallbackTable 保存COM标量参数回调虚函数表地址
+	scalarCallbackTable = [4]uintptr{
+		syscall.NewCallback(callbackQuery),
+		syscall.NewCallback(callbackAdd),
+		syscall.NewCallback(callbackRelease),
+		syscall.NewCallback(scalarCallbackInvoke),
+	}
 	// callbackRoots 持有活动COM回调对象防止被垃圾回收
 	callbackRoots sync.Map
 )
@@ -107,10 +114,11 @@ type windowClass struct {
 
 // comCallback 保存COM回调与引用计数
 type comCallback struct {
-	Table *[4]uintptr
-	Refs  atomic.Int32
-	IID   syscall.GUID
-	Fn    func(uintptr, *comObject) uintptr
+	Table    *[4]uintptr
+	Refs     atomic.Int32
+	IID      syscall.GUID
+	Fn       func(uintptr, *comObject) uintptr
+	ScalarFn func(uintptr, uintptr) uintptr
 }
 
 // comObject 保存COM接口的虚函数表指针
@@ -293,6 +301,18 @@ func callbackInvoke(c *comCallback, a uintptr, b *comObject) (result uintptr) {
 	return c.Fn(a, b)
 }
 
+// scalarCallbackInvoke 调度标量参数回调并隔离异常
+// 入参: c 回调对象, a 第一数值参数, b 第二数值参数
+// 返回: uintptr HRESULT结果
+func scalarCallbackInvoke(c *comCallback, a, b uintptr) (result uintptr) {
+	defer func() {
+		if recover() != nil {
+			result = 0x80004005
+		}
+	}()
+	return c.ScalarFn(a, b)
+}
+
 // newCallback 创建初始引用计数为1的一次性COM回调
 // 入参: iid 接口标识, fn 回调函数
 // 返回: *comCallback 回调对象, uintptr 回调地址
@@ -300,6 +320,19 @@ func newCallback(iid string, fn func(uintptr, *comObject) uintptr) (*comCallback
 	var g syscall.GUID
 	ole32.NewProc("CLSIDFromString").Call(uintptr(unsafe.Pointer(wide(iid))), uintptr(unsafe.Pointer(&g)))
 	c := &comCallback{Table: &callbackTable, IID: g, Fn: fn}
+	c.Refs.Store(1)
+	p := uintptr(unsafe.Pointer(c))
+	callbackRoots.Store(p, c)
+	return c, p
+}
+
+// newScalarCallback 创建初始引用计数为1的一次性COM标量参数回调
+// 入参: iid 接口标识, fn 回调函数
+// 返回: *comCallback 回调对象, uintptr 回调地址
+func newScalarCallback(iid string, fn func(uintptr, uintptr) uintptr) (*comCallback, uintptr) {
+	var g syscall.GUID
+	ole32.NewProc("CLSIDFromString").Call(uintptr(unsafe.Pointer(wide(iid))), uintptr(unsafe.Pointer(&g)))
+	c := &comCallback{Table: &scalarCallbackTable, IID: g, ScalarFn: fn}
 	c.Refs.Store(1)
 	p := uintptr(unsafe.Pointer(c))
 	callbackRoots.Store(p, c)
@@ -1220,14 +1253,19 @@ func (n *nativeWindow) setup() error {
 		}
 		go func() {
 			if n.options.OnReady != nil {
+				panicked := false
 				func() {
 					defer func() {
 						if v := recover(); v != nil {
-							n.reportError(fmt.Errorf("OnReady panic: %v", v))
+							panicked = true
+							n.fail(fmt.Errorf("OnReady panic: %v", v))
 						}
 					}()
 					n.options.OnReady(&Window{native: n})
 				}()
+				if panicked {
+					return
+				}
 			}
 			_ = n.enqueue(func() {
 				if n.closeRequested {
