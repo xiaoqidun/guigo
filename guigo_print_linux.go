@@ -128,10 +128,10 @@ func (n *nativeWindow) printCapabilities(ctx context.Context) (PrintCapabilities
 	return PrintCapabilities{SystemDialog: true, DialogCompletion: true, Direct: true, PageRanges: true, DeviceSettings: true}, nil
 }
 
-// showPrintUI 打开WebKitGTK系统打印对话框并等待底层消费结束
+// showPrintDialog 打开WebKitGTK系统打印对话框并等待底层消费结束
 // 入参: ctx 调用上下文, kind 打印窗口类型
 // 返回: error 不支持、取消或窗口调用错误
-func (n *nativeWindow) showPrintUI(ctx context.Context, kind PrintDialogKind) error {
+func (n *nativeWindow) showPrintDialog(ctx context.Context, kind PrintDialogKind) error {
 	if n.isClosed() {
 		return ErrClosed
 	}
@@ -210,7 +210,7 @@ func (n *nativeWindow) runPrint(ctx context.Context, o PrintOptions, dialog bool
 			set("use-color", strconv.FormatBool(o.Color == PrintColorModeColor))
 		}
 		if o.Duplex != "" {
-			set("duplex", map[PrintDuplex]string{PrintDuplexOneSided: "simplex", PrintDuplexLongEdge: "horizontal", PrintDuplexShortEdge: "vertical"}[o.Duplex])
+			set("duplex", map[PrintDuplex]string{PrintDuplexSimplex: "simplex", PrintDuplexLongEdge: "horizontal", PrintDuplexShortEdge: "vertical"}[o.Duplex])
 		}
 		if o.PageRanges != "" {
 			ranges, err := printPageRanges(o.PageRanges)

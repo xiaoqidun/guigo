@@ -97,7 +97,7 @@ type instanceWindowSearch struct {
 // 入参: ctx 生命周期上下文, options 归一化实例配置, receive 接收回调
 // 返回: *Instance 新窗口入口或nil, error 创建或转交错误
 func openWindowInstance(ctx context.Context, options InstanceOptions, receive func(context.Context, []byte) error) (*Instance, error) {
-	address, err := instanceAddress(options.AppID)
+	address, err := instanceAddress(options.Key)
 	if err != nil {
 		return nil, err
 	}

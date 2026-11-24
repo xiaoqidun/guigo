@@ -24,6 +24,7 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 )
@@ -40,11 +41,11 @@ const (
 var errInstanceWindow = errors.New("instance window is not on current desktop")
 
 // InstanceOptions 定义单实例入口的标识、转交消息及匹配策略
-// AppID为非空隔离键；Payload长度不得超过MaxPayloadBytes(默认1MiB，最大16MiB)
+// Key为非空隔离键；Payload长度不得超过MaxPayloadBytes(默认1MiB，最大16MiB)
 // Window在windows/amd64上按当前虚拟桌面最近激活的同组窗口优先转交，其他平台沿用会话单实例
 // Timeout非正值默认10秒
 type InstanceOptions struct {
-	AppID           string
+	Key             string
 	Payload         []byte
 	Window          bool
 	Timeout         time.Duration
@@ -70,6 +71,7 @@ type Instance struct {
 	done     chan struct{}
 	timeout  time.Duration
 	limit    int
+	closed   atomic.Bool
 	once     sync.Once
 	err      error
 }
@@ -78,7 +80,7 @@ type Instance struct {
 // 入参: options 单实例选项
 // 返回: InstanceOptions 归一化后的选项, error 参数错误
 func normalizeInstanceOptions(options InstanceOptions) (InstanceOptions, error) {
-	if options.AppID == "" || strings.ContainsRune(options.AppID, 0) {
+	if options.Key == "" || strings.ContainsRune(options.Key, 0) {
 		return InstanceOptions{}, errors.New("invalid instance options")
 	}
 	if options.MaxPayloadBytes < 0 || options.MaxPayloadBytes > maxInstanceLimit {
@@ -125,7 +127,7 @@ func OpenInstance(ctx context.Context, options InstanceOptions, receive func(con
 // 入参: ctx 生命周期上下文, options 归一化实例配置, receive 接收回调
 // 返回: *Instance 新实例入口或nil, error 创建或转交错误
 func openSessionInstance(ctx context.Context, options InstanceOptions, receive func(context.Context, []byte) error) (*Instance, error) {
-	address, err := instanceAddress(options.AppID)
+	address, err := instanceAddress(options.Key)
 	if err != nil {
 		return nil, err
 	}
@@ -286,6 +288,7 @@ func (i *Instance) Close() error {
 		return nil
 	}
 	i.once.Do(func() {
+		i.closed.Store(true)
 		if i.cancel != nil {
 			i.cancel()
 		}

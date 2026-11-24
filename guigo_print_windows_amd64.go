@@ -75,10 +75,10 @@ func (n *nativeWindow) printCapabilities(ctx context.Context) (PrintCapabilities
 	return result, err
 }
 
-// showPrintUI 在最外层消息循环发起WebView2打印对话框请求
+// showPrintDialog 在最外层消息循环发起WebView2打印对话框请求
 // 入参: ctx 调用上下文, kind 打印窗口类型
 // 返回: error 不支持、取消或窗口调用错误
-func (n *nativeWindow) showPrintUI(ctx context.Context, kind PrintDialogKind) error {
+func (n *nativeWindow) showPrintDialog(ctx context.Context, kind PrintDialogKind) error {
 	return n.invokeTop(func() error {
 		if n.printActive {
 			return ErrPrintBusy
@@ -191,7 +191,7 @@ func (n *nativeWindow) printSettings(o PrintOptions) (*comObject, error) {
 		set(38, value)
 	}
 	if o.Duplex != "" {
-		value := map[PrintDuplex]uintptr{PrintDuplexOneSided: 1, PrintDuplexLongEdge: 2, PrintDuplexShortEdge: 3}[o.Duplex]
+		value := map[PrintDuplex]uintptr{PrintDuplexSimplex: 1, PrintDuplexLongEdge: 2, PrintDuplexShortEdge: 3}[o.Duplex]
 		set(40, value)
 	}
 	if failure != nil {

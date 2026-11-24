@@ -1262,10 +1262,7 @@ func (n *nativeWindow) center(monitor uintptr) error {
 // 入参: w 客户区宽度, h 客户区高度
 // 返回: error 调整错误
 func (n *nativeWindow) setClientSize(w, h int) error {
-	width, height, err := clampWindowSize(n.options, w, h)
-	if err != nil {
-		return err
-	}
+	width, height := clampWindowSize(n.options, w, h)
 	r := rect{Right: n.pixels(width), Bottom: n.pixels(height)}
 	if err := n.adjustRect(&r); err != nil {
 		return err

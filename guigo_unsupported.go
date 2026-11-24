@@ -34,13 +34,6 @@ func systemDark() bool {
 	return false
 }
 
-// resourceURL 返回未适配平台的空资源地址
-// 入参: path 资源路径
-// 返回: string 空地址
-func resourceURL(path string) string {
-	return ""
-}
-
 // openURL 返回平台不支持错误
 // 入参: raw 外部地址
 // 返回: error 平台错误
@@ -95,10 +88,10 @@ func (n *nativeWindow) printCapabilities(ctx context.Context) (PrintCapabilities
 	return PrintCapabilities{}, ErrUnsupportedPlatform
 }
 
-// showPrintUI 返回未适配平台的打印错误
+// showPrintDialog 返回未适配平台的打印错误
 // 入参: ctx 调用上下文, kind 打印窗口类型
 // 返回: error 平台错误
-func (n *nativeWindow) showPrintUI(ctx context.Context, kind PrintDialogKind) error {
+func (n *nativeWindow) showPrintDialog(ctx context.Context, kind PrintDialogKind) error {
 	return ErrUnsupportedPlatform
 }
 

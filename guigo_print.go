@@ -52,8 +52,8 @@ const (
 )
 
 const (
-	// PrintDuplexOneSided 使用单面打印
-	PrintDuplexOneSided PrintDuplex = "simplex"
+	// PrintDuplexSimplex 使用单面打印
+	PrintDuplexSimplex PrintDuplex = "simplex"
 	// PrintDuplexLongEdge 使用长边翻页双面打印
 	PrintDuplexLongEdge PrintDuplex = "longEdge"
 	// PrintDuplexShortEdge 使用短边翻页双面打印
@@ -177,7 +177,7 @@ func validatePrint(o PrintOptions) error {
 	}
 	if !slices.Contains([]PrintOrientation{"", PrintOrientationPortrait, PrintOrientationLandscape}, o.Orientation) ||
 		!slices.Contains([]PrintColorMode{"", PrintColorModeColor, PrintColorModeGrayscale}, o.Color) ||
-		!slices.Contains([]PrintDuplex{"", PrintDuplexOneSided, PrintDuplexLongEdge, PrintDuplexShortEdge}, o.Duplex) ||
+		!slices.Contains([]PrintDuplex{"", PrintDuplexSimplex, PrintDuplexLongEdge, PrintDuplexShortEdge}, o.Duplex) ||
 		!slices.Contains([]PrintCollation{"", PrintCollationCollated, PrintCollationUncollated}, o.Collation) ||
 		!slices.Contains([]int{0, 1, 2, 4, 6, 9, 16}, o.PagesPerSide) {
 		return errors.New("invalid print option")
@@ -234,12 +234,12 @@ func (w *Window) PrintCapabilities(ctx context.Context) (PrintCapabilities, erro
 	return w.native.printCapabilities(ctx)
 }
 
-// ShowPrintUI 为当前顶层文档打开打印对话框，空值默认采用PrintDialogSystem
+// ShowPrintDialog 为当前顶层文档打开打印对话框，空值默认采用PrintDialogSystem
 // Windows返回表示对话框请求已交付，不能据此释放内容或认定打印成功
 // 调用方可以监听页面afterprint，在对话框关闭后恢复界面；Linux取消返回ErrCanceled
 // 入参: ctx 调用上下文, kind 打印窗口类型
 // 返回: error 不支持、取消或窗口调用错误
-func (w *Window) ShowPrintUI(ctx context.Context, kind PrintDialogKind) error {
+func (w *Window) ShowPrintDialog(ctx context.Context, kind PrintDialogKind) error {
 	if ctx == nil {
 		return errors.New("nil context")
 	}
@@ -255,7 +255,7 @@ func (w *Window) ShowPrintUI(ctx context.Context, kind PrintDialogKind) error {
 	if kind != PrintDialogSystem && kind != PrintDialogBrowser {
 		return errors.New("invalid print dialog kind")
 	}
-	return w.native.showPrintUI(ctx, kind)
+	return w.native.showPrintDialog(ctx, kind)
 }
 
 // Print 直接提交当前顶层文档，设备设置仍受打印机驱动能力约束

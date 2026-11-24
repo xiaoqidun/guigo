@@ -38,30 +38,22 @@ type PrintPaper struct {
 	Height float64 `json:"height"`
 }
 
-// PrintRectangle 保存以物理纸张左上角为原点的毫米区域
-type PrintRectangle struct {
-	X      float64 `json:"x"`
-	Y      float64 `json:"y"`
-	Width  float64 `json:"width"`
-	Height float64 `json:"height"`
-}
-
 // PrinterProfile 是一次设备设置查询的独立结果，不缓存为永久设备能力
-// Width/Height为应用方向后的物理纸面毫米尺寸，PrintableArea为硬件可打印区域
+// Width/Height为应用方向后的物理纸面毫米尺寸，PrintableArea为硬件可打印毫米区域
 // Fingerprint标识当前设置与设备几何信息，供提交前复查
 type PrinterProfile struct {
-	Printer       PrinterInfo    `json:"printer"`
-	Options       PrintOptions   `json:"options"`
-	Papers        []PrintPaper   `json:"papers"`
-	Width         float64        `json:"width"`
-	Height        float64        `json:"height"`
-	PrintableArea PrintRectangle `json:"printableArea"`
-	Color         bool           `json:"color"`
-	Duplex        bool           `json:"duplex"`
-	MaxCopies     int            `json:"maxCopies"`
-	CustomPaper   bool           `json:"customPaper"`
-	Properties    bool           `json:"properties"`
-	Fingerprint   string         `json:"fingerprint"`
+	Printer       PrinterInfo  `json:"printer"`
+	Options       PrintOptions `json:"options"`
+	Papers        []PrintPaper `json:"papers"`
+	Width         float64      `json:"width"`
+	Height        float64      `json:"height"`
+	PrintableArea Rect         `json:"printableArea"`
+	Color         bool         `json:"color"`
+	Duplex        bool         `json:"duplex"`
+	MaxCopies     int          `json:"maxCopies"`
+	CustomPaper   bool         `json:"customPaper"`
+	Properties    bool         `json:"properties"`
+	Fingerprint   string       `json:"fingerprint"`
 }
 
 // validatePrinterProfile 统一检查返回区域及作业能力，并计算可复查的设备指纹
@@ -80,7 +72,7 @@ func validatePrinterProfile(p *PrinterProfile) error {
 	if p.Printer.Name == "" || p.Width <= 0 || p.Height <= 0 || r.Width <= 0 || r.Height <= 0 || r.X+r.Width > p.Width+0.1 || r.Y+r.Height > p.Height+0.1 {
 		return errors.New("invalid printer printable area")
 	}
-	if p.Options.Color == PrintColorModeColor && !p.Color || p.Options.Duplex != "" && p.Options.Duplex != PrintDuplexOneSided && !p.Duplex || p.MaxCopies > 0 && p.Options.Copies > p.MaxCopies {
+	if p.Options.Color == PrintColorModeColor && !p.Color || p.Options.Duplex != "" && p.Options.Duplex != PrintDuplexSimplex && !p.Duplex || p.MaxCopies > 0 && p.Options.Copies > p.MaxCopies {
 		return fmt.Errorf("%w: device settings", ErrPrintUnsupported)
 	}
 	p.Fingerprint = ""

@@ -215,7 +215,7 @@ func queryWindowsPrinter(o PrintOptions) (PrinterProfile, error) {
 			o.Duplex = map[int]PrintDuplex{2: PrintDuplexLongEdge, 3: PrintDuplexShortEdge}[get(94)]
 		}
 		if o.Duplex == "" {
-			o.Duplex = PrintDuplexOneSided
+			o.Duplex = PrintDuplexSimplex
 		}
 	}
 	if o.Color == "" {
@@ -231,7 +231,7 @@ func queryWindowsPrinter(o PrintOptions) (PrinterProfile, error) {
 		}
 	}
 	o.Printer = name
-	setDuplex := p.Duplex && (requestedDuplex != "" || o.Duplex != PrintDuplexOneSided)
+	setDuplex := p.Duplex && (requestedDuplex != "" || o.Duplex != PrintDuplexSimplex)
 	fields := (binary.LittleEndian.Uint32(data[72:]) | 1 | 2 | 0x10 | 0x100 | 0x800 | 0x8000) &^ 0x10000
 	set(78, paperID)
 	if paperID == 0 {
@@ -249,7 +249,7 @@ func queryWindowsPrinter(o PrintOptions) (PrinterProfile, error) {
 	set(86, o.Copies)
 	if setDuplex {
 		fields |= 0x1000
-		set(94, map[PrintDuplex]int{PrintDuplexOneSided: 1, PrintDuplexLongEdge: 2, PrintDuplexShortEdge: 3}[o.Duplex])
+		set(94, map[PrintDuplex]int{PrintDuplexSimplex: 1, PrintDuplexLongEdge: 2, PrintDuplexShortEdge: 3}[o.Duplex])
 	}
 	set(92, 1)
 	if o.Color == PrintColorModeColor {
@@ -265,14 +265,14 @@ func queryWindowsPrinter(o PrintOptions) (PrinterProfile, error) {
 	if o.Orientation == PrintOrientationLandscape {
 		p.Width, p.Height = p.Height, p.Width
 	}
-	if o.Color == PrintColorModeColor && !p.Color || o.Duplex != PrintDuplexOneSided && !p.Duplex || o.Copies > p.MaxCopies {
+	if o.Color == PrintColorModeColor && !p.Color || o.Duplex != PrintDuplexSimplex && !p.Duplex || o.Copies > p.MaxCopies {
 		return p, fmt.Errorf("%w: device settings", ErrPrintUnsupported)
 	}
 	status, _, _ := winspool.NewProc("DocumentPropertiesW").Call(0, printer, uintptr(unsafe.Pointer(wide(name))), uintptr(unsafe.Pointer(&data[0])), uintptr(unsafe.Pointer(&data[0])), 10)
 	if int32(status) != 1 {
 		return p, fmt.Errorf("validate printer settings")
 	}
-	if get(76) != (map[PrintOrientation]int{PrintOrientationPortrait: 1, PrintOrientationLandscape: 2}[o.Orientation]) || setDuplex && get(94) != (map[PrintDuplex]int{PrintDuplexOneSided: 1, PrintDuplexLongEdge: 2, PrintDuplexShortEdge: 3}[o.Duplex]) {
+	if get(76) != (map[PrintOrientation]int{PrintOrientationPortrait: 1, PrintOrientationLandscape: 2}[o.Orientation]) || setDuplex && get(94) != (map[PrintDuplex]int{PrintDuplexSimplex: 1, PrintDuplexLongEdge: 2, PrintDuplexShortEdge: 3}[o.Duplex]) {
 		return p, fmt.Errorf("%w: driver changed device settings", ErrPrintUnsupported)
 	}
 	dc, _, err := gdi32.NewProc("CreateICW").Call(uintptr(unsafe.Pointer(wide("WINSPOOL"))), uintptr(unsafe.Pointer(wide(name))), 0, uintptr(unsafe.Pointer(&data[0])))
@@ -289,7 +289,7 @@ func queryWindowsPrinter(o PrintOptions) (PrinterProfile, error) {
 		return p, fmt.Errorf("%w: driver changed paper size", ErrPrintUnsupported)
 	}
 	x, y := math.Max(0, device(112)*25.4/dx), math.Max(0, device(113)*25.4/dy)
-	p.PrintableArea = PrintRectangle{X: x, Y: y, Width: math.Min(p.Width-x, device(8)*25.4/dx), Height: math.Min(p.Height-y, device(10)*25.4/dy)}
+	p.PrintableArea = Rect{X: x, Y: y, Width: math.Min(p.Width-x, device(8)*25.4/dx), Height: math.Min(p.Height-y, device(10)*25.4/dy)}
 	runtime.KeepAlive(data)
 	return p, nil
 }

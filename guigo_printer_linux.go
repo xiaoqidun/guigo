@@ -187,10 +187,10 @@ func queryCUPSPrinter(ctx context.Context, o PrintOptions, cups cupsAPI) (Printe
 	if o.Duplex == "" {
 		o.Duplex = map[string]PrintDuplex{"two-sided-long-edge": PrintDuplexLongEdge, "two-sided-short-edge": PrintDuplexShortEdge}[defaultString("sides")]
 		if o.Duplex == "" {
-			o.Duplex = PrintDuplexOneSided
+			o.Duplex = PrintDuplexSimplex
 		}
 	}
-	if o.Duplex != PrintDuplexOneSided {
+	if o.Duplex != PrintDuplexSimplex {
 		if cups.Supported(0, selected, info, "sides", map[PrintDuplex]string{PrintDuplexLongEdge: "two-sided-long-edge", PrintDuplexShortEdge: "two-sided-short-edge"}[o.Duplex]) == 0 {
 			return p, fmt.Errorf("%w: duplex mode", ErrPrintUnsupported)
 		}
@@ -237,7 +237,7 @@ func queryCUPSPrinter(ctx context.Context, o PrintOptions, cups cupsAPI) (Printe
 		p.Width, p.Height = p.Height, p.Width
 		left, top, right, bottom = top, right, bottom, left
 	}
-	p.PrintableArea = PrintRectangle{X: left, Y: top, Width: p.Width - left - right, Height: p.Height - top - bottom}
+	p.PrintableArea = Rect{X: left, Y: top, Width: p.Width - left - right, Height: p.Height - top - bottom}
 	return p, ctx.Err()
 }
 

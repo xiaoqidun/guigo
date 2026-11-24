@@ -1058,14 +1058,11 @@ func (n *nativeWindow) setTitle(title string) error {
 	})
 }
 
-// setSize 校验并设置窗口尺寸
+// setSize 按约束设置窗口尺寸
 // 入参: width 宽度, height 高度
-// 返回: error 尺寸或关闭错误
+// 返回: error 关闭错误
 func (n *nativeWindow) setSize(width, height int) error {
-	width, height, err := clampWindowSize(n.options, width, height)
-	if err != nil {
-		return err
-	}
+	width, height = clampWindowSize(n.options, width, height)
 	return n.invoke(func() error {
 		gtk.Size(n.window, int32(width), int32(height))
 		return nil
@@ -1209,7 +1206,7 @@ func (n *nativeWindow) measureTitleControls() (int32, [2]int32) {
 func (n *nativeWindow) updateTitleInfo() {
 	n.titleUpdatePending = false
 	scale := gtk.ScaleFactor(n.window)
-	info := TitleBarInfo{Active: gtk.IsActive(n.window) != 0, Maximized: gtk.IsMaximized(n.window) != 0}
+	info := TitleBarInfo{Active: gtk.IsActive(n.window) != 0, Maximized: gtk.IsMaximized(n.window) != 0, Material: WindowSolid}
 	if n.options.TitleBar == TitleBarContent {
 		info.Colors = n.titleBarColors
 		height, widths := n.measureTitleControls()

@@ -32,27 +32,27 @@ import (
 
 const (
 	// TitleBarSystem 使用系统标题栏，为默认值
-	TitleBarSystem TitleBarMode = iota
+	TitleBarSystem TitleBarMode = "system"
 	// TitleBarContent 将内容延伸到标题栏，保留系统窗口按钮
-	TitleBarContent
+	TitleBarContent TitleBarMode = "content"
 )
 
 const (
 	// WindowSolid 使用纯色窗口材质，为默认值
-	WindowSolid WindowMaterial = iota
+	WindowSolid WindowMaterial = "solid"
 	// WindowMicaAlt 使用云母Alt窗口材质
-	WindowMicaAlt
+	WindowMicaAlt WindowMaterial = "micaAlt"
 	// WindowAcrylic 使用亚克力窗口材质
-	WindowAcrylic
+	WindowAcrylic WindowMaterial = "acrylic"
 )
 
 var (
 	// ErrUnsupportedPlatform 表示当前平台没有可用宿主实现
 	ErrUnsupportedPlatform = errors.New("unsupported platform")
 	// ErrCanceled 表示用户取消操作
-	ErrCanceled = errors.New("dialog canceled")
+	ErrCanceled = errors.New("canceled")
 	// ErrClosed 表示窗口、托盘或实例已经关闭
-	ErrClosed = errors.New("window closed")
+	ErrClosed = errors.New("closed")
 	// ErrAlreadyRunning 表示当前进程已有活动窗口循环
 	ErrAlreadyRunning = errors.New("another Run is active")
 	// ErrDialogBusy 表示当前窗口已有活动文件对话框
@@ -61,7 +61,8 @@ var (
 	ErrRuntimeUnavailable = errors.New("native runtime unavailable")
 )
 
-// HandlerFunc 异步处理页面调用，调用结束、取消或页面退出时取消上下文
+// HandlerFunc 异步处理页面通过window.guigo.call(name, args, {signal})发起的调用
+// 支持Blob/ArrayBuffer/TypedArray二进制直传与BridgeError结构化错误，调用结束、取消或页面退出时取消上下文
 // 返回带Discard的Result时，上下文保持到页面确认接收或调用取消
 // 入参: ctx 调用上下文, args 已解码参数，二进制为[]byte
 // 返回: any 可JSON编码的值或Result, error 错误信息
@@ -74,10 +75,10 @@ type Result struct {
 }
 
 // TitleBarMode 定义窗口标题栏的显示方式
-type TitleBarMode uint8
+type TitleBarMode string
 
 // WindowMaterial 定义窗口的背景材质
-type WindowMaterial uint8
+type WindowMaterial string
 
 // TitleBarColors 定义内容标题栏激活与失焦的前景色及背景色，颜色使用#RRGGBB格式
 type TitleBarColors struct {
@@ -87,7 +88,7 @@ type TitleBarColors struct {
 	InactiveForeground string `json:"inactiveForeground"`
 }
 
-// Rect 定义相对客户区左上角的逻辑像素矩形，不随页面缩放变化，零宽高表示空矩形
+// Rect 定义二维平面矩形区域，用于逻辑像素拖动区或毫米可打印区域，零宽高表示空矩形
 type Rect struct {
 	X      float64 `json:"x"`
 	Y      float64 `json:"y"`
@@ -194,10 +195,13 @@ type envelope struct {
 	Code      string `json:"code,omitempty"`
 }
 
-// SupportsWindowMaterial 查询当前平台是否提供指定窗口材质
+// SupportsWindowMaterial 查询当前平台是否提供指定窗口材质，空值视为WindowSolid
 // 入参: material 窗口材质
 // 返回: bool 是否支持
 func SupportsWindowMaterial(material WindowMaterial) bool {
+	if material == "" {
+		material = WindowSolid
+	}
 	return supportsWindowMaterial(material)
 }
 
@@ -371,13 +375,10 @@ func validateAppID(appID string) error {
 	return nil
 }
 
-// clampWindowSize 校验并按最小最大约束限制客户区逻辑尺寸
+// clampWindowSize 按最小最大约束限制客户区逻辑尺寸
 // 入参: o 宿主选项, width 目标宽度, height 目标高度
-// 返回: int 限制后宽度, int 限制后高度, error 尺寸错误
-func clampWindowSize(o Options, width, height int) (int, int, error) {
-	if width < 1 || height < 1 || width > 32767 || height > 32767 {
-		return 0, 0, errors.New("invalid window dimensions")
-	}
+// 返回: int 限制后宽度, int 限制后高度
+func clampWindowSize(o Options, width, height int) (int, int) {
 	width = max(width, o.MinWidth)
 	height = max(height, o.MinHeight)
 	if o.MaxWidth > 0 {
@@ -386,15 +387,24 @@ func clampWindowSize(o Options, width, height int) (int, int, error) {
 	if o.MaxHeight > 0 {
 		height = min(height, o.MaxHeight)
 	}
-	return width, height, nil
+	return width, height
 }
 
 // validate 补全默认尺寸并检查约束
 // 入参: o 宿主选项
 // 返回: error 校验错误
 func validate(o *Options) error {
+	if o.Instance != nil && (o.Instance.listener == nil || o.Instance.closed.Load()) {
+		return ErrClosed
+	}
+	if o.TitleBar == "" {
+		o.TitleBar = TitleBarSystem
+	}
 	if o.TitleBar != TitleBarSystem && o.TitleBar != TitleBarContent {
 		return errors.New("invalid title bar mode")
+	}
+	if o.WindowMaterial == "" {
+		o.WindowMaterial = WindowSolid
 	}
 	if o.WindowMaterial != WindowSolid && o.WindowMaterial != WindowMicaAlt && o.WindowMaterial != WindowAcrylic {
 		return errors.New("invalid window material")
@@ -449,7 +459,7 @@ func validate(o *Options) error {
 	if o.MaxWidth > 0 && o.MinWidth > o.MaxWidth || o.MaxHeight > 0 && o.MinHeight > o.MaxHeight {
 		return errors.New("invalid size constraints")
 	}
-	o.Width, o.Height, _ = clampWindowSize(*o, o.Width, o.Height)
+	o.Width, o.Height = clampWindowSize(*o, o.Width, o.Height)
 	if o.Handler == nil {
 		if o.FS != nil {
 			o.Handler = fileHandler{http.FileServerFS(o.FS)}
@@ -477,7 +487,7 @@ func (e *BridgeError) Error() string {
 	return e.Message
 }
 
-// Emit 向页面发送命名事件，返回值表示消息已交给宿主而非页面已消费
+// Emit 向页面发送命名事件，前端通过window.guigo.on(name, listener)订阅，返回值表示已交给宿主而非已消费
 // 入参: name 非空事件名称, value 可JSON编码的数据
 // 返回: error 错误信息
 func (w *Window) Emit(name string, value any) error {
@@ -558,12 +568,15 @@ func (w *Window) SetTitleBarColors(colors TitleBarColors) error {
 	return w.native.setTitleBarColors(colors)
 }
 
-// SetWindowMaterial 更新窗口背景材质，不支持的材质返回错误
+// SetWindowMaterial 更新窗口背景材质，空值视为WindowSolid，不支持的材质返回错误
 // 入参: material 窗口材质，纯色关闭系统背景材质
 // 返回: error 材质或窗口错误
 func (w *Window) SetWindowMaterial(material WindowMaterial) error {
 	if w == nil || w.native == nil {
 		return ErrClosed
+	}
+	if material == "" {
+		material = WindowSolid
 	}
 	if material != WindowSolid && material != WindowMicaAlt && material != WindowAcrylic {
 		return errors.New("invalid window material")
@@ -604,14 +617,10 @@ func (w *Window) SetSize(width, height int) error {
 	if w == nil || w.native == nil {
 		return ErrClosed
 	}
+	if width < 1 || height < 1 || width > 32767 || height > 32767 {
+		return errors.New("invalid window dimensions")
+	}
 	return w.native.setSize(width, height)
-}
-
-// ResourceURL 返回当前平台的宿主资源地址，不支持的平台返回空字符串
-// 入参: path 资源路径
-// 返回: string 宿主资源地址
-func (w *Window) ResourceURL(path string) string {
-	return resourceURL(path)
 }
 
 // OpenFile 选择单个已有文件
