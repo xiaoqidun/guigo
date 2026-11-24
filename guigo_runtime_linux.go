@@ -93,6 +93,8 @@ type linuxAPI struct {
 	Idle                func(int32, uintptr, uintptr, uintptr) uint32                             `symbol:"g_idle_add_full"`
 	DialogErrorQuark    func() uint32                                                             `symbol:"gtk_dialog_error_quark"`
 	IOErrorQuark        func() uint32                                                             `symbol:"g_io_error_quark"`
+	NetworkErrorQuark   func() uint32                                                             `symbol:"webkit_network_error_quark"`
+	PolicyErrorQuark    func() uint32                                                             `symbol:"webkit_policy_error_quark"`
 	UnixInput           func(int32, int32) uintptr                                                `symbol:"g_unix_input_stream_new"`
 	Init                func() int32                                                              `symbol:"gtk_init_check"`
 	Major               func() uint32                                                             `symbol:"gtk_get_major_version"`

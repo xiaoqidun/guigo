@@ -262,7 +262,7 @@ func (q *callQueue) run(call *pendingCall, bindings map[string]HandlerFunc, body
 	case q.slots <- struct{}{}:
 		defer func() { <-q.slots }()
 	case <-call.ctx.Done():
-		return envelope{ID: call.message.ID, Type: "reply", Error: call.ctx.Err().Error(), ErrorName: "AbortError"}
+		return envelope{ID: call.message.ID, Type: "reply", Error: call.ctx.Err().Error(), ErrorName: "AbortError", Code: "canceled"}
 	}
 	if body != nil {
 		args, err := readBinaryCall(call.ctx, body, size)

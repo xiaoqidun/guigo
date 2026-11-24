@@ -41,7 +41,7 @@ type linuxThemeAPI struct {
 	Address      func(int32, uintptr, **linuxError) *byte                                                                      `symbol:"g_dbus_address_get_for_bus_sync"`
 	Connect      func(string, uint32, uintptr, uintptr, **linuxError) uintptr                                                  `symbol:"g_dbus_connection_new_for_address_sync"`
 	ExitOnClose  func(uintptr, int32)                                                                                          `symbol:"g_dbus_connection_set_exit_on_close"`
-	Close        func(uintptr, uintptr, **linuxError) int32                                                                    `symbol:"g_dbus_connection_close_sync"`
+	CloseAsync   func(uintptr, uintptr, uintptr, uintptr)                                                                      `symbol:"g_dbus_connection_close"`
 	Call         func(uintptr, string, string, string, string, uintptr, uintptr, uint32, int32, uintptr, **linuxError) uintptr `symbol:"g_dbus_connection_call_sync"`
 	CancelNew    func() uintptr                                                                                                `symbol:"g_cancellable_new"`
 	Cancel       func(uintptr)                                                                                                 `symbol:"g_cancellable_cancel"`
@@ -170,11 +170,7 @@ func linuxPortalDark() (bool, bool) {
 	}
 	linuxTheme.ExitOnClose(conn, 0)
 	defer func() {
-		var closeErr *linuxError
-		linuxTheme.Close(conn, 0, &closeErr)
-		if closeErr != nil {
-			linuxTheme.ErrorFree(closeErr)
-		}
+		linuxTheme.CloseAsync(conn, 0, 0, 0)
 		linuxTheme.ObjectUnref(conn)
 	}()
 	params := linuxTheme.Parse(0, `("org.freedesktop.appearance", "color-scheme")`, 0, 0, &failure)

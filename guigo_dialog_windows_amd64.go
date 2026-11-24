@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 	"unsafe"
 
@@ -73,6 +74,24 @@ func shellPath(item *comObject) (string, error) {
 	return windows.UTF16PtrToString(value), nil
 }
 
+// closeFileDialog 关闭活动文件对话框，兼顾原生接口与对话框窗口关闭消息
+// 入参: dialog 原生文件对话框接口
+func closeFileDialog(dialog *comObject) {
+	if dialog == nil {
+		return
+	}
+	com(dialog, 23, 0x800704c7)
+	iid := guid("{00000114-0000-0000-C000-000000000046}")
+	var oleWindow *comObject
+	if hresult(com(dialog, 0, uintptr(unsafe.Pointer(&iid)), uintptr(unsafe.Pointer(&oleWindow)))) == nil && oleWindow != nil {
+		var hwnd uintptr
+		if hresult(com(oleWindow, 3, uintptr(unsafe.Pointer(&hwnd)))) == nil && hwnd != 0 {
+			user32.NewProc("PostMessageW").Call(hwnd, 0x10, 0, 0)
+		}
+		release(oleWindow)
+	}
+}
+
 // dialog 运行单结果原生对话框
 // 入参: ctx 调用上下文, o 对话框选项, mode 对话框类型
 // 返回: string 文件路径, error 对话框错误
@@ -88,7 +107,11 @@ func (n *nativeWindow) dialog(ctx context.Context, o DialogOptions, mode int) (s
 // 入参: ctx 调用上下文, o 对话框选项, mode 对话框类型
 // 返回: []string 文件路径, error 对话框错误
 func (n *nativeWindow) dialogs(ctx context.Context, o DialogOptions, mode int) (paths []string, err error) {
-	err = n.invokeTop(func() error {
+	if !n.dialogActive.CompareAndSwap(false, true) {
+		return nil, ErrDialogBusy
+	}
+	defer n.dialogActive.Store(false)
+	err = n.invokeTop(ctx, func() error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -130,11 +153,27 @@ func (n *nativeWindow) dialogs(ctx context.Context, o DialogOptions, mode int) (
 			Name    *uint16
 			Pattern *uint16
 		}
-		filters := make([]filter, len(o.Filters))
-		for i, f := range o.Filters {
-			filters[i] = filter{wide(f.Name), wide(f.Pattern)}
+		var filters []filter
+		if mode != 2 {
+			for _, f := range o.Filters {
+				var patterns []string
+				for _, part := range strings.Split(f.Pattern, ";") {
+					if part = strings.TrimSpace(part); part != "" {
+						patterns = append(patterns, part)
+					}
+				}
+				if len(patterns) == 0 {
+					continue
+				}
+				pattern := strings.Join(patterns, ";")
+				name := f.Name
+				if name == "" {
+					name = pattern
+				}
+				filters = append(filters, filter{wide(name), wide(pattern)})
+			}
 		}
-		if len(filters) > 0 && mode != 2 {
+		if len(filters) > 0 {
 			if err := hresult(com(dialog, 4, uintptr(len(filters)), uintptr(unsafe.Pointer(&filters[0])))); err != nil {
 				return err
 			}
@@ -154,7 +193,7 @@ func (n *nativeWindow) dialogs(ctx context.Context, o DialogOptions, mode int) (
 				release(item)
 			}
 		}
-		if n.ctx.Err() != nil || n.quitAfterModal || n.closed {
+		if n.ctx.Err() != nil || n.quitting || n.quitAfterModal || n.closed {
 			return ErrClosed
 		}
 		if err := ctx.Err(); err != nil {
@@ -165,7 +204,7 @@ func (n *nativeWindow) dialogs(ctx context.Context, o DialogOptions, mode int) (
 		stop := context.AfterFunc(ctx, func() {
 			_ = n.enqueue(func() {
 				if n.activeDialog == dialog {
-					com(dialog, 23, 0x800704c7)
+					closeFileDialog(dialog)
 				}
 			})
 		})

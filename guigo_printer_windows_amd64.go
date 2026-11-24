@@ -93,7 +93,13 @@ func windowsPrintMode(name string) ([]byte, uintptr, error) {
 func enumWindowsPrinters() ([]PrinterInfo, error) {
 	proc := winspool.NewProc("EnumPrintersW")
 	var size, count uint32
-	proc.Call(6, 0, 4, 0, 0, uintptr(unsafe.Pointer(&size)), uintptr(unsafe.Pointer(&count)))
+	ok, _, err := proc.Call(6, 0, 4, 0, 0, uintptr(unsafe.Pointer(&size)), uintptr(unsafe.Pointer(&count)))
+	if ok != 0 {
+		return []PrinterInfo{}, nil
+	}
+	if !errors.Is(err, syscall.Errno(122)) {
+		return nil, err
+	}
 	if size == 0 {
 		return []PrinterInfo{}, nil
 	}
@@ -362,7 +368,10 @@ func (n *nativeWindow) queryPrinter(ctx context.Context, o PrintOptions) (Printe
 // 入参: ctx 调用上下文, name 系统队列名称
 // 返回: error 不支持、取消或属性窗口错误
 func (n *nativeWindow) showPrinterProperties(ctx context.Context, name string) error {
-	return n.invokeTop(func() error {
+	return n.invokeTop(ctx, func() error {
+		if n.closed || n.quitting || n.quitAfterModal || n.ctx.Err() != nil {
+			return ErrClosed
+		}
 		if err := ctx.Err(); err != nil {
 			return err
 		}

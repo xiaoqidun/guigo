@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"unsafe"
@@ -27,8 +28,20 @@ import (
 // trayMessage 接收通知区域图标消息
 const trayMessage = 0x8031
 
-// taskbarCreated 保存系统任务栏重建通知消息编号
-var taskbarCreated, _, _ = user32.NewProc("RegisterWindowMessageW").Call(uintptr(unsafe.Pointer(wide("TaskbarCreated"))))
+// 任务栏重建通知消息编号的惰性初始化状态
+var (
+	taskbarCreatedOnce sync.Once
+	taskbarCreatedID   uintptr
+)
+
+// taskbarCreatedMessage 惰性注册系统任务栏重建通知消息编号，避免纯命令行导入加载user32
+// 返回: uintptr 消息编号
+func taskbarCreatedMessage() uintptr {
+	taskbarCreatedOnce.Do(func() {
+		taskbarCreatedID, _, _ = user32.NewProc("RegisterWindowMessageW").Call(uintptr(unsafe.Pointer(wide("TaskbarCreated"))))
+	})
+	return taskbarCreatedID
+}
 
 // notifyIconData 对应Windows通知区域图标结构
 type notifyIconData struct {
@@ -60,7 +73,7 @@ type windowsTray struct {
 // 入参: ctx 调用上下文, options 托盘配置
 // 返回: *Tray 托盘句柄, error 创建错误
 func (n *nativeWindow) newTray(ctx context.Context, options TrayOptions) (*Tray, error) {
-	if taskbarCreated == 0 {
+	if taskbarCreatedMessage() == 0 {
 		return nil, errors.New("cannot register taskbar notification")
 	}
 	options, err := prepareTray(options, n.options.Title, n.iconData)
@@ -258,7 +271,7 @@ func (t *windowsTray) runTrayCallback(fn func()) {
 // 入参: msg 窗口消息, wparam 坐标参数, lparam 通知数据
 // 返回: bool 是否已处理
 func (n *nativeWindow) trayProc(msg, wparam, lparam uintptr) bool {
-	if taskbarCreated != 0 && msg == taskbarCreated {
+	if len(n.trays) > 0 && msg == taskbarCreatedMessage() {
 		for _, t := range n.trays {
 			available := t.register()
 			t.handle.available.Store(available)
@@ -301,7 +314,7 @@ func (t *windowsTray) queueMenu(position uintptr) {
 	}
 	go func() {
 		defer t.menuPending.Store(false)
-		if err := n.invokeTop(func() error {
+		if err := n.invokeTop(nil, func() error {
 			return t.showMenu(position)
 		}); err != nil && !errors.Is(err, ErrClosed) {
 			n.reportError(err)

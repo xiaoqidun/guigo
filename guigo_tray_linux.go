@@ -95,6 +95,8 @@ type linuxTray struct {
 	hostRegSubscription   uint32
 	closedSignal          uint64
 	closed                bool
+	hostGeneration        uint64
+	reregisterGen         atomic.Uint64
 	reregistering         atomic.Bool
 	reregisterPending     atomic.Bool
 	pixmapVariant         uintptr
@@ -187,16 +189,19 @@ func linuxTrayHostChanged(connection uintptr, sender, path, iface, signal *byte,
 		if !ok {
 			return
 		}
+		t.hostGeneration++
 		if newOwner == "" {
 			t.handle.available.Store(false)
 			_ = t.owner.activate()
 		} else {
-			t.reregister()
+			t.reregister(t.hostGeneration)
 		}
 	case "StatusNotifierHostUnregistered":
-		t.checkHostOffline()
+		t.hostGeneration++
+		t.checkHostOffline(t.hostGeneration)
 	case "StatusNotifierHostRegistered":
-		t.reregister()
+		t.hostGeneration++
+		t.reregister(t.hostGeneration)
 	}
 }
 
@@ -443,8 +448,9 @@ func (n *nativeWindow) newTray(ctx context.Context, options TrayOptions) (*Tray,
 	return t.handle, nil
 }
 
-// checkHostOffline 异步复查监视服务是否已无在线托盘宿主，确认离线后再恢复窗口
-func (t *linuxTray) checkHostOffline() {
+// checkHostOffline 异步复查监视服务是否已无在线托盘宿主，核对世代号后再恢复窗口
+// 入参: gen 触发复查时的宿主变更世代号
+func (t *linuxTray) checkHostOffline(gen uint64) {
 	if t.closed || t.connection == 0 {
 		return
 	}
@@ -461,7 +467,7 @@ func (t *linuxTray) checkHostOffline() {
 			return
 		}
 		_ = t.owner.enqueue(func() {
-			if !t.closed && t.connection == connection && !t.reregistering.Load() && !t.reregisterPending.Load() {
+			if !t.closed && t.connection == connection && gen == t.hostGeneration {
 				t.handle.available.Store(false)
 				_ = t.owner.activate()
 			}
@@ -470,10 +476,12 @@ func (t *linuxTray) checkHostOffline() {
 }
 
 // reregister 在桌面托盘宿主重启或重新上线后异步重新向监视服务注册，保留并发期间到达的重试信号
-func (t *linuxTray) reregister() {
+// 入参: gen 触发重新注册时的宿主变更世代号
+func (t *linuxTray) reregister(gen uint64) {
 	if t.closed || t.connection == 0 {
 		return
 	}
+	t.reregisterGen.Store(gen)
 	t.reregisterPending.Store(true)
 	if !t.reregistering.CompareAndSwap(false, true) {
 		return
@@ -483,6 +491,7 @@ func (t *linuxTray) reregister() {
 		defer gtk.Unref(connection)
 		for {
 			t.reregisterPending.Store(false)
+			currentGen := t.reregisterGen.Load()
 			if t.owner.ctx.Err() != nil || t.handle.closed.Load() || gdbus.Closed(connection) != 0 {
 				t.reregistering.Store(false)
 				return
@@ -495,7 +504,7 @@ func (t *linuxTray) reregister() {
 				}
 				if callErr == nil {
 					_ = t.owner.enqueue(func() {
-						if !t.closed && t.connection == connection && gdbus.Closed(connection) == 0 {
+						if !t.closed && t.connection == connection && currentGen == t.hostGeneration && gdbus.Closed(connection) == 0 {
 							t.handle.available.Store(true)
 						}
 					})

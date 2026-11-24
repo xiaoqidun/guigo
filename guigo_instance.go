@@ -58,9 +58,10 @@ type instanceConn interface {
 	SetDeadline(time.Time) error
 }
 
-// instanceListener 提供实例入口的接收及释放能力
+// instanceListener 提供实例入口的接收、停止及释放能力
 type instanceListener interface {
 	Accept() (instanceConn, error)
+	stop() error
 	Close() error
 }
 
@@ -195,7 +196,7 @@ func forwardInstance(ctx context.Context, conn instanceConn, data []byte, limit 
 	if err := writeInstanceMessage(conn, data, limit); err != nil {
 		return err
 	}
-	reply, err := readInstanceMessage(conn, limit)
+	reply, err := readInstanceMessage(conn, maxInstanceErrorBytes+1)
 	if err != nil {
 		return err
 	}
@@ -293,10 +294,13 @@ func (i *Instance) Close() error {
 			i.cancel()
 		}
 		if i.listener != nil {
-			i.err = i.listener.Close()
+			_ = i.listener.stop()
 		}
 		if i.done != nil {
 			<-i.done
+		}
+		if i.listener != nil {
+			i.err = i.listener.Close()
 		}
 	})
 	return i.err
@@ -306,8 +310,12 @@ func (i *Instance) Close() error {
 // 入参: ctx 生命周期上下文, receive 接收回调
 func (i *Instance) serve(ctx context.Context, receive func(context.Context, []byte) error) {
 	defer close(i.done)
+	defer i.closed.Store(true)
 	defer i.listener.Close()
-	stop := context.AfterFunc(ctx, func() { i.listener.Close() })
+	stop := context.AfterFunc(ctx, func() {
+		i.closed.Store(true)
+		_ = i.listener.stop()
+	})
 	defer stop()
 	for {
 		conn, err := i.listener.Accept()
@@ -353,11 +361,10 @@ func (i *Instance) receive(ctx context.Context, conn instanceConn, receive func(
 		} else if errors.Is(receiveErr, errInstanceWindow) {
 			reply[0] = 3
 		} else {
-			maxErr := min(maxInstanceErrorBytes, max(0, i.limit-1))
-			reply = append([]byte{1}, []byte(truncateUTF8(receiveErr.Error(), maxErr))...)
+			reply = append([]byte{1}, []byte(truncateUTF8(receiveErr.Error(), maxInstanceErrorBytes))...)
 		}
 	}
-	if writeInstanceMessage(conn, reply, i.limit) == nil {
+	if writeInstanceMessage(conn, reply, maxInstanceErrorBytes+1) == nil {
 		var accepted [1]byte
 		_, _ = io.ReadFull(conn, accepted[:])
 	}

@@ -18,7 +18,7 @@ package guigo
 
 import "encoding/json"
 
-// bridgeScriptCore 为双平台共用的Promise调用桥与事件订阅主体，依赖外层提供transport与bridgeToken
+// bridgeScriptCore 为双平台共用的Promise调用桥与事件订阅主体，依赖外层提供transport、bridgeToken与dropEnabled
 const bridgeScriptCore = `(() => {
 	let serial = 0;
 	let closed = false;
@@ -196,16 +196,18 @@ const bridgeScriptCore = `(() => {
 		pending.clear();
 		for (const call of uploads.splice(0)) { call.cleanup(); call.reject(new Error("document closed")); }
 	});
-	addEventListener("dragover", event => {
-		if (event.dataTransfer && Array.from(event.dataTransfer.types).includes("Files")) event.preventDefault();
-	});
-	addEventListener("drop", event => {
-		const files = Array.from(event.dataTransfer?.files || []);
-		if (files.length && transport.postMessageWithAdditionalObjects) {
-			event.preventDefault();
-			transport.postMessageWithAdditionalObjects({type:"drop"}, files);
-		}
-	});
+	if (dropEnabled && transport.postMessageWithAdditionalObjects) {
+		addEventListener("dragover", event => {
+			if (event.dataTransfer && Array.from(event.dataTransfer.types).includes("Files")) event.preventDefault();
+		});
+		addEventListener("drop", event => {
+			const files = Array.from(event.dataTransfer?.files || []);
+			if (files.length) {
+				event.preventDefault();
+				transport.postMessageWithAdditionalObjects({type:"drop"}, files);
+			}
+		});
+	}
 })();`
 
 // bridgeScriptQuoted 编码桥接凭据为JavaScript字符串字面量

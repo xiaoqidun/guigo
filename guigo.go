@@ -306,7 +306,7 @@ func dispatch(ctx context.Context, bindings map[string]HandlerFunc, call envelop
 	}()
 	reply.ID = call.ID
 	if err := ctx.Err(); err != nil {
-		reply.Error, reply.ErrorName = err.Error(), "AbortError"
+		reply.Error, reply.ErrorName, reply.Code = err.Error(), "AbortError", "canceled"
 		return
 	}
 	if call.Type != "call" || call.ID == "" || call.Name == "" {

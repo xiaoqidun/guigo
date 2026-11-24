@@ -100,7 +100,7 @@ type nativeWindow struct {
 	onReadyDone                                      bool
 	filterDone                                       bool
 	entryLoaded                                      bool
-	onCloseReady                                     bool
+	onCloseReady                                     atomic.Bool
 	shown                                            bool
 	hidden                                           bool
 	err                                              error
@@ -359,6 +359,7 @@ func runLinux(parent context.Context, o Options) (bool, error) {
 	n.readyWG.Add(1)
 	go func() {
 		defer n.readyWG.Done()
+		n.onCloseReady.Store(true)
 		if o.OnReady != nil {
 			var panicErr error
 			func() {
@@ -376,16 +377,15 @@ func runLinux(parent context.Context, o Options) (bool, error) {
 		}
 		n.startTitleCallbacks()
 		_ = n.enqueue(func() {
-			n.onCloseReady = true
 			n.onReadyDone = true
 			n.maybeLoadEntry()
 		})
 	}()
 	gtk.LoopRun(n.loop)
 	if n.err != nil {
-		return n.onCloseReady, n.err
+		return n.onCloseReady.Load(), n.err
 	}
-	return n.onCloseReady, parent.Err()
+	return n.onCloseReady.Load(), parent.Err()
 }
 
 // linuxFilterSaved 安装编译完成的外网拦截过滤器并推进首次页面加载
@@ -472,6 +472,9 @@ func linuxLoadFailed(view uintptr, event int32, uri *byte, nativeErr *linuxError
 	}
 	message := "navigation failed"
 	if nativeErr != nil {
+		if nativeErr.Domain == gtk.NetworkErrorQuark() && nativeErr.Code == 302 || nativeErr.Domain == gtk.PolicyErrorQuark() && nativeErr.Code == 102 {
+			return 1
+		}
 		message = nativeString(nativeErr.Message)
 	}
 	err := fmt.Errorf("load %s: %s", nativeString(uri), message)
@@ -506,6 +509,7 @@ func linuxBridgeScript(bridgeToken, receiveToken string) string {
 		`if (location.protocol !== "guigo:" || location.host !== "localhost" || window !== window.top) return;`,
 		`const bridgeToken = ` + encodedBridge + `;`,
 		`const receiveToken = ` + encodedReceive + `;`,
+		`const dropEnabled = false;`,
 		`const nativeFetch = window.fetch.bind(window);`,
 		`window.fetch = async (input, options) => {`,
 		`const url = new URL(input instanceof Request ? input.url : input, location.href);`,
@@ -1138,10 +1142,10 @@ func (n *nativeWindow) titleBarInfo() (TitleBarInfo, error) {
 // 入参: colors 已校验的标题栏配色
 // 返回: error 模式或调度错误
 func (n *nativeWindow) setTitleBarColors(colors TitleBarColors) error {
-	if n.options.TitleBar != TitleBarContent {
-		return errors.New("title bar colors require content title bar")
-	}
 	return n.invoke(func() error {
+		if n.options.TitleBar != TitleBarContent {
+			return errors.New("title bar colors require content title bar")
+		}
 		if n.titleBarColors == colors {
 			return nil
 		}
@@ -1164,10 +1168,10 @@ func (n *nativeWindow) setWindowMaterial(material WindowMaterial) error {
 // 入参: regions 客户区拖动矩形，空切片清除全部区域
 // 返回: error 模式或关闭错误
 func (n *nativeWindow) setDragRegions(regions []Rect) error {
-	if n.options.TitleBar != TitleBarContent {
-		return errors.New("drag regions require content title bar")
-	}
 	return n.invoke(func() error {
+		if n.options.TitleBar != TitleBarContent {
+			return errors.New("drag regions require content title bar")
+		}
 		for _, handle := range n.dragHandles {
 			gtk.OverlayRemove(n.dragOverlay, handle.widget)
 		}

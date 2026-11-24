@@ -34,6 +34,8 @@ type unixInstance struct {
 	*net.UnixListener
 	lockFile *os.File
 	sockPath string
+	stopOnce sync.Once
+	stopErr  error
 	once     sync.Once
 	err      error
 }
@@ -45,6 +47,7 @@ func linuxRuntimeDir() string {
 	if dir == "" || !filepath.IsAbs(dir) || strings.ContainsRune(dir, 0) {
 		return ""
 	}
+	dir = filepath.Clean(dir)
 	var st unix.Stat_t
 	if err := unix.Lstat(dir, &st); err != nil {
 		return ""
@@ -52,7 +55,7 @@ func linuxRuntimeDir() string {
 	if st.Mode&unix.S_IFMT != unix.S_IFDIR || st.Mode&0o777 != 0o700 || st.Uid != uint32(os.Geteuid()) {
 		return ""
 	}
-	return filepath.Clean(dir)
+	return dir
 }
 
 // instanceAddress 生成当前用户及图形会话的本机套接字地址，优先使用私有XDG_RUNTIME_DIR路径
@@ -163,14 +166,23 @@ func checkInstancePeer(conn *net.UnixConn) error {
 // 入参: err 连接错误
 // 返回: bool 是否可重试
 func instanceUnavailable(err error) bool {
-	return errors.Is(err, unix.ECONNREFUSED) || errors.Is(err, unix.ENOENT)
+	return errors.Is(err, unix.ECONNREFUSED) || errors.Is(err, unix.ENOENT) || errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EWOULDBLOCK)
+}
+
+// stop 停止接收新连接，暂不清理套接字文件与排他锁
+// 返回: error 停止错误
+func (l *unixInstance) stop() error {
+	l.stopOnce.Do(func() {
+		l.stopErr = l.UnixListener.Close()
+	})
+	return l.stopErr
 }
 
 // Close 停止监听、在持锁状态下清理套接字文件并释放锁，可重复调用
 // 返回: error 关闭错误
 func (l *unixInstance) Close() error {
 	l.once.Do(func() {
-		l.err = l.UnixListener.Close()
+		l.err = l.stop()
 		if l.sockPath != "" {
 			_ = os.Remove(l.sockPath)
 		}

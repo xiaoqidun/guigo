@@ -523,12 +523,15 @@ func (n *nativeWindow) titleBarProc(hwnd, msg, wparam, lparam uintptr) (uintptr,
 		}
 	}
 	if msg == 0xa5 && wparam == 2 {
-		go func() {
-			_ = n.invokeTop(func() error {
-				n.showTitleBarMenu(lparam)
-				return nil
-			})
-		}()
+		if n.activeTrayMenu == nil && n.titleMenuPending.CompareAndSwap(false, true) {
+			go func() {
+				defer n.titleMenuPending.Store(false)
+				_ = n.invokeTop(nil, func() error {
+					n.showTitleBarMenu(lparam)
+					return nil
+				})
+			}()
+		}
 		return 0, true
 	}
 	if msg == 0x83 && lparam != 0 {
@@ -580,7 +583,7 @@ func (n *nativeWindow) titleBarProc(hwnd, msg, wparam, lparam uintptr) (uintptr,
 // showTitleBarMenu 在最外层消息循环显示拖动区域的原生窗口菜单并交回系统命令处理
 // 入参: position 屏幕坐标组成的消息参数
 func (n *nativeWindow) showTitleBarMenu(position uintptr) {
-	if n.closed || n.quitAfterModal || n.ctx.Err() != nil {
+	if n.closed || n.quitting || n.quitAfterModal || n.ctx.Err() != nil || n.activeTrayMenu != nil {
 		return
 	}
 	menu, _, _ := user32.NewProc("GetSystemMenu").Call(n.hwnd, 0)
@@ -608,8 +611,10 @@ func (n *nativeWindow) showTitleBarMenu(position uintptr) {
 	n.modalActive++
 	defer n.leaveModal()
 	x, y := int32(int16(position)), int32(int16(position>>16))
+	user32.NewProc("SetForegroundWindow").Call(n.hwnd)
 	command, _, _ := user32.NewProc("TrackPopupMenuEx").Call(menu, 0x102, uintptr(x), uintptr(y), n.hwnd, 0)
-	if command != 0 && !n.closed && !n.quitAfterModal {
+	user32.NewProc("PostMessageW").Call(n.hwnd, 0, 0, 0)
+	if command != 0 && !n.closed && !n.quitting && !n.quitAfterModal {
 		user32.NewProc("SendMessageW").Call(n.hwnd, 0x112, command, position)
 	}
 }

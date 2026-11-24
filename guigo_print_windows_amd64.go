@@ -79,7 +79,10 @@ func (n *nativeWindow) printCapabilities(ctx context.Context) (PrintCapabilities
 // 入参: ctx 调用上下文, kind 打印窗口类型
 // 返回: error 不支持、取消或窗口调用错误
 func (n *nativeWindow) showPrintDialog(ctx context.Context, kind PrintDialogKind) error {
-	return n.invokeTop(func() error {
+	return n.invokeTop(ctx, func() error {
+		if n.quitting || n.closed {
+			return ErrClosed
+		}
 		if n.printActive {
 			return ErrPrintBusy
 		}

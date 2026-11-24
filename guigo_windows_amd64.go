@@ -135,59 +135,64 @@ type eventToken struct {
 
 // nativeWindow 保存STA线程拥有的原生对象
 type nativeWindow struct {
-	options         Options
-	bridgeToken     string
-	threadID        uint32
-	mu              sync.Mutex
-	ctx             context.Context
-	cancel          context.CancelFunc
-	done            chan struct{}
-	queue           []queuedCall
-	topQueue        []func()
-	hwnd            uintptr
-	contentWindow   uintptr
-	dragWindow      uintptr
-	dragRegions     []Rect
-	titleBarState   TitleBarInfo
-	titleBarDPI     uint32
-	titleBarEvents  chan TitleBarInfo
-	titleBarWG      sync.WaitGroup
-	readyWG         sync.WaitGroup
-	titleBarReady   bool
-	titleBarPending bool
-	titleBarLayout  bool
-	dpi             uint32
-	iconData        []byte
-	icons           [2]uintptr
-	trays           map[uint32]*windowsTray
-	nextTrayID      uint32
-	activeTrayMenu  *windowsTray
-	environment     *comObject
-	controller      *comObject
-	webview         *comObject
-	activeDialog    *comObject
-	modalActive     int
-	quitAfterModal  bool
-	printActive     bool
-	callbacks       []*comCallback
-	eventTokens     []eventToken
-	generation      uint64
-	pageCtx         context.Context
-	pageCancel      context.CancelFunc
-	calls           *callQueue
-	pendingEvents   []string
-	resources       map[*comObject]resourceRequest
-	temporary       temporaryDirectory
-	initializing    bool
-	onCloseReady    bool
-	ready           bool
-	shown           bool
-	hidden          bool
-	closing         bool
-	closePending    bool
-	closeRequested  bool
-	closed          bool
-	err             error
+	options          Options
+	bridgeToken      string
+	threadID         uint32
+	mu               sync.Mutex
+	ctx              context.Context
+	cancel           context.CancelFunc
+	done             chan struct{}
+	queue            []queuedCall
+	topQueue         []func()
+	hwnd             uintptr
+	contentWindow    uintptr
+	dragWindow       uintptr
+	dragRegions      []Rect
+	titleBarState    TitleBarInfo
+	titleBarDPI      uint32
+	titleBarEvents   chan TitleBarInfo
+	titleBarWG       sync.WaitGroup
+	readyWG          sync.WaitGroup
+	titleBarReady    bool
+	titleBarPending  bool
+	titleBarLayout   bool
+	dpi              uint32
+	iconData         []byte
+	icons            [2]uintptr
+	trays            map[uint32]*windowsTray
+	nextTrayID       uint32
+	activeTrayMenu   *windowsTray
+	environment      *comObject
+	controller       *comObject
+	webview          *comObject
+	activeDialog     *comObject
+	dialogActive     atomic.Bool
+	titleMenuPending atomic.Bool
+	modalActive      int
+	quitAfterModal   bool
+	quitting         bool
+	printActive      bool
+	callbacks        []*comCallback
+	eventTokens      []eventToken
+	generation       uint64
+	pageCtx          context.Context
+	pageCancel       context.CancelFunc
+	calls            *callQueue
+	pendingEvents    []string
+	resources        map[*comObject]resourceRequest
+	temporary        temporaryDirectory
+	initializing     bool
+	onCloseReady     atomic.Bool
+	initialLoaded    bool
+	contentCommitted bool
+	ready            bool
+	shown            bool
+	hidden           bool
+	closing          bool
+	closePending     bool
+	closeRequested   bool
+	closed           bool
+	err              error
 }
 
 // queuedCall 保存主线程操作及关闭时的资源回收操作
@@ -424,14 +429,19 @@ func newScalarCallback(iid string, fn func(uintptr, uintptr) uintptr) (*comCallb
 }
 
 // buildWindowsBridgeScript 构造带随机凭据隔离的Windows文档初始化脚本
-// 入参: token 仅向顶层宿主页面注入的随机凭据
+// 入参: token 仅向顶层宿主页面注入的随机凭据, dropEnabled 是否启用文件拖放桥接
 // 返回: string 文档初始化脚本
-func buildWindowsBridgeScript(token string) string {
+func buildWindowsBridgeScript(token string, dropEnabled bool) string {
 	encoded := bridgeScriptQuoted(token)
+	drop := "false"
+	if dropEnabled {
+		drop = "true"
+	}
 	return strings.Join([]string{
 		`(() => {`,
 		`if (location.origin !== "` + resourceOrigin + `" || window !== window.top) return;`,
 		`const bridgeToken = ` + encoded + `;`,
+		`const dropEnabled = ` + drop + `;`,
 		`const webview = chrome.webview;`,
 		`const transport = {`,
 		`postMessage: message => webview.postMessage({...message, token: bridgeToken}),`,
@@ -452,7 +462,7 @@ func run(parent context.Context, o Options) error {
 		return ErrAlreadyRunning
 	}
 	defer func() {
-		if n.onCloseReady && o.OnClose != nil {
+		if n.onCloseReady.Load() && o.OnClose != nil {
 			o.OnClose()
 		}
 	}()
@@ -836,7 +846,6 @@ func windowProc(hwnd, msg, wparam, lparam uintptr) uintptr {
 					entry.recordActivation(hwnd)
 				}
 			}
-			n.scheduleTitleBarChange()
 		case 0x10:
 			n.requestClose()
 			return 0
@@ -960,10 +969,11 @@ func (n *nativeWindow) activate() error {
 		iconic, _, _ := user32.NewProc("IsIconic").Call(n.hwnd)
 		if iconic != 0 {
 			user32.NewProc("ShowWindow").Call(n.hwnd, 9)
+			user32.NewProc("SetForegroundWindow").Call(n.hwnd)
 		} else if n.shown || n.ready {
 			n.show()
+			user32.NewProc("SetForegroundWindow").Call(n.hwnd)
 		}
-		user32.NewProc("SetForegroundWindow").Call(n.hwnd)
 	})
 }
 
@@ -1023,24 +1033,35 @@ func (n *nativeWindow) drainTop() {
 	n.topQueue = nil
 	n.mu.Unlock()
 	for _, fn := range queue {
-		if n.closed || n.quitAfterModal {
+		if n.closed || n.quitting || n.quitAfterModal {
 			return
 		}
 		fn()
 	}
 }
 
-// invokeTop 等待最外层消息循环执行操作，不在WndProc或COM回调栈显示模态窗口
-// 入参: fn 待执行操作
+// invokeTop 等待最外层消息循环执行操作，不在WndProc或COM回调栈显示模态窗口，排队阶段响应上下文取消
+// 入参: ctx 调用上下文, fn 待执行操作
 // 返回: error 执行错误
-func (n *nativeWindow) invokeTop(fn func() error) error {
+func (n *nativeWindow) invokeTop(ctx context.Context, fn func() error) error {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
 	result := make(chan error, 1)
+	var state atomic.Int32
 	n.mu.Lock()
 	if n.closed {
 		n.mu.Unlock()
 		return ErrClosed
 	}
-	n.topQueue = append(n.topQueue, func() { result <- fn() })
+	n.topQueue = append(n.topQueue, func() {
+		if !state.CompareAndSwap(0, 1) {
+			return
+		}
+		result <- fn()
+	})
 	ok, _, err := user32.NewProc("PostMessageW").Call(n.hwnd, 0x8002, 0, 0)
 	if ok == 0 {
 		n.topQueue = n.topQueue[:len(n.topQueue)-1]
@@ -1048,9 +1069,27 @@ func (n *nativeWindow) invokeTop(fn func() error) error {
 		return err
 	}
 	n.mu.Unlock()
+	if ctx == nil {
+		select {
+		case err := <-result:
+			return err
+		case <-n.done:
+			return ErrClosed
+		}
+	}
 	select {
 	case err := <-result:
 		return err
+	case <-ctx.Done():
+		if state.CompareAndSwap(0, 2) {
+			return ctx.Err()
+		}
+		select {
+		case err := <-result:
+			return err
+		case <-n.done:
+			return ErrClosed
+		}
 	case <-n.done:
 		return ErrClosed
 	}
@@ -1076,12 +1115,13 @@ func (n *nativeWindow) leaveModal() {
 
 // postQuit 关闭活动菜单与对话框并退出主消息循环，存在嵌套模态循环时延迟退出
 func (n *nativeWindow) postQuit() {
+	n.quitting = true
 	if n.activeTrayMenu != nil {
 		n.activeTrayMenu.endMenu()
 	}
 	user32.NewProc("EndMenu").Call()
 	if n.activeDialog != nil {
-		com(n.activeDialog, 23, 0x800704c7)
+		closeFileDialog(n.activeDialog)
 	}
 	if n.modalActive > 0 {
 		n.quitAfterModal = true
@@ -1154,7 +1194,7 @@ func (n *nativeWindow) close() error {
 
 // emit 投递JSON消息
 // 入参: raw 消息文本
-// 返回: error 投递错误
+// 返回: error 队列上限或投递错误
 func (n *nativeWindow) emit(raw string) error {
 	return n.invoke(func() error {
 		if n.webview == nil {
@@ -1162,11 +1202,9 @@ func (n *nativeWindow) emit(raw string) error {
 		}
 		if !n.ready {
 			if len(n.pendingEvents) >= maxPendingEvents {
-				copy(n.pendingEvents, n.pendingEvents[1:])
-				n.pendingEvents[len(n.pendingEvents)-1] = raw
-			} else {
-				n.pendingEvents = append(n.pendingEvents, raw)
+				return errors.New("too many pending events")
 			}
+			n.pendingEvents = append(n.pendingEvents, raw)
 			return nil
 		}
 		return hresult(com(n.webview, 32, uintptr(unsafe.Pointer(wide(raw)))))
@@ -1344,6 +1382,7 @@ func (n *nativeWindow) setup() error {
 		n.pageCtx, n.pageCancel = context.WithCancel(n.ctx)
 		n.calls = newCallQueue(n.pageCtx)
 		n.ready = false
+		n.contentCommitted = true
 		return 0
 	})
 	if err := register(9, 10, contentLoading); err != nil {
@@ -1464,22 +1503,30 @@ func (n *nativeWindow) setup() error {
 		if success == 0 {
 			var status int32
 			hasStatus := hresult(com(args, 4, uintptr(unsafe.Pointer(&status)))) == nil
-			if hasStatus && (status == 14 || status == 9 && n.closeRequested) {
+			if hasStatus && status == 9 && (n.closeRequested || n.quitting) {
 				return 0
 			}
-			var httpStatus int32
-			var args2 *comObject
-			if hresult(com(args, 0, uintptr(unsafe.Pointer(&navCompleted2IID)), uintptr(unsafe.Pointer(&args2)))) == nil && args2 != nil {
-				_ = hresult(com(args2, 6, uintptr(unsafe.Pointer(&httpStatus))))
-				release(args2)
-			}
-			if httpStatus <= 0 {
-				if !n.ready {
-					n.fail(errors.New("navigation failed"))
+			if hasStatus && status == 14 {
+				if !n.contentCommitted {
+					return 0
 				}
-				return 0
+			} else {
+				var httpStatus int32
+				var args2 *comObject
+				if hresult(com(args, 0, uintptr(unsafe.Pointer(&navCompleted2IID)), uintptr(unsafe.Pointer(&args2)))) == nil && args2 != nil {
+					_ = hresult(com(args2, 6, uintptr(unsafe.Pointer(&httpStatus))))
+					release(args2)
+				}
+				if httpStatus <= 0 {
+					if !n.initialLoaded {
+						n.fail(errors.New("navigation failed"))
+					}
+					return 0
+				}
 			}
 		}
+		n.initialLoaded = true
+		n.contentCommitted = false
 		if !n.ready {
 			n.ready = true
 			for _, event := range n.pendingEvents {
@@ -1520,6 +1567,7 @@ func (n *nativeWindow) setup() error {
 		n.readyWG.Add(1)
 		go func() {
 			defer n.readyWG.Done()
+			n.onCloseReady.Store(true)
 			if n.options.OnReady != nil {
 				var panicErr error
 				func() {
@@ -1536,17 +1584,12 @@ func (n *nativeWindow) setup() error {
 				}
 			}
 			_ = n.enqueue(func() {
-				if n.closed || n.webview == nil {
-					return
-				}
-				n.onCloseReady = true
-				if n.closeRequested {
+				if n.closed || n.quitting || n.closing || n.closeRequested || n.webview == nil {
 					return
 				}
 				n.titleBarReady = true
 				n.publishTitleBarChange(true)
 				if err := hresult(com(n.webview, 5, uintptr(unsafe.Pointer(wide(resourceURL(n.options.EntryPath)))))); err != nil {
-					n.onCloseReady = false
 					n.fail(err)
 				}
 			})
@@ -1554,7 +1597,7 @@ func (n *nativeWindow) setup() error {
 		return 0
 	})
 	defer releaseCallback(completedObj)
-	script := buildWindowsBridgeScript(n.bridgeToken)
+	script := buildWindowsBridgeScript(n.bridgeToken, n.options.OnDrop != nil)
 	return hresult(com(n.webview, 27, uintptr(unsafe.Pointer(wide(script))), completed))
 }
 

@@ -83,7 +83,7 @@ func linuxResource(request, data uintptr) {
 		return
 	}
 	uri := gtk.RequestURI(request)
-	req, err := http.NewRequestWithContext(n.pageCtx, gtk.RequestMethod(request), uri, nil)
+	req, err := http.NewRequestWithContext(n.ctx, gtk.RequestMethod(request), uri, nil)
 	if err != nil {
 		n.reportError(err)
 		n.finishEmpty(request, 400, nil)
@@ -186,6 +186,14 @@ func linuxResource(request, data uintptr) {
 			}
 			if resource != nil {
 				if resource.Body == nil {
+					status := resource.StatusCode
+					if status == http.StatusNoContent || status == http.StatusNotModified {
+						if resource.Header != nil {
+							w.header = resource.Header.Clone()
+						}
+						w.WriteHeader(status)
+						return
+					}
 					w.err = errors.New("missing resource body")
 					http.Error(w, "Missing resource body", 500)
 					return

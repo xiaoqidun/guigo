@@ -19,8 +19,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -39,11 +41,39 @@ type pipeInstance struct {
 	ctx      context.Context
 	cancel   context.CancelFunc
 	acceptMu sync.Mutex
+	stopOnce sync.Once
 	once     sync.Once
 	err      error
 }
 
-// instanceSecurityDescriptor 构造仅允许当前用户访问的安全描述符，提权进程附加高完整性标签
+// tokenIsHighIntegrity 检查访问令牌是否具备高或更高完整性级别
+// 入参: token 进程访问令牌
+// 返回: bool 是否至少为高完整性级别
+func tokenIsHighIntegrity(token windows.Token) bool {
+	var size uint32
+	err := windows.GetTokenInformation(token, windows.TokenIntegrityLevel, nil, 0, &size)
+	if !errors.Is(err, windows.ERROR_INSUFFICIENT_BUFFER) || size < uint32(unsafe.Sizeof(windows.Tokenmandatorylabel{})) || size > 4096 {
+		return false
+	}
+	wordSize := uint32(unsafe.Sizeof(uintptr(0)))
+	words := make([]uintptr, (size+wordSize-1)/wordSize)
+	if err := windows.GetTokenInformation(token, windows.TokenIntegrityLevel, (*byte)(unsafe.Pointer(&words[0])), uint32(len(words))*wordSize, &size); err != nil {
+		return false
+	}
+	label := (*windows.Tokenmandatorylabel)(unsafe.Pointer(&words[0]))
+	if label.Label.Sid == nil {
+		return false
+	}
+	count := label.Label.Sid.SubAuthorityCount()
+	if count == 0 {
+		return false
+	}
+	high := label.Label.Sid.SubAuthority(uint32(count-1)) >= 0x3000
+	runtime.KeepAlive(words)
+	return high
+}
+
+// instanceSecurityDescriptor 构造仅允许当前用户访问的安全描述符，高完整性进程附加高完整性标签
 // 入参: identity 实例身份字符串
 // 返回: *windows.SECURITY_DESCRIPTOR 安全描述符, error 构造错误
 func instanceSecurityDescriptor(identity string) (*windows.SECURITY_DESCRIPTOR, error) {
@@ -55,7 +85,7 @@ func instanceSecurityDescriptor(identity string) (*windows.SECURITY_DESCRIPTOR, 
 	return windows.SecurityDescriptorFromString(sddl)
 }
 
-// windowsInstanceIdentity 返回进程所属用户、登录会话及提升状态
+// windowsInstanceIdentity 返回进程所属用户、登录会话、提升状态及高完整性级别
 // 入参: pid 进程编号
 // 返回: string 实例身份, error 查询错误
 func windowsInstanceIdentity(pid uint32) (string, error) {
@@ -77,7 +107,7 @@ func windowsInstanceIdentity(pid uint32) (string, error) {
 	if err := windows.ProcessIdToSessionId(pid, &session); err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("%s:%d:%t", user.User.Sid.String(), session, token.IsElevated()), nil
+	return fmt.Sprintf("%s:%d:%t:%t", user.User.Sid.String(), session, token.IsElevated(), tokenIsHighIntegrity(token)), nil
 }
 
 // instanceAddress 生成当前用户、会话及权限范围的管道地址
@@ -121,7 +151,14 @@ func listenInstance(address string) (instanceListener, error) {
 		windows.CloseHandle(mutex)
 		return nil, err
 	}
-	first, err := windows.CreateNamedPipe(pipeName, windows.PIPE_ACCESS_DUPLEX|windows.FILE_FLAG_OVERLAPPED|firstPipeInstanceFlag, windows.PIPE_TYPE_BYTE|windows.PIPE_REJECT_REMOTE_CLIENTS, 255, 4096, 4096, 0, &attributes)
+	var first windows.Handle
+	for i := range 10 {
+		first, err = windows.CreateNamedPipe(pipeName, windows.PIPE_ACCESS_DUPLEX|windows.FILE_FLAG_OVERLAPPED|firstPipeInstanceFlag, windows.PIPE_TYPE_BYTE|windows.PIPE_REJECT_REMOTE_CLIENTS, 255, 4096, 4096, 0, &attributes)
+		if err == nil || !errors.Is(err, windows.ERROR_ACCESS_DENIED) || i == 9 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	if err != nil {
 		windows.CloseHandle(mutex)
 		return nil, err
@@ -241,10 +278,10 @@ func (l *pipeInstance) Accept() (instanceConn, error) {
 	}
 }
 
-// Close 停止等待并释放互斥入口与未使用的首管道句柄
-// 返回: error 关闭错误
-func (l *pipeInstance) Close() error {
-	l.once.Do(func() {
+// stop 停止等待新连接并关闭未使用的首管道句柄，暂不释放互斥入口
+// 返回: error 停止错误
+func (l *pipeInstance) stop() error {
+	l.stopOnce.Do(func() {
 		l.cancel()
 		l.acceptMu.Lock()
 		defer l.acceptMu.Unlock()
@@ -252,6 +289,15 @@ func (l *pipeInstance) Close() error {
 			windows.CloseHandle(l.first)
 			l.first = 0
 		}
+	})
+	return nil
+}
+
+// Close 停止等待并释放互斥入口与未使用的首管道句柄
+// 返回: error 关闭错误
+func (l *pipeInstance) Close() error {
+	_ = l.stop()
+	l.once.Do(func() {
 		l.err = windows.CloseHandle(l.mutex)
 	})
 	return l.err

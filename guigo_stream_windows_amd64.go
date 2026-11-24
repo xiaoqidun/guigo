@@ -226,19 +226,21 @@ func streamQuery(self uintptr, iid *syscall.GUID, out *uintptr) (result uintptr)
 		return 0x80004005
 	}
 	g := *iid
-	if g == iidMarshal && stream.marshal != nil {
-		if addRefPositive(&stream.refs) == 0 {
-			return 0x80004005
-		}
-		hr := com(stream.marshal, 0, uintptr(unsafe.Pointer(iid)), uintptr(unsafe.Pointer(out)))
-		streamRelease(self)
-		return hr
-	}
-	if g != iidUnknown && g != iidStream && g != iidSequentialStream && g != iidAgileObject {
+	if g != iidMarshal && g != iidUnknown && g != iidStream && g != iidSequentialStream && g != iidAgileObject {
 		return 0x80004002
 	}
 	if addRefPositive(&stream.refs) == 0 {
 		return 0x80004005
+	}
+	if g == iidMarshal {
+		marshal := stream.marshal
+		if marshal == nil {
+			streamRelease(self)
+			return 0x80004002
+		}
+		hr := com(marshal, 0, uintptr(unsafe.Pointer(iid)), uintptr(unsafe.Pointer(out)))
+		streamRelease(self)
+		return hr
 	}
 	*out = self
 	return 0

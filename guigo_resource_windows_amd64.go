@@ -316,14 +316,21 @@ func (n *nativeWindow) resource(args *comObject) {
 		if body != nil {
 			defer body.Close()
 		}
-		if localURL(uri) && isReservedPath(req.URL.Path) && req.URL.Path != "/__guigo/call" {
+		if !localURL(uri) {
+			_ = n.enqueue(func() {
+				n.respond(args, nil, 403, "")
+				n.finishResource(args)
+			})
+			return
+		}
+		if isReservedPath(req.URL.Path) && req.URL.Path != "/__guigo/call" {
 			_ = n.enqueue(func() {
 				n.respond(args, nil, 404, "")
 				n.finishResource(args)
 			})
 			return
 		}
-		if localURL(uri) && (n.options.ResourceHandler != nil || req.URL.Path == "/__guigo/call") {
+		if n.options.ResourceHandler != nil || req.URL.Path == "/__guigo/call" {
 			var resource *Resource
 			var handlerErr error
 			func() {
@@ -428,15 +435,11 @@ func (n *nativeWindow) resource(args *comObject) {
 					w.err = fmt.Errorf("resource handler panic: %v", v)
 				}
 			}()
-			if !localURL(uri) {
-				http.Error(w, "Forbidden", 403)
-			} else {
-				if _, ok := n.options.Handler.(fileHandler); ok && strings.HasSuffix(req.URL.Path, "/index.html") {
-					req.URL.Path = strings.TrimSuffix(req.URL.Path, "index.html")
-					req.URL.RawPath = ""
-				}
-				n.options.Handler.ServeHTTP(w, req)
+			if _, ok := n.options.Handler.(fileHandler); ok && strings.HasSuffix(req.URL.Path, "/index.html") {
+				req.URL.Path = strings.TrimSuffix(req.URL.Path, "index.html")
+				req.URL.RawPath = ""
 			}
+			n.options.Handler.ServeHTTP(w, req)
 		}()
 		if w.err != nil {
 			spool.finish(w.err)

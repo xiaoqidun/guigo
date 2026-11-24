@@ -383,9 +383,9 @@ func (l *windowInstance) detachWindow(window *nativeWindow) {
 	}
 }
 
-// Close 移除窗口登记属性并关闭入口，释放尚未完成的启动等待
-// 返回: error 关闭错误
-func (l *windowInstance) Close() error {
+// stop 移除窗口登记属性、结束启动等待并停止接收新连接
+// 返回: error 停止错误
+func (l *windowInstance) stop() error {
 	l.mu.Lock()
 	var window *nativeWindow
 	if !l.closed {
@@ -406,5 +406,12 @@ func (l *windowInstance) Close() error {
 		}
 	}
 	l.once.Do(func() { close(l.bound) })
+	return l.instanceListener.stop()
+}
+
+// Close 移除窗口登记属性并关闭入口，释放尚未完成的启动等待
+// 返回: error 关闭错误
+func (l *windowInstance) Close() error {
+	_ = l.stop()
 	return l.instanceListener.Close()
 }
