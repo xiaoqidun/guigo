@@ -16,9 +16,13 @@
 
 package guigo
 
-// bridgeScript 在文档创建时安装Promise调用桥与事件订阅
-const bridgeScript = `(() => {
-	if (location.origin !== "` + resourceOrigin + `" || window !== window.top) return;
+import (
+	"encoding/json"
+	"strings"
+)
+
+// bridgeScriptCore 为双平台共用的Promise调用桥与事件订阅主体，依赖外层提供transport与bridgeToken
+const bridgeScriptCore = `(() => {
 	let serial = 0;
 	let closed = false;
 	const pending = new Map();
@@ -83,10 +87,12 @@ const bridgeScript = `(() => {
 		if (header.length > 4 * 1024 * 1024) throw new RangeError("binary header too large");
 		const prefix = new Uint8Array(4);
 		new DataView(prefix.buffer).setUint32(0, header.length, true);
-		return {parts:[prefix, header, ...bodies], size:4 + header.length + parts.reduce((total, part) => total + part.size, 0)};
+		const size = 4 + header.length + parts.reduce((total, part) => total + part.size, 0);
+		if (size > 128 * 1024 * 1024) throw new RangeError("binary payload too large");
+		return {parts:[prefix, header, ...bodies], size};
 	};
 	const cancel = id => {
-		try { chrome.webview.postMessage({type:"cancel", id}); }
+		try { transport.postMessage({type:"cancel", id}); }
 		catch {}
 	};
 	const settle = message => {
@@ -95,7 +101,7 @@ const bridgeScript = `(() => {
 		pending.delete(message.id);
 		call.cleanup();
 		try {
-			chrome.webview.postMessage({type:message.error ? "cancel" : "accept", id:message.id});
+			transport.postMessage({type:message.error ? "cancel" : "accept", id:message.id});
 		} catch (error) {
 			cancel(message.id);
 			call.reject(error);
@@ -108,7 +114,7 @@ const bridgeScript = `(() => {
 			call.reject(error);
 		} else call.resolve(message.value);
 	};
-	chrome.webview.addEventListener("message", event => {
+	transport.addEventListener("message", event => {
 		const message = event.data;
 		if (!message || typeof message !== "object") return;
 		if (message.type === "reply") settle(message);
@@ -149,7 +155,7 @@ const bridgeScript = `(() => {
 						const cleanup = () => signal?.removeEventListener("abort", abort);
 						const upload = async () => {
 							try {
-								const response = await fetch("/__guigo/call?id=" + id, {method:"POST", body, signal, headers:{"X-Guigo-Length":String(data.size)}});
+								const response = await fetch("/__guigo/call?id=" + id, {method:"POST", body:transport.body ? await transport.body(body) : body, signal, headers:{"X-Guigo-Length":String(data.size), "X-Guigo-Token":bridgeToken}});
 								if (!response.ok) throw new Error("binary call failed");
 								settle(await response.json());
 							} catch (error) {
@@ -163,7 +169,7 @@ const bridgeScript = `(() => {
 						signal?.addEventListener("abort", abort, {once:true});
 						if (signal?.aborted) { abort(); return; }
 						try {
-							chrome.webview.postMessage({type:"call", id, name, args:data.args, binary:!!body});
+							transport.postMessage({type:"call", id, name, args:data.args, binary:!!body});
 						} catch (error) {
 							pending.delete(id);
 							cleanup();
@@ -198,12 +204,40 @@ const bridgeScript = `(() => {
 	});
 	addEventListener("drop", event => {
 		const files = Array.from(event.dataTransfer?.files || []);
-		if (files.length && chrome.webview.postMessageWithAdditionalObjects) {
+		if (files.length && transport.postMessageWithAdditionalObjects) {
 			event.preventDefault();
-			chrome.webview.postMessageWithAdditionalObjects({type:"drop"}, files);
+			transport.postMessageWithAdditionalObjects({type:"drop"}, files);
 		}
 	});
 })();`
+
+// bridgeScriptQuoted 编码桥接凭据为JavaScript字符串字面量
+// 入参: token 凭据文本
+// 返回: string JSON字符串字面量
+func bridgeScriptQuoted(token string) string {
+	data, _ := json.Marshal(token)
+	return string(data)
+}
+
+// buildWindowsBridgeScript 构造带随机凭据隔离的Windows文档初始化脚本
+// 入参: token 仅向顶层宿主页面注入的随机凭据
+// 返回: string 文档初始化脚本
+func buildWindowsBridgeScript(token string) string {
+	encoded := bridgeScriptQuoted(token)
+	return strings.Join([]string{
+		`(() => {`,
+		`if (location.origin !== "` + resourceOrigin + `" || window !== window.top) return;`,
+		`const bridgeToken = ` + encoded + `;`,
+		`const webview = chrome.webview;`,
+		`const transport = {`,
+		`postMessage: message => webview.postMessage({...message, token: bridgeToken}),`,
+		`addEventListener: (name, listener) => webview.addEventListener(name, listener),`,
+		`postMessageWithAdditionalObjects: webview.postMessageWithAdditionalObjects ? (message, files) => webview.postMessageWithAdditionalObjects({...message, token: bridgeToken}, files) : null`,
+		`};`,
+		bridgeScriptCore,
+		`})();`,
+	}, "\n")
+}
 
 // localURL 判断请求是否属于宿主来源
 // 入参: raw 资源地址

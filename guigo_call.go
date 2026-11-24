@@ -24,6 +24,9 @@ import (
 	"sync"
 )
 
+// maxBinaryCallSize 限制单次二进制调用总字节数上限，防止异常请求耗尽内存
+const maxBinaryCallSize int64 = 128 << 20
+
 // callQueue 管理当前页面的调用及执行上限
 type callQueue struct {
 	mu    sync.Mutex
@@ -56,9 +59,10 @@ type binaryPart struct {
 // pageContextKey 标识调用所属页面的生命周期
 type pageContextKey struct{}
 
-// PageContext 返回调用所属页面的上下文，导航或关闭窗口时取消
+// PageContext 从处理器调用上下文中提取所属页面的生命周期上下文，非异步操作
+// 当页面发生导航或窗口关闭时，返回的上下文取消；非宿主上下文原样返回
 // 入参: ctx 处理器收到的调用上下文
-// 返回: context.Context 页面上下文，非宿主上下文原样返回
+// 返回: context.Context 页面上下文
 func PageContext(ctx context.Context) context.Context {
 	if ctx == nil {
 		return nil
@@ -76,12 +80,15 @@ func newCallQueue(ctx context.Context) *callQueue {
 	return &callQueue{ctx: ctx, items: make(map[string]*pendingCall), slots: make(chan struct{}, 8)}
 }
 
-// readBinaryCall 读取元信息与原始字节并还原参数
+// readBinaryCall 读取元信息与原始字节并还原参数，限制总体积上限
 // 入参: ctx 调用上下文, body 请求流, size 请求长度
 // 返回: any 参数, error 解码错误
 func readBinaryCall(ctx context.Context, body io.Reader, size int64) (any, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if size < 4 || size > maxBinaryCallSize {
+		return nil, errors.New("invalid binary size")
 	}
 	var prefix [4]byte
 	if _, err := io.ReadFull(body, prefix[:]); err != nil {

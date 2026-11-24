@@ -99,7 +99,7 @@ func validatePrinterProfile(p *PrinterProfile) error {
 	if p.Printer.Name == "" || p.Width <= 0 || p.Height <= 0 || r.Width <= 0 || r.Height <= 0 || r.X+r.Width > p.Width+0.1 || r.Y+r.Height > p.Height+0.1 {
 		return fmt.Errorf("invalid printer printable area")
 	}
-	if p.Options.Color == "color" && !p.Color || p.Options.Duplex != "" && p.Options.Duplex != "simplex" && !p.Duplex || p.MaxCopies > 0 && p.Options.Copies > p.MaxCopies {
+	if p.Options.Color == PrintColorModeColor && !p.Color || p.Options.Duplex != "" && p.Options.Duplex != PrintDuplexOneSided && !p.Duplex || p.MaxCopies > 0 && p.Options.Copies > p.MaxCopies {
 		return fmt.Errorf("%w: device settings", ErrPrintUnsupported)
 	}
 	p.Fingerprint = ""
@@ -176,7 +176,7 @@ func (w *Window) ShowPrinterProperties(ctx context.Context, printer string) erro
 		return ErrClosed
 	}
 	if printer == "" {
-		return fmt.Errorf("missing printer")
+		return fmt.Errorf("%w: missing printer", ErrPrinterNotFound)
 	}
 	if err := validatePrint(PrintOptions{Printer: printer}); err != nil {
 		return err

@@ -76,7 +76,10 @@ func linuxEndPrint(operation uintptr, failure error) {
 	if failure == nil {
 		failure = job.err
 	}
-	job.result <- failure
+	select {
+	case job.result <- failure:
+	default:
+	}
 }
 
 // printCapabilities 返回WebKitGTK支持的通用打印机制
@@ -98,8 +101,8 @@ func (n *nativeWindow) printCapabilities(ctx context.Context) (PrintCapabilities
 // showPrintUI 打开WebKitGTK系统打印对话框并等待底层消费结束
 // 入参: ctx 调用上下文, kind 打印窗口类型
 // 返回: error 不支持、取消或窗口调用错误
-func (n *nativeWindow) showPrintUI(ctx context.Context, kind string) error {
-	if kind != "system" {
+func (n *nativeWindow) showPrintUI(ctx context.Context, kind PrintDialogKind) error {
+	if kind != PrintDialogSystem {
 		return ErrPrintUnsupported
 	}
 	_, err := n.runPrint(ctx, PrintOptions{}, true)
@@ -113,7 +116,7 @@ func (n *nativeWindow) print(ctx context.Context, o PrintOptions) (PrintResult, 
 	return n.runPrint(ctx, o, false)
 }
 
-// runPrint 在GTK线程配置、调起并跟踪一次打印
+// runPrint 在GTK线程配置、调起并跟踪一次打印，持额外引用防止模态期间释放引发UAF
 // 入参: ctx 调用上下文, o 设备打印选项, dialog 是否显示系统窗口
 // 返回: PrintResult 提交结果, error 配置、提交或取消错误
 func (n *nativeWindow) runPrint(ctx context.Context, o PrintOptions, dialog bool) (PrintResult, error) {
@@ -156,7 +159,7 @@ func (n *nativeWindow) runPrint(ctx context.Context, o PrintOptions, dialog bool
 		set("print-pages", "all")
 		set("page-set", "all")
 		set("reverse", "false")
-		set("orientation", o.Orientation)
+		set("orientation", string(o.Orientation))
 		if o.Copies > 0 {
 			set("n-copies", strconv.Itoa(o.Copies))
 		}
@@ -167,13 +170,13 @@ func (n *nativeWindow) runPrint(ctx context.Context, o PrintOptions, dialog bool
 			set("number-up", strconv.Itoa(o.PagesPerSide))
 		}
 		if o.Collation != "" {
-			set("collate", strconv.FormatBool(o.Collation == "collated"))
+			set("collate", strconv.FormatBool(o.Collation == PrintCollationCollated))
 		}
 		if o.Color != "" {
-			set("use-color", strconv.FormatBool(o.Color == "color"))
+			set("use-color", strconv.FormatBool(o.Color == PrintColorModeColor))
 		}
 		if o.Duplex != "" {
-			set("duplex", map[string]string{"simplex": "simplex", "longEdge": "horizontal", "shortEdge": "vertical"}[o.Duplex])
+			set("duplex", map[PrintDuplex]string{PrintDuplexOneSided: "simplex", PrintDuplexLongEdge: "horizontal", PrintDuplexShortEdge: "vertical"}[o.Duplex])
 		}
 		if o.PageRanges != "" {
 			ranges, err := printPageRanges(o.PageRanges)
@@ -192,7 +195,7 @@ func (n *nativeWindow) runPrint(ctx context.Context, o PrintOptions, dialog bool
 		}
 		if o.Orientation != "" {
 			orientation := int32(0)
-			if o.Orientation == "landscape" {
+			if o.Orientation == PrintOrientationLandscape {
 				orientation = 1
 			}
 			gtk.PageOrientation(setup, orientation)
@@ -209,7 +212,17 @@ func (n *nativeWindow) runPrint(ctx context.Context, o PrintOptions, dialog bool
 		job.failed = gtk.Connect(operation, "failed", linuxPrintFailedCallback, 0, 0, 0)
 		job.finished = gtk.Connect(operation, "finished", linuxPrintFinishedCallback, 0, 0, 0)
 		linuxPrintOperations.Store(operation, job)
+		gtk.Ref(operation)
+		defer gtk.Unref(operation)
 		if dialog {
+			n.printModalDepth++
+			defer func() {
+				n.printModalDepth--
+				if n.printModalDepth == 0 && n.quitPending && len(n.dialogsPending) == 0 {
+					n.quitPending = false
+					gtk.LoopQuit(n.loop)
+				}
+			}()
 			if gtk.PrintDialog(operation, n.window) != 0 {
 				linuxEndPrint(operation, ErrCanceled)
 			}

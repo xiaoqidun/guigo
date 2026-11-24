@@ -35,8 +35,12 @@ import (
 	"github.com/ebitengine/purego"
 )
 
-// resourceOrigin 为WebKitGTK拦截的内部资源来源
-const resourceOrigin = "guigo://localhost"
+const (
+	// resourceOrigin 为WebKitGTK拦截的内部资源来源
+	resourceOrigin = "guigo://localhost"
+	// linuxBlockExternalRules 拦截所有非本地外网协议子资源请求以对齐安全沙箱
+	linuxBlockExternalRules = `[{"trigger":{"url-filter":"^(https?|wss?|ftp)://"},"action":{"type":"block"}}]`
+)
 
 // active 保存当前运行的Linux窗口宿主
 var active atomic.Pointer[nativeWindow]
@@ -53,7 +57,7 @@ var linuxRuns = make(chan linuxRun)
 // linuxCallbacks 缓存供原生信号调用的回调地址
 var linuxCallbacks = struct {
 	tick, closing, closed, loaded, message, scheme, headers, policy, failed, dialog, drop, loadFailed, startup uintptr
-	titleChanged, titlePosition, dragPosition                                                                  uintptr
+	titleChanged, titlePosition, dragPosition, filterSaved, dialogShutdown                                     uintptr
 }{}
 
 // nativeWindow 保存GTK线程拥有的窗口及页面状态
@@ -66,6 +70,7 @@ type nativeWindow struct {
 	cancel                                           context.CancelFunc
 	done                                             chan struct{}
 	window, view, manager, webContext, session, loop uintptr
+	filterStore                                      uintptr
 	dropTarget                                       uintptr
 	captionOverlay, dragOverlay                      uintptr
 	captionControls                                  [2]uintptr
@@ -73,6 +78,7 @@ type nativeWindow struct {
 	dragHandles                                      []linuxDragHandle
 	titleInfo                                        TitleBarInfo
 	titleScale                                       int32
+	titleBarWG                                       sync.WaitGroup
 	titleCallbacksReady                              bool
 	titleInfoSet, titleUpdatePending                 bool
 	titleCallbackRunning, titleCallbackPending       bool
@@ -86,11 +92,19 @@ type nativeWindow struct {
 	resources                                        map[uintptr]bool
 	dialogsPending                                   map[uintptr]*linuxDialog
 	nextDialog                                       uintptr
+	dialogShutdownTimer                              uint32
+	printModalDepth                                  int
+	quitPending                                      bool
 	iconDir                                          string
 	iconData                                         []byte
 	trays                                            map[uintptr]*linuxTray
 	bridgeToken                                      string
+	receiveToken                                     string
 	source, startupTimer                             uint32
+	onReadyDone                                      bool
+	filterDone                                       bool
+	entryLoaded                                      bool
+	onCloseReady                                     bool
 	shown                                            bool
 	hidden                                           bool
 	err                                              error
@@ -102,11 +116,17 @@ type linuxJob struct {
 	discard func()
 }
 
+// linuxRunResult 保存固定GTK线程的退出错误及关闭回调资格
+type linuxRunResult struct {
+	onCloseReady bool
+	err          error
+}
+
 // linuxRun 保存传给固定GTK线程的运行请求
 type linuxRun struct {
 	parent  context.Context
 	options Options
-	result  chan error
+	result  chan linuxRunResult
 }
 
 // linuxDragHandle 保存由GTK原生标题栏手势处理的内容区矩形
@@ -133,6 +153,8 @@ func init() {
 	linuxCallbacks.titleChanged = purego.NewCallback(linuxTitleChanged)
 	linuxCallbacks.titlePosition = purego.NewCallback(linuxTitlePosition)
 	linuxCallbacks.dragPosition = purego.NewCallback(linuxDragPosition)
+	linuxCallbacks.filterSaved = purego.NewCallback(linuxFilterSaved)
+	linuxCallbacks.dialogShutdown = purego.NewCallback(linuxDialogShutdownTimeout)
 }
 
 // SupportsWindowMaterial 查询当前平台是否提供指定窗口材质
@@ -142,53 +164,72 @@ func SupportsWindowMaterial(material WindowMaterial) bool {
 	return material == WindowSolid
 }
 
-// run 在固定GTK线程创建窗口并等待退出
+// run 在固定GTK线程创建窗口并等待退出，释放运行锁后在调用方Goroutine执行OnClose
 // 入参: parent 运行上下文, o 宿主选项
 // 返回: error 启动或上下文错误
 func run(parent context.Context, o Options) error {
 	if !linuxRunning.CompareAndSwap(false, true) {
-		return errors.New("another Run is active")
+		return ErrAlreadyRunning
 	}
-	defer linuxRunning.Store(false)
 	linuxThread.Do(func() {
 		go func() {
 			runtime.LockOSThread()
 			for request := range linuxRuns {
-				request.result <- runLinux(request.parent, request.options)
+				onCloseReady, err := runLinux(request.parent, request.options)
+				request.result <- linuxRunResult{onCloseReady: onCloseReady, err: err}
 			}
 		}()
 	})
-	result := make(chan error, 1)
+	result := make(chan linuxRunResult, 1)
 	linuxRuns <- linuxRun{parent: parent, options: o, result: result}
-	return <-result
+	outcome := <-result
+	linuxRunning.Store(false)
+	if outcome.onCloseReady && o.OnClose != nil {
+		o.OnClose()
+	}
+	return outcome.err
 }
 
 // runLinux 创建GTK窗口并运行原生事件循环
 // 入参: parent 运行上下文, o 宿主选项
-// 返回: error 启动或上下文错误
-func runLinux(parent context.Context, o Options) error {
-	n := &nativeWindow{options: o, bridgeToken: rand.Text(), done: make(chan struct{}), resources: make(map[uintptr]bool), dialogsPending: make(map[uintptr]*linuxDialog)}
+// 返回: bool 是否需要执行OnClose, error 启动或上下文错误
+func runLinux(parent context.Context, o Options) (bool, error) {
+	n := &nativeWindow{options: o, bridgeToken: rand.Text(), receiveToken: rand.Text(), done: make(chan struct{}), resources: make(map[uintptr]bool), dialogsPending: make(map[uintptr]*linuxDialog)}
 	if !active.CompareAndSwap(nil, n) {
-		return errors.New("another Run is active")
+		return false, ErrAlreadyRunning
 	}
 	defer active.Store(nil)
 	if err := parent.Err(); err != nil {
-		return err
+		return false, err
 	}
 	if err := loadLinux(o.LibraryPath); err != nil {
-		return err
+		return false, err
 	}
 	if o.AppID != "" {
-		defer gtk.Prgname(gtk.GetPrgname())
+		var restore []byte
+		hasPrevious := false
+		if previous := gtk.GetPrgname(); previous != nil {
+			hasPrevious = true
+			restore = append([]byte(nativeString(previous)), 0)
+		}
+		defer func() {
+			if hasPrevious {
+				gtk.Prgname(&restore[0])
+				runtime.KeepAlive(restore)
+			} else {
+				gtk.Prgname(nil)
+			}
+		}()
 		name := append([]byte(o.AppID), 0)
 		gtk.Prgname(&name[0])
+		runtime.KeepAlive(name)
 	}
-	if !gtk.Init() {
-		return errors.New("GTK could not open display")
+	if gtk.Init() == 0 {
+		return false, fmt.Errorf("%w: GTK could not open display", ErrRuntimeUnavailable)
 	}
 	data, err := iconData(o)
 	if err != nil {
-		return err
+		return false, err
 	}
 	dir := o.UserDataDir
 	if dir == "" {
@@ -197,17 +238,24 @@ func runLinux(parent context.Context, o Options) error {
 		dir, err = filepath.Abs(dir)
 	}
 	if err != nil {
-		return err
+		return false, err
 	}
 	if err = os.MkdirAll(dir, 0700); err != nil {
-		return err
+		return false, err
 	}
 	n.ctx, n.cancel = context.WithCancel(parent)
-	defer n.cancel()
+	defer func() {
+		n.cancel()
+		n.titleBarWG.Wait()
+	}()
 	n.webContext = gtk.ContextNew()
 	n.session = gtk.SessionNew(filepath.Join(dir, "data"), filepath.Join(dir, "cache"))
+	if proxy := gtk.ProxyNew("http://127.0.0.1:0", 0); proxy != 0 {
+		gtk.SessionProxy(n.session, 2, proxy)
+		gtk.ProxyFree(proxy)
+	}
 	n.manager = gtk.ManagerNew()
-	n.loop = gtk.LoopNew(0, false)
+	n.loop = gtk.LoopNew(0, 0)
 	defer gtk.Unref(n.webContext)
 	defer gtk.Unref(n.session)
 	defer gtk.Unref(n.manager)
@@ -217,15 +265,30 @@ func runLinux(parent context.Context, o Options) error {
 	gtk.CorsScheme(security, "guigo")
 	gtk.RegisterScheme(n.webContext, "guigo", linuxCallbacks.scheme, 0, 0)
 	gtk.Connect(n.manager, "script-message-received::guigo", linuxCallbacks.message, 0, 0, 0)
-	if !gtk.RegisterMessage(n.manager, "guigo", 0) {
-		return errors.New("register script message handler")
+	if gtk.RegisterMessage(n.manager, "guigo", 0) == 0 {
+		return false, errors.New("register script message handler")
 	}
-	script := gtk.ScriptNew(linuxBridgeScript(n.bridgeToken), 1, 0, 0, 0)
+	script := gtk.ScriptNew(linuxBridgeScript(n.bridgeToken, n.receiveToken), 1, 0, 0, 0)
 	gtk.AddScript(n.manager, script)
 	gtk.ScriptUnref(script)
+	n.filterStore = gtk.FilterStoreNew(filepath.Join(dir, "filters"))
+	if n.filterStore != 0 {
+		defer gtk.Unref(n.filterStore)
+		rules := []byte(linuxBlockExternalRules)
+		bytesObj := gtk.BytesNew(unsafe.Pointer(&rules[0]), uintptr(len(rules)))
+		runtime.KeepAlive(rules)
+		if bytesObj != 0 {
+			gtk.FilterSave(n.filterStore, "guigo-block-external", bytesObj, 0, linuxCallbacks.filterSaved, 0)
+			gtk.BytesUnref(bytesObj)
+		} else {
+			n.filterDone = true
+		}
+	} else {
+		n.filterDone = true
+	}
 	n.view = n.newView()
 	if n.view == 0 {
-		return errors.New("create WebKitGTK view")
+		return false, errors.New("create WebKitGTK view")
 	}
 	gtk.Sink(n.view)
 	defer gtk.Unref(n.view)
@@ -237,25 +300,22 @@ func runLinux(parent context.Context, o Options) error {
 		if n.iconDir != "" {
 			_ = os.RemoveAll(n.iconDir)
 		}
-		if o.OnClose != nil {
-			o.OnClose()
-		}
 	}()
 	gtk.Title(n.window, o.Title)
 	gtk.Size(n.window, int32(o.Width), int32(o.Height))
 	gtk.Minimum(n.view, int32(o.MinWidth), int32(o.MinHeight))
-	gtk.Resizable(n.window, !o.FixedSize)
+	gtk.Resizable(n.window, linuxBool(!o.FixedSize))
 	n.initTitleBar()
 	defer n.freeTitleBarColors()
 	if len(data) != 0 {
 		n.iconData = data
 		n.iconDir, err = linuxIconDirectory()
 		if err != nil {
-			return err
+			return false, err
 		}
 		iconName := filepath.Base(n.iconDir)
 		if err = os.WriteFile(filepath.Join(n.iconDir, iconName+".png"), data, 0600); err != nil {
-			return err
+			return false, err
 		}
 		gtk.IconPath(gtk.IconTheme(gtk.Display(n.window)), n.iconDir)
 		gtk.IconName(n.window, iconName)
@@ -281,6 +341,9 @@ func runLinux(parent context.Context, o Options) error {
 		if n.startupTimer != 0 {
 			gtk.SourceRemove(n.startupTimer)
 		}
+		if n.dialogShutdownTimer != 0 {
+			gtk.SourceRemove(n.dialogShutdownTimer)
+		}
 		n.mu.Lock()
 		source := n.source
 		n.source = 0
@@ -289,33 +352,83 @@ func runLinux(parent context.Context, o Options) error {
 			gtk.SourceRemove(source)
 		}
 	}()
+	n.onCloseReady = true
 	go func() {
 		if o.OnReady != nil {
-			panicked := false
+			var panicErr error
 			func() {
 				defer func() {
 					if v := recover(); v != nil {
-						panicked = true
-						n.fail(fmt.Errorf("OnReady panic: %v", v))
+						panicErr = fmt.Errorf("OnReady panic: %v", v)
 					}
 				}()
 				o.OnReady(&Window{native: n})
 			}()
-			if panicked {
+			if panicErr != nil {
+				_ = n.enqueue(func() { n.fail(panicErr) })
 				return
 			}
 		}
 		n.startTitleCallbacks()
 		_ = n.enqueue(func() {
-			n.startupTimer = gtk.Timeout(0, 30000, linuxCallbacks.startup, 0, 0)
-			gtk.Load(n.view, resourceURL(o.EntryPath))
+			n.onReadyDone = true
+			n.maybeLoadEntry()
 		})
 	}()
 	gtk.LoopRun(n.loop)
 	if n.err != nil {
-		return n.err
+		return n.onCloseReady, n.err
 	}
-	return parent.Err()
+	return n.onCloseReady, parent.Err()
+}
+
+// linuxFilterSaved 安装编译完成的外网拦截过滤器并推进首次页面加载
+// 入参: store 过滤器存储对象, result 异步结果, data 用户数据
+func linuxFilterSaved(store, result, data uintptr) {
+	n := active.Load()
+	if n == nil || n.filterStore != store {
+		return
+	}
+	var nativeErr *linuxError
+	filter := gtk.FilterSaveFinish(store, result, &nativeErr)
+	if filter != 0 {
+		if !n.closed {
+			gtk.AddFilter(n.manager, filter)
+		}
+		gtk.FilterUnref(filter)
+	} else if nativeErr != nil {
+		_ = nativeError(nativeErr)
+	}
+	n.filterDone = true
+	n.maybeLoadEntry()
+}
+
+// linuxDialogShutdownTimeout 在XDG门户不响应取消时强制结束残余对话框并退出主循环
+// 入参: data 用户数据
+// 返回: uintptr 是否继续计时
+func linuxDialogShutdownTimeout(data uintptr) uintptr {
+	n := active.Load()
+	if n == nil {
+		return 0
+	}
+	n.dialogShutdownTimer = 0
+	for id := range n.dialogsPending {
+		n.finishDialog(id, nil, ErrClosed)
+	}
+	if n.printModalDepth == 0 {
+		gtk.LoopQuit(n.loop)
+	}
+	return 0
+}
+
+// maybeLoadEntry 在外网拦截规则与OnReady均就绪后启动首次页面加载
+func (n *nativeWindow) maybeLoadEntry() {
+	if n.closed || n.entryLoaded || !n.onReadyDone || !n.filterDone {
+		return
+	}
+	n.entryLoaded = true
+	n.startupTimer = gtk.Timeout(0, 30000, linuxCallbacks.startup, 0, 0)
+	gtk.Load(n.view, resourceURL(n.options.EntryPath))
 }
 
 // linuxIconDirectory 创建仅用于图标的私有临时目录
@@ -352,10 +465,9 @@ func linuxLoadFailed(view uintptr, event int32, uri *byte, nativeErr *linuxError
 		message = nativeString(nativeErr.Message)
 	}
 	err := fmt.Errorf("load %s: %s", nativeString(uri), message)
-	n.fail(err)
+	n.reportError(err)
 	if !n.shown {
-		n.err = err
-		n.shutdown()
+		n.fail(err)
 	}
 	return 1
 }
@@ -366,42 +478,50 @@ func linuxLoadFailed(view uintptr, event int32, uri *byte, nativeErr *linuxError
 func linuxStartupTimeout(data uintptr) uintptr {
 	if n := active.Load(); n != nil && !n.shown {
 		n.startupTimer = 0
-		n.err = errors.New("initial page load timed out")
-		n.fail(n.err)
-		n.shutdown()
+		err := errors.New("initial page load timed out")
+		n.reportError(err)
+		n.fail(err)
 	}
 	return 0
 }
 
-// linuxBridgeScript 适配WebKit消息入口并保留公共桥接协议
-// 入参: token 仅向受信顶层页面注入的消息凭据
+// linuxBridgeScript 适配WebKit消息入口、双向凭据校验与公共桥接协议
+// 入参: bridgeToken 顶层页面向宿主发送消息的随机凭据, receiveToken 宿主向页面投递消息的随机凭据
 // 返回: string 文档初始化脚本
-func linuxBridgeScript(token string) string {
-	encoded, _ := json.Marshal(token)
-	script := strings.Replace(bridgeScript, `location.origin !== "`+resourceOrigin+`"`, `(location.protocol !== "guigo:" || location.host !== "localhost")`, 1)
-	script = strings.ReplaceAll(script, "chrome.webview", "transport")
-	script = strings.ReplaceAll(script, `method:"POST", body, signal`, `method:"POST", body:await body.arrayBuffer(), signal`)
-	return `(() => {
- if (location.protocol !== "guigo:" || location.host !== "localhost" || window !== window.top) return;
- const nativeFetch = window.fetch.bind(window);
- window.fetch = async (input, options) => {
-  const url = new URL(input instanceof Request ? input.url : input, location.href);
-  if (url.protocol === "guigo:" && url.host === "localhost") {
-   if (options?.body instanceof Blob) options = {...options, body:await options.body.arrayBuffer()};
-   else if (input instanceof Request && options?.body === undefined && input.method !== "GET" && input.method !== "HEAD") {
-    options = {...options, body:await input.clone().arrayBuffer()};
-   }
-  }
-  return nativeFetch(input, options);
- };
- let receive;
- const transport = {
-  postMessage: message => window.webkit.messageHandlers.guigo.postMessage(JSON.stringify({...message,token:` + string(encoded) + `})),
-  addEventListener: (name, listener) => { receive = listener; }
- };
- Object.defineProperty(window,"__guigoReceive",{value:message => receive?.({data:message})});
- ` + script + `
- })();`
+func linuxBridgeScript(bridgeToken, receiveToken string) string {
+	encodedBridge := bridgeScriptQuoted(bridgeToken)
+	encodedReceive := bridgeScriptQuoted(receiveToken)
+	return strings.Join([]string{
+		`(() => {`,
+		`if (location.protocol !== "guigo:" || location.host !== "localhost" || window !== window.top) return;`,
+		`const bridgeToken = ` + encodedBridge + `;`,
+		`const receiveToken = ` + encodedReceive + `;`,
+		`const nativeFetch = window.fetch.bind(window);`,
+		`window.fetch = async (input, options) => {`,
+		`const url = new URL(input instanceof Request ? input.url : input, location.href);`,
+		`if (url.protocol === "guigo:" && url.host === "localhost") {`,
+		`if (options?.body instanceof Blob) options = {...options, body:await options.body.arrayBuffer()};`,
+		`else if (input instanceof Request && options?.body === undefined && input.method !== "GET" && input.method !== "HEAD") {`,
+		`options = {...options, body:await input.clone().arrayBuffer()};`,
+		`}`,
+		`}`,
+		`return nativeFetch(input, options);`,
+		`};`,
+		`let receive;`,
+		`const transport = {`,
+		`postMessage: message => window.webkit.messageHandlers.guigo.postMessage(JSON.stringify({...message, token: bridgeToken})),`,
+		`addEventListener: (name, listener) => { receive = listener; },`,
+		`body: blob => blob.arrayBuffer()`,
+		`};`,
+		`Object.defineProperty(window, "__guigoReceive", {`,
+		`value: (token, message) => { if (token === receiveToken) receive?.({data: message}); },`,
+		`writable: false,`,
+		`configurable: false,`,
+		`enumerable: false`,
+		`});`,
+		bridgeScriptCore,
+		`})();`,
+	}, "\n")
 }
 
 // linuxTick 处理跨线程操作及上下文取消
@@ -481,7 +601,7 @@ func linuxMessage(manager, value, data uintptr) {
 		Token string `json:"token"`
 	}
 	if err := json.Unmarshal([]byte(raw), &received); err != nil {
-		n.fail(err)
+		n.reportError(err)
 		return
 	}
 	if received.Token != n.bridgeToken {
@@ -489,6 +609,9 @@ func linuxMessage(manager, value, data uintptr) {
 	}
 	message := received.envelope
 	calls := n.calls
+	if calls == nil {
+		return
+	}
 	switch message.Type {
 	case "cancel":
 		calls.remove(message.ID)
@@ -508,11 +631,15 @@ func linuxMessage(manager, value, data uintptr) {
 		go func() {
 			reply := calls.run(call, n.options.Bindings, nil, 0)
 			encoded := string(marshalReply(reply))
-			_ = n.enqueue(func() {
-				if generation == n.generation && n.pageCtx.Err() == nil {
+			if err := n.enqueue(func() {
+				if !n.closed && generation == n.generation && n.pageCtx.Err() == nil {
 					n.evaluate(encoded)
+				} else {
+					calls.remove(message.ID)
 				}
-			})
+			}); err != nil {
+				calls.remove(message.ID)
+			}
 		}()
 	}
 }
@@ -594,27 +721,14 @@ func linuxClipDragRegion(region Rect, width, height int32) linuxRectangle {
 	return linuxRectangle{X: int32(x), Y: int32(y), Width: int32(right - x), Height: int32(bottom - y)}
 }
 
-// openURL 使用系统浏览器打开外部链接
+// openURL 使用按需加载的GIO打开外部链接，不触发GTK与WebKitGTK加载
 // 入参: raw 外部地址
 // 返回: error 启动错误
 func openURL(raw string) error {
-	linuxLoadMu.Lock()
-	path := linuxLoadedPath
-	linuxLoadMu.Unlock()
-	if err := loadLinux(path); err != nil {
-		return err
-	}
-	var nativeErr *linuxError
-	if !gtk.LaunchURI(raw, 0, &nativeErr) {
-		if err := nativeError(nativeErr); err != nil {
-			return err
-		}
-		return errors.New("could not launch default URI handler")
-	}
-	return nil
+	return linuxOpenURL(raw)
 }
 
-// linuxPolicy 限制页面导航到受信来源
+// linuxPolicy 限制页面导航到受信来源，仅顶层或用户手势触发外部浏览器
 // 入参: view 浏览器对象, decision 导航决策, kind 决策类型, data 用户数据
 // 返回: uintptr 是否已经处理
 func linuxPolicy(view, decision uintptr, kind int32, data uintptr) uintptr {
@@ -631,10 +745,22 @@ func linuxPolicy(view, decision uintptr, kind int32, data uintptr) uintptr {
 		return 0
 	}
 	gtk.PolicyIgnore(decision)
-	if externalURL(uri) {
+	if !externalURL(uri) || localURL(uri) {
+		return 1
+	}
+	userGesture := gtk.ActionUserGesture(action) != 0
+	frameName := nativeString(gtk.ActionFrameName(action))
+	navType := gtk.ActionType(action)
+	allowExternal := false
+	if kind == 1 {
+		allowExternal = userGesture
+	} else {
+		allowExternal = frameName == "" && (userGesture || navType == 0)
+	}
+	if allowExternal {
 		go func() {
 			if err := openURL(uri); err != nil {
-				n.fail(err)
+				n.reportError(err)
 			}
 		}()
 	}
@@ -645,9 +771,9 @@ func linuxPolicy(view, decision uintptr, kind int32, data uintptr) uintptr {
 // 入参: view 浏览器对象, reason 退出原因, data 用户数据
 func linuxProcessFailed(view uintptr, reason int32, data uintptr) {
 	if n := active.Load(); n != nil && n.view == view {
-		n.err = fmt.Errorf("WebKit web process terminated: %d", reason)
-		n.fail(n.err)
-		n.shutdown()
+		err := fmt.Errorf("WebKit web process terminated: %d", reason)
+		n.reportError(err)
+		n.fail(err)
 	}
 }
 
@@ -682,7 +808,7 @@ func linuxDrop(target, value uintptr, x, y float64, data uintptr) uintptr {
 	go func() {
 		defer func() {
 			if v := recover(); v != nil {
-				n.fail(fmt.Errorf("OnDrop panic: %v", v))
+				n.reportError(fmt.Errorf("OnDrop panic: %v", v))
 			}
 		}()
 		n.mu.Lock()
@@ -734,6 +860,17 @@ func (n *nativeWindow) enqueueCleanup(fn, discard func()) error {
 	return nil
 }
 
+// invoke 同步等待GTK线程执行操作并返回执行结果
+// 入参: fn 原生操作
+// 返回: error 执行或关闭错误
+func (n *nativeWindow) invoke(fn func() error) error {
+	result := make(chan error, 1)
+	if err := n.enqueueCleanup(func() { result <- fn() }, func() { result <- ErrClosed }); err != nil {
+		return err
+	}
+	return <-result
+}
+
 // newPage 更新页面上下文及调用队列
 func (n *nativeWindow) newPage() {
 	if n.pageCancel != nil {
@@ -745,22 +882,23 @@ func (n *nativeWindow) newPage() {
 	n.ready = false
 }
 
-// evaluate 将消息投递到当前页面
+// evaluate 携带接收凭据将消息投递到当前页面
 // 入参: raw JSON消息
 func (n *nativeWindow) evaluate(raw string) {
-	gtk.Evaluate(n.view, "window.__guigoReceive?.("+raw+")", -1, 0, 0, 0, 0, 0)
+	gtk.Evaluate(n.view, "window.__guigoReceive?.("+bridgeScriptQuoted(n.receiveToken)+","+raw+")", -1, 0, 0, 0, 0, 0)
 }
 
-// emit 在线程队列中发送事件
+// emit 在GTK线程发送事件并同步等待完成
 // 入参: raw JSON消息
 // 返回: error 关闭错误
 func (n *nativeWindow) emit(raw string) error {
-	return n.enqueue(func() {
+	return n.invoke(func() error {
 		if !n.ready {
 			n.pendingEvents = append(n.pendingEvents, raw)
 		} else {
 			n.evaluate(raw)
 		}
+		return nil
 	})
 }
 
@@ -782,7 +920,7 @@ func (n *nativeWindow) activate() error {
 func (n *nativeWindow) hide() error {
 	return n.enqueue(func() {
 		n.hidden = true
-		gtk.Visible(n.window, false)
+		gtk.Visible(n.window, 0)
 	})
 }
 
@@ -806,7 +944,7 @@ func (n *nativeWindow) requestClose() {
 				defer func() {
 					if v := recover(); v != nil {
 						allow = false
-						n.fail(fmt.Errorf("OnClosing panic: %v", v))
+						n.reportError(fmt.Errorf("OnClosing panic: %v", v))
 					}
 				}()
 				allow = n.options.OnClosing(n.ctx)
@@ -814,6 +952,9 @@ func (n *nativeWindow) requestClose() {
 		}
 		_ = n.enqueue(func() {
 			n.closing = false
+			if n.closed {
+				return
+			}
 			pending := n.closePending
 			n.closePending = false
 			if !allow {
@@ -827,7 +968,16 @@ func (n *nativeWindow) requestClose() {
 	}()
 }
 
-// shutdown 取消所有页面操作并退出主循环
+// fail 在GTK主线程记录首个致命错误并退出主循环
+// 入参: err 致命错误
+func (n *nativeWindow) fail(err error) {
+	if n.err == nil {
+		n.err = err
+	}
+	n.shutdown()
+}
+
+// shutdown 取消所有页面操作并协调模态对话框与主循环退出
 func (n *nativeWindow) shutdown() {
 	n.mu.Lock()
 	first := !n.closed
@@ -856,7 +1006,9 @@ func (n *nativeWindow) shutdown() {
 			return true
 		})
 		n.cancel()
-		n.pageCancel()
+		if n.pageCancel != nil {
+			n.pageCancel()
+		}
 		close(n.done)
 		for _, d := range n.dialogsPending {
 			gtk.Cancel(d.cancel)
@@ -865,8 +1017,20 @@ func (n *nativeWindow) shutdown() {
 			n.finishResponse(request, 499, nil)
 		}
 	}
+	if n.printModalDepth > 0 {
+		n.quitPending = true
+		return
+	}
 	if len(n.dialogsPending) == 0 {
+		if n.dialogShutdownTimer != 0 {
+			gtk.SourceRemove(n.dialogShutdownTimer)
+			n.dialogShutdownTimer = 0
+		}
 		gtk.LoopQuit(n.loop)
+		return
+	}
+	if n.dialogShutdownTimer == 0 {
+		n.dialogShutdownTimer = gtk.Timeout(0, 1500, linuxCallbacks.dialogShutdown, 0, 0)
 	}
 }
 
@@ -874,26 +1038,24 @@ func (n *nativeWindow) shutdown() {
 // 入参: title 标题
 // 返回: error 关闭错误
 func (n *nativeWindow) setTitle(title string) error {
-	return n.enqueue(func() { gtk.Title(n.window, title) })
+	return n.invoke(func() error {
+		gtk.Title(n.window, title)
+		return nil
+	})
 }
 
 // setSize 校验并设置窗口尺寸
 // 入参: width 宽度, height 高度
 // 返回: error 尺寸或关闭错误
 func (n *nativeWindow) setSize(width, height int) error {
-	if width < 1 || height < 1 || width > 32767 || height > 32767 {
-		return errors.New("invalid window dimensions")
+	width, height, err := clampWindowSize(n.options, width, height)
+	if err != nil {
+		return err
 	}
-	o := n.options
-	width = max(width, o.MinWidth)
-	height = max(height, o.MinHeight)
-	if o.MaxWidth > 0 {
-		width = min(width, o.MaxWidth)
-	}
-	if o.MaxHeight > 0 {
-		height = min(height, o.MaxHeight)
-	}
-	return n.enqueue(func() { gtk.Size(n.window, int32(width), int32(height)) })
+	return n.invoke(func() error {
+		gtk.Size(n.window, int32(width), int32(height))
+		return nil
+	})
 }
 
 // initTitleBar 在单个WebView上方叠放原生控件并保留GTK客户区装饰
@@ -901,7 +1063,7 @@ func (n *nativeWindow) initTitleBar() {
 	if n.options.TitleBar == TitleBarContent {
 		titlebar := gtk.BoxNew(0, 0)
 		gtk.Titlebar(n.window, titlebar)
-		gtk.Visible(titlebar, false)
+		gtk.Visible(titlebar, 0)
 		n.dragOverlay = gtk.OverlayNew()
 		gtk.OverlayChild(n.dragOverlay, n.view)
 		n.captionOverlay = gtk.OverlayNew()
@@ -968,14 +1130,15 @@ func (n *nativeWindow) setTitleBarColors(colors TitleBarColors) error {
 	if n.options.TitleBar != TitleBarContent {
 		return errors.New("title bar colors require content title bar")
 	}
-	return n.enqueue(func() {
+	return n.invoke(func() error {
 		if n.options.TitleBarColors == colors {
-			return
+			return nil
 		}
 		n.freeTitleBarColors()
 		n.options.TitleBarColors = colors
 		n.initTitleBarColors()
 		n.updateTitleInfo()
+		return nil
 	})
 }
 
@@ -983,16 +1146,15 @@ func (n *nativeWindow) setTitleBarColors(colors TitleBarColors) error {
 // 入参: material 已校验的平台可用材质
 // 返回: error 调度错误
 func (n *nativeWindow) setWindowMaterial(material WindowMaterial) error {
-	return n.enqueue(func() {})
+	return n.invoke(func() error { return nil })
 }
 
 // setDragRegions 复制逻辑像素区域并交给GTK原生WindowHandle处理真实输入事件
-// GTK手势使用实际GdkEvent的设备、时间戳和原生坐标，保留系统双击动作及窗口菜单
 // 入参: regions 客户区拖动矩形，空切片清除全部区域
 // 返回: error 模式、参数或关闭错误
 func (n *nativeWindow) setDragRegions(regions []Rect) error {
 	if n.options.TitleBar != TitleBarContent {
-		return errors.New("content title bar is not enabled")
+		return errors.New("drag regions require content title bar")
 	}
 	regions = append([]Rect(nil), regions...)
 	for _, r := range regions {
@@ -1002,7 +1164,7 @@ func (n *nativeWindow) setDragRegions(regions []Rect) error {
 			return errors.New("invalid drag region")
 		}
 	}
-	return n.enqueue(func() {
+	return n.invoke(func() error {
 		for _, handle := range n.dragHandles {
 			gtk.OverlayRemove(n.dragOverlay, handle.widget)
 		}
@@ -1015,6 +1177,7 @@ func (n *nativeWindow) setDragRegions(regions []Rect) error {
 			n.dragHandles = append(n.dragHandles, linuxDragHandle{widget: handle, region: region})
 			gtk.OverlayAdd(n.dragOverlay, handle)
 		}
+		return nil
 	})
 }
 
@@ -1024,7 +1187,7 @@ func (n *nativeWindow) measureTitleControls() (int32, [2]int32) {
 	height := int32(32)
 	var widths [2]int32
 	for side, controls := range n.captionControls {
-		if controls == 0 || gtk.ControlsEmpty(controls) {
+		if controls == 0 || gtk.ControlsEmpty(controls) != 0 {
 			continue
 		}
 		var minimum, natural int32
@@ -1040,7 +1203,7 @@ func (n *nativeWindow) measureTitleControls() (int32, [2]int32) {
 func (n *nativeWindow) updateTitleInfo() {
 	n.titleUpdatePending = false
 	scale := gtk.ScaleFactor(n.window)
-	info := TitleBarInfo{Active: gtk.IsActive(n.window), Maximized: gtk.IsMaximized(n.window)}
+	info := TitleBarInfo{Active: gtk.IsActive(n.window) != 0, Maximized: gtk.IsMaximized(n.window) != 0}
 	if n.options.TitleBar == TitleBarContent {
 		info.Colors = n.options.TitleBarColors
 		height, widths := n.measureTitleControls()
@@ -1061,6 +1224,7 @@ func (n *nativeWindow) updateTitleInfo() {
 		start = n.titleCallbacksReady && !n.titleCallbackRunning
 		if start {
 			n.titleCallbackRunning = true
+			n.titleBarWG.Add(1)
 		}
 	}
 	n.mu.Unlock()
@@ -1076,6 +1240,7 @@ func (n *nativeWindow) startTitleCallbacks() {
 	start := !n.closed && n.titleCallbackPending && !n.titleCallbackRunning
 	if start {
 		n.titleCallbackRunning = true
+		n.titleBarWG.Add(1)
 	}
 	n.mu.Unlock()
 	if start {
@@ -1085,6 +1250,7 @@ func (n *nativeWindow) startTitleCallbacks() {
 
 // deliverTitleInfo 串行通知最新标题栏状态并隔离业务异常，关闭后丢弃未交付状态
 func (n *nativeWindow) deliverTitleInfo() {
+	defer n.titleBarWG.Done()
 	for {
 		n.mu.Lock()
 		if n.closed || !n.titleCallbackPending || n.ctx.Err() != nil || active.Load() != n {
@@ -1099,7 +1265,7 @@ func (n *nativeWindow) deliverTitleInfo() {
 		func() {
 			defer func() {
 				if v := recover(); v != nil {
-					n.fail(fmt.Errorf("OnTitleBarChanged panic: %v", v))
+					n.reportError(fmt.Errorf("OnTitleBarChanged panic: %v", v))
 				}
 			}()
 			n.options.OnTitleBarChanged(info)
@@ -1115,10 +1281,13 @@ func (n *nativeWindow) queueTitleInfo() {
 	}
 }
 
-// fail 异步报告错误并隔离用户回调异常
+// reportError 异步报告非致命运行错误并隔离用户回调异常
 // 入参: err 异步错误
-func (n *nativeWindow) fail(err error) {
+func (n *nativeWindow) reportError(err error) {
 	if err != nil && n.options.OnError != nil {
-		go func() { defer func() { _ = recover() }(); n.options.OnError(err) }()
+		go func() {
+			defer func() { _ = recover() }()
+			n.options.OnError(err)
+		}()
 	}
 }

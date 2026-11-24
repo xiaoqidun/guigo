@@ -18,9 +18,9 @@ package guigo
 
 import "context"
 
-// openWindowInstance 在其他平台保留原有实例复用范围
-// 入参: ctx 生命周期上下文, key 调用方实例键, data 消息, receive 接收回调
+// openWindowInstance 在其他平台沿用当前会话的单实例复用范围
+// 入参: ctx 生命周期上下文, options 归一化实例配置, receive 接收回调
 // 返回: *Instance 实例入口或nil, error 创建或转交错误
-func openWindowInstance(ctx context.Context, key string, data []byte, receive func(context.Context, []byte) error) (*Instance, error) {
-	return OpenInstance(ctx, key, data, receive)
+func openWindowInstance(ctx context.Context, options InstanceOptions, receive func(context.Context, []byte) error) (*Instance, error) {
+	return openSessionInstance(ctx, options, receive)
 }

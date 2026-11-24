@@ -17,6 +17,7 @@ package guigo
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
 	"runtime"
@@ -72,6 +73,16 @@ func windowsWideString(value *uint16) string {
 	return syscall.UTF16ToString(buffer)
 }
 
+// wrapPrinterError 将未知打印机系统错误包装为ErrPrinterNotFound
+// 入参: name 队列名称, err 系统错误
+// 返回: error 包装后的错误
+func wrapPrinterError(name string, err error) error {
+	if errors.Is(err, syscall.Errno(1801)) {
+		return fmt.Errorf("%w: %s", ErrPrinterNotFound, name)
+	}
+	return err
+}
+
 // windowsPrintMode 取得驱动完整DEVMODE，不改变系统默认值
 // 入参: name 系统队列名称
 // 返回: []byte 完整DEVMODE数据, uintptr 待关闭打印机句柄, error 驱动读取错误
@@ -79,7 +90,7 @@ func windowsPrintMode(name string) ([]byte, uintptr, error) {
 	var printer uintptr
 	ok, _, err := winspool.NewProc("OpenPrinterW").Call(uintptr(unsafe.Pointer(wide(name))), uintptr(unsafe.Pointer(&printer)), 0)
 	if ok == 0 {
-		return nil, 0, err
+		return nil, 0, wrapPrinterError(name, err)
 	}
 	proc := winspool.NewProc("DocumentPropertiesW")
 	size, _, _ := proc.Call(0, printer, uintptr(unsafe.Pointer(wide(name))), 0, 0, 0)
@@ -96,65 +107,54 @@ func windowsPrintMode(name string) ([]byte, uintptr, error) {
 	return data, printer, nil
 }
 
-// listPrinters 枚举已安装本地和连接队列，不连接远端设备读取详细驱动数据
-// 入参: ctx 查询上下文
-// 返回: []PrinterInfo 系统打印队列, error 查询或取消错误
-func (n *nativeWindow) listPrinters(ctx context.Context) ([]PrinterInfo, error) {
-	n.mu.Lock()
-	closed := n.closed
-	n.mu.Unlock()
-	if closed {
-		return nil, ErrClosed
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	var size, count uint32
+// enumWindowsPrinters 枚举已安装本地和连接队列，缓冲区不足时自动重试并检查边界
+// 返回: []PrinterInfo 系统打印队列, error 查询错误
+func enumWindowsPrinters() ([]PrinterInfo, error) {
 	proc := winspool.NewProc("EnumPrintersW")
+	var size, count uint32
 	proc.Call(6, 0, 4, 0, 0, uintptr(unsafe.Pointer(&size)), uintptr(unsafe.Pointer(&count)))
 	if size == 0 {
-		return []PrinterInfo{}, ctx.Err()
+		return []PrinterInfo{}, nil
 	}
-	if size > 64<<20 {
-		return nil, fmt.Errorf("printer list too large")
+	for range 3 {
+		if size > 64<<20 {
+			return nil, fmt.Errorf("printer list too large")
+		}
+		buffer := make([]byte, size)
+		var needed uint32
+		ok, _, err := proc.Call(6, 0, 4, uintptr(unsafe.Pointer(&buffer[0])), uintptr(size), uintptr(unsafe.Pointer(&needed)), uintptr(unsafe.Pointer(&count)))
+		if ok == 0 {
+			if errors.Is(err, syscall.Errno(122)) && needed > 0 {
+				size = needed
+				continue
+			}
+			return nil, err
+		}
+		if uint64(count)*uint64(unsafe.Sizeof(printerInfo4{})) > uint64(len(buffer)) {
+			return nil, fmt.Errorf("invalid printer list")
+		}
+		defaultName := windowsDefaultPrinter()
+		result := make([]PrinterInfo, 0, count)
+		for _, item := range unsafe.Slice((*printerInfo4)(unsafe.Pointer(&buffer[0])), count) {
+			name := windowsWideString(item.Name)
+			result = append(result, PrinterInfo{Name: name, Default: name == defaultName})
+		}
+		runtime.KeepAlive(buffer)
+		return result, nil
 	}
-	buffer := make([]byte, size)
-	ok, _, err := proc.Call(6, 0, 4, uintptr(unsafe.Pointer(&buffer[0])), uintptr(size), uintptr(unsafe.Pointer(&size)), uintptr(unsafe.Pointer(&count)))
-	if ok == 0 {
-		return nil, err
-	}
-	if uint64(count)*uint64(unsafe.Sizeof(printerInfo4{})) > uint64(len(buffer)) {
-		return nil, fmt.Errorf("invalid printer list")
-	}
-	defaultName := windowsDefaultPrinter()
-	result := make([]PrinterInfo, 0, count)
-	for _, item := range unsafe.Slice((*printerInfo4)(unsafe.Pointer(&buffer[0])), count) {
-		name := windowsWideString(item.Name)
-		result = append(result, PrinterInfo{Name: name, Default: name == defaultName})
-	}
-	runtime.KeepAlive(buffer)
-	return result, ctx.Err()
+	return nil, fmt.Errorf("printer list changed during enumeration")
 }
 
-// queryPrinter 查询当前纸张、方向对应的驱动可打印区域，毫米换算使用设备DPI
-// 入参: ctx 查询上下文, o 待核对设备设置
-// 返回: PrinterProfile 设备能力及当前纸面, error 配置、查询或取消错误
-func (n *nativeWindow) queryPrinter(ctx context.Context, o PrintOptions) (PrinterProfile, error) {
-	n.mu.Lock()
-	closed := n.closed
-	n.mu.Unlock()
-	if closed {
-		return PrinterProfile{}, ErrClosed
-	}
-	if err := ctx.Err(); err != nil {
-		return PrinterProfile{}, err
-	}
+// queryWindowsPrinter 读取打印机纸张、可打印区域与能力快照，分别校验各项驱动数组长度
+// 入参: o 待核对设备设置
+// 返回: PrinterProfile 设备能力及当前纸面, error 配置或查询错误
+func queryWindowsPrinter(o PrintOptions) (PrinterProfile, error) {
 	name := o.Printer
 	if name == "" {
 		name = windowsDefaultPrinter()
 	}
 	if name == "" {
-		return PrinterProfile{}, fmt.Errorf("no default printer")
+		return PrinterProfile{}, fmt.Errorf("%w: no default printer", ErrPrinterNotFound)
 	}
 	data, printer, err := windowsPrintMode(name)
 	if err != nil {
@@ -168,12 +168,12 @@ func (n *nativeWindow) queryPrinter(ctx context.Context, o PrintOptions) (Printe
 		return int(int32(value))
 	}
 	p := PrinterProfile{Printer: PrinterInfo{Name: name, Default: name == windowsDefaultPrinter()}, Papers: []PrintPaper{}, Color: capability(32, nil) == 1, Duplex: capability(7, nil) == 1, MaxCopies: max(1, capability(18, nil)), Properties: true}
-	count := capability(2, nil)
-	if count > 0 && count < 4096 {
-		ids := make([]uint16, count)
-		sizes := make([]point, count)
-		names := make([]uint16, count*64)
-		if capability(2, unsafe.Pointer(&ids[0])) != count || capability(3, unsafe.Pointer(&sizes[0])) != count || capability(16, unsafe.Pointer(&names[0])) != count {
+	idCount, sizeCount, nameCount := capability(2, nil), capability(3, nil), capability(16, nil)
+	if idCount > 0 && idCount < 4096 && sizeCount > 0 && sizeCount < 4096 && nameCount > 0 && nameCount < 4096 && idCount == sizeCount && idCount == nameCount {
+		ids := make([]uint16, idCount)
+		sizes := make([]point, sizeCount)
+		names := make([]uint16, nameCount*64)
+		if capability(2, unsafe.Pointer(&ids[0])) != idCount || capability(3, unsafe.Pointer(&sizes[0])) != sizeCount || capability(16, unsafe.Pointer(&names[0])) != nameCount {
 			return p, fmt.Errorf("printer paper capabilities changed")
 		}
 		for i, id := range ids {
@@ -214,9 +214,9 @@ func (n *nativeWindow) queryPrinter(ctx context.Context, o PrintOptions) (Printe
 		}
 	}
 	if o.Orientation == "" {
-		o.Orientation = "portrait"
+		o.Orientation = PrintOrientationPortrait
 		if get(76) == 2 {
-			o.Orientation = "landscape"
+			o.Orientation = PrintOrientationLandscape
 		}
 	}
 	if o.Copies == 0 {
@@ -225,26 +225,26 @@ func (n *nativeWindow) queryPrinter(ctx context.Context, o PrintOptions) (Printe
 	requestedDuplex := o.Duplex
 	if o.Duplex == "" {
 		if p.Duplex {
-			o.Duplex = map[int]string{2: "longEdge", 3: "shortEdge"}[get(94)]
+			o.Duplex = map[int]PrintDuplex{2: PrintDuplexLongEdge, 3: PrintDuplexShortEdge}[get(94)]
 		}
 		if o.Duplex == "" {
-			o.Duplex = "simplex"
+			o.Duplex = PrintDuplexOneSided
 		}
 	}
 	if o.Color == "" {
-		o.Color = "grayscale"
+		o.Color = PrintColorModeGrayscale
 		if p.Color && get(92) == 2 {
-			o.Color = "color"
+			o.Color = PrintColorModeColor
 		}
 	}
 	if o.Collation == "" {
-		o.Collation = "uncollated"
+		o.Collation = PrintCollationUncollated
 		if get(100) == 1 {
-			o.Collation = "collated"
+			o.Collation = PrintCollationCollated
 		}
 	}
 	o.Printer = name
-	setDuplex := p.Duplex && (requestedDuplex != "" || o.Duplex != "simplex")
+	setDuplex := p.Duplex && (requestedDuplex != "" || o.Duplex != PrintDuplexOneSided)
 	fields := (binary.LittleEndian.Uint32(data[72:]) | 1 | 2 | 0x10 | 0x100 | 0x800 | 0x8000) &^ 0x10000
 	set(78, paperID)
 	if paperID == 0 {
@@ -255,37 +255,37 @@ func (n *nativeWindow) queryPrinter(ctx context.Context, o PrintOptions) (Printe
 		fields &^= 4 | 8
 	}
 	set(76, 1)
-	if o.Orientation == "landscape" {
+	if o.Orientation == PrintOrientationLandscape {
 		set(76, 2)
 	}
 	set(84, 100)
 	set(86, o.Copies)
 	if setDuplex {
 		fields |= 0x1000
-		set(94, map[string]int{"simplex": 1, "longEdge": 2, "shortEdge": 3}[o.Duplex])
+		set(94, map[PrintDuplex]int{PrintDuplexOneSided: 1, PrintDuplexLongEdge: 2, PrintDuplexShortEdge: 3}[o.Duplex])
 	}
 	set(92, 1)
-	if o.Color == "color" {
+	if o.Color == PrintColorModeColor {
 		set(92, 2)
 	}
 	set(100, 0)
-	if o.Collation == "collated" {
+	if o.Collation == PrintCollationCollated {
 		set(100, 1)
 	}
 	binary.LittleEndian.PutUint32(data[72:], fields)
 	p.Options = o
 	p.Width, p.Height = o.Width, o.Height
-	if o.Orientation == "landscape" {
+	if o.Orientation == PrintOrientationLandscape {
 		p.Width, p.Height = p.Height, p.Width
 	}
-	if o.Color == "color" && !p.Color || o.Duplex != "simplex" && !p.Duplex || o.Copies > p.MaxCopies {
+	if o.Color == PrintColorModeColor && !p.Color || o.Duplex != PrintDuplexOneSided && !p.Duplex || o.Copies > p.MaxCopies {
 		return p, fmt.Errorf("%w: device settings", ErrPrintUnsupported)
 	}
 	status, _, _ := winspool.NewProc("DocumentPropertiesW").Call(0, printer, uintptr(unsafe.Pointer(wide(name))), uintptr(unsafe.Pointer(&data[0])), uintptr(unsafe.Pointer(&data[0])), 10)
 	if int32(status) != 1 {
 		return p, fmt.Errorf("validate printer settings")
 	}
-	if get(76) != (map[string]int{"portrait": 1, "landscape": 2}[o.Orientation]) || setDuplex && get(94) != (map[string]int{"simplex": 1, "longEdge": 2, "shortEdge": 3}[o.Duplex]) {
+	if get(76) != (map[PrintOrientation]int{PrintOrientationPortrait: 1, PrintOrientationLandscape: 2}[o.Orientation]) || setDuplex && get(94) != (map[PrintDuplex]int{PrintDuplexOneSided: 1, PrintDuplexLongEdge: 2, PrintDuplexShortEdge: 3}[o.Duplex]) {
 		return p, fmt.Errorf("%w: driver changed device settings", ErrPrintUnsupported)
 	}
 	dc, _, err := printGDI.NewProc("CreateICW").Call(uintptr(unsafe.Pointer(wide("WINSPOOL"))), uintptr(unsafe.Pointer(wide(name))), 0, uintptr(unsafe.Pointer(&data[0])))
@@ -304,7 +304,77 @@ func (n *nativeWindow) queryPrinter(ctx context.Context, o PrintOptions) (Printe
 	x, y := math.Max(0, device(112)*25.4/dx), math.Max(0, device(113)*25.4/dy)
 	p.PrintableArea = PrintRectangle{X: x, Y: y, Width: math.Min(p.Width-x, device(8)*25.4/dx), Height: math.Min(p.Height-y, device(10)*25.4/dy)}
 	runtime.KeepAlive(data)
-	return p, ctx.Err()
+	return p, nil
+}
+
+// listPrinters 在后台执行队列枚举并及时响应上下文取消和窗口关闭
+// 入参: ctx 查询上下文
+// 返回: []PrinterInfo 系统打印队列, error 查询或取消错误
+func (n *nativeWindow) listPrinters(ctx context.Context) ([]PrinterInfo, error) {
+	n.mu.Lock()
+	closed := n.closed
+	n.mu.Unlock()
+	if closed {
+		return nil, ErrClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	type response struct {
+		printers []PrinterInfo
+		err      error
+	}
+	done := make(chan response, 1)
+	go func() {
+		printers, err := enumWindowsPrinters()
+		done <- response{printers: printers, err: err}
+	}()
+	select {
+	case r := <-done:
+		if r.err != nil {
+			return nil, r.err
+		}
+		return r.printers, ctx.Err()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-n.done:
+		return nil, ErrClosed
+	}
+}
+
+// queryPrinter 在后台执行设备能力查询并及时响应上下文取消和窗口关闭
+// 入参: ctx 查询上下文, o 待核对设备设置
+// 返回: PrinterProfile 设备能力及当前纸面, error 配置、查询或取消错误
+func (n *nativeWindow) queryPrinter(ctx context.Context, o PrintOptions) (PrinterProfile, error) {
+	n.mu.Lock()
+	closed := n.closed
+	n.mu.Unlock()
+	if closed {
+		return PrinterProfile{}, ErrClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return PrinterProfile{}, err
+	}
+	type response struct {
+		profile PrinterProfile
+		err     error
+	}
+	done := make(chan response, 1)
+	go func() {
+		profile, err := queryWindowsPrinter(o)
+		done <- response{profile: profile, err: err}
+	}()
+	select {
+	case r := <-done:
+		if r.err != nil {
+			return PrinterProfile{}, r.err
+		}
+		return r.profile, ctx.Err()
+	case <-ctx.Done():
+		return PrinterProfile{}, ctx.Err()
+	case <-n.done:
+		return PrinterProfile{}, ErrClosed
+	}
 }
 
 // showPrinterProperties 在STA最外层消息循环打开系统设备属性
@@ -318,12 +388,20 @@ func (n *nativeWindow) showPrinterProperties(ctx context.Context, name string) e
 		var printer uintptr
 		ok, _, err := winspool.NewProc("OpenPrinterW").Call(uintptr(unsafe.Pointer(wide(name))), uintptr(unsafe.Pointer(&printer)), 0)
 		if ok == 0 {
-			return err
+			return wrapPrinterError(name, err)
 		}
 		defer winspool.NewProc("ClosePrinter").Call(printer)
+		n.modalActive++
+		defer func() {
+			n.modalActive--
+			if n.modalActive == 0 && n.quitAfterModal {
+				n.quitAfterModal = false
+				user32.NewProc("PostQuitMessage").Call(0)
+			}
+		}()
 		ok, _, err = winspool.NewProc("PrinterProperties").Call(n.hwnd, printer)
 		if ok == 0 {
-			if err == syscall.Errno(0) {
+			if errors.Is(err, syscall.Errno(0)) || errors.Is(err, syscall.Errno(1223)) {
 				return ErrCanceled
 			}
 			return err

@@ -16,6 +16,7 @@ package guigo
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -45,14 +46,14 @@ var (
 	active atomic.Pointer[nativeWindow]
 	// wndCallback 缓存主窗口过程回调地址
 	wndCallback = syscall.NewCallback(windowProc)
-	// callbackTable 保存COM回调虚函数表地址
+	// callbackTable 保存COM对象参数回调虚函数表地址
 	callbackTable = [4]uintptr{
 		syscall.NewCallback(callbackQuery),
 		syscall.NewCallback(callbackAdd),
 		syscall.NewCallback(callbackRelease),
 		syscall.NewCallback(callbackInvoke),
 	}
-	// scalarCallbackTable 保存COM标量参数回调虚函数表地址
+	// scalarCallbackTable 保存COM标量及非COM指针参数回调虚函数表地址
 	scalarCallbackTable = [4]uintptr{
 		syscall.NewCallback(callbackQuery),
 		syscall.NewCallback(callbackAdd),
@@ -112,13 +113,14 @@ type windowClass struct {
 	SmallIcon   uintptr
 }
 
-// comCallback 保存COM回调与引用计数
+// comCallback 保存COM回调、固定句柄与引用计数
 type comCallback struct {
 	Table    *[4]uintptr
 	Refs     atomic.Int32
 	IID      syscall.GUID
 	Fn       func(uintptr, *comObject) uintptr
 	ScalarFn func(uintptr, uintptr) uintptr
+	pin      runtime.Pinner
 }
 
 // comObject 保存COM接口的虚函数表指针
@@ -126,9 +128,16 @@ type comObject struct {
 	table *uintptr
 }
 
+// eventToken 保存WebView2事件注销索引和登记令牌
+type eventToken struct {
+	removeIndex int
+	token       int64
+}
+
 // nativeWindow 保存STA线程拥有的原生对象
 type nativeWindow struct {
 	options         Options
+	bridgeToken     string
 	mu              sync.Mutex
 	ctx             context.Context
 	cancel          context.CancelFunc
@@ -142,6 +151,7 @@ type nativeWindow struct {
 	titleBarState   TitleBarInfo
 	titleBarDPI     uint32
 	titleBarEvents  chan TitleBarInfo
+	titleBarWG      sync.WaitGroup
 	titleBarReady   bool
 	titleBarPending bool
 	titleBarLayout  bool
@@ -155,8 +165,11 @@ type nativeWindow struct {
 	controller      *comObject
 	webview         *comObject
 	activeDialog    *comObject
+	modalActive     int
+	quitAfterModal  bool
 	printActive     bool
 	callbacks       []*comCallback
+	eventTokens     []eventToken
 	generation      uint64
 	pageCtx         context.Context
 	pageCancel      context.CancelFunc
@@ -165,6 +178,7 @@ type nativeWindow struct {
 	resources       map[*comObject]resourceRequest
 	temporary       temporaryDirectory
 	initializing    bool
+	onCloseReady    bool
 	ready           bool
 	shown           bool
 	hidden          bool
@@ -252,68 +266,122 @@ func utf16String(p *uint16) string {
 	return syscall.UTF16ToString(b)
 }
 
-// callbackQuery 提供IUnknown和指定回调接口
-// 入参: c 回调对象, iid 接口标识, out 接口输出
+// callbackQuery 提供IUnknown和指定回调接口并隔离异常
+// 入参: self 回调地址, iid 接口标识, out 接口输出
 // 返回: uintptr HRESULT结果
-func callbackQuery(c *comCallback, iid *syscall.GUID, out **comCallback) uintptr {
-	if out == nil {
+func callbackQuery(self uintptr, iid *syscall.GUID, out *uintptr) (result uintptr) {
+	defer func() {
+		if recover() != nil {
+			result = 0x80004005
+		}
+	}()
+	if out == nil || iid == nil {
 		return 0x80004003
 	}
-	*out = nil
+	*out = 0
+	value, ok := callbackRoots.Load(self)
+	if !ok {
+		return 0x80004005
+	}
+	c := value.(*comCallback)
 	g := *iid
 	unknown := syscall.GUID{Data4: [8]byte{0xc0, 0, 0, 0, 0, 0, 0, 0x46}}
 	if g != unknown && g != c.IID {
 		return 0x80004002
 	}
-	*out = c
+	*out = self
 	c.Refs.Add(1)
 	return 0
 }
 
 // callbackAdd 增加回调引用
-// 入参: c 回调对象
+// 入参: self 回调地址
 // 返回: uintptr 引用计数
-func callbackAdd(c *comCallback) uintptr {
-	return uintptr(c.Refs.Add(1))
+func callbackAdd(self uintptr) (result uintptr) {
+	defer func() {
+		if recover() != nil {
+			result = 0
+		}
+	}()
+	value, ok := callbackRoots.Load(self)
+	if !ok {
+		return 0
+	}
+	return uintptr(value.(*comCallback).Refs.Add(1))
 }
 
-// callbackRelease 释放回调引用与全局根
-// 入参: c 回调对象
+// callbackRelease 释放回调引用、取消固定并清理全局根
+// 入参: self 回调地址
 // 返回: uintptr 引用计数
-func callbackRelease(c *comCallback) uintptr {
+func callbackRelease(self uintptr) (result uintptr) {
+	defer func() {
+		if recover() != nil {
+			result = 0
+		}
+	}()
+	value, ok := callbackRoots.Load(self)
+	if !ok {
+		return 0
+	}
+	c := value.(*comCallback)
 	n := c.Refs.Add(-1)
 	if n <= 0 {
-		callbackRoots.Delete(uintptr(unsafe.Pointer(c)))
+		callbackRoots.Delete(self)
+		c.pin.Unpin()
 		return 0
 	}
 	return uintptr(n)
 }
 
-// callbackInvoke 调度回调并隔离异常
-// 入参: c 回调对象, a 数值参数, b 对象参数
+// releaseCallback 释放Go侧持有的回调引用
+// 入参: c 回调对象
+func releaseCallback(c *comCallback) {
+	if c != nil {
+		callbackRelease(uintptr(unsafe.Pointer(c)))
+	}
+}
+
+// callbackInvoke 调度COM对象参数回调并隔离异常
+// 入参: self 回调地址, a 数值参数, b COM对象参数
 // 返回: uintptr HRESULT结果
-func callbackInvoke(c *comCallback, a uintptr, b *comObject) (result uintptr) {
+func callbackInvoke(self, a uintptr, b *comObject) (result uintptr) {
 	defer func() {
 		if recover() != nil {
 			result = 0x80004005
 		}
 	}()
+	value, ok := callbackRoots.Load(self)
+	if !ok {
+		return 0x80004005
+	}
+	c := value.(*comCallback)
+	if c.Fn == nil {
+		return 0
+	}
 	return c.Fn(a, b)
 }
 
-// scalarCallbackInvoke 调度标量参数回调并隔离异常
-// 入参: c 回调对象, a 第一数值参数, b 第二数值参数
+// scalarCallbackInvoke 调度标量或非COM指针参数回调并隔离异常，满足checkptr对齐检查
+// 入参: self 回调地址, a 第一参数, b 第二参数
 // 返回: uintptr HRESULT结果
-func scalarCallbackInvoke(c *comCallback, a, b uintptr) (result uintptr) {
+func scalarCallbackInvoke(self, a, b uintptr) (result uintptr) {
 	defer func() {
 		if recover() != nil {
 			result = 0x80004005
 		}
 	}()
+	value, ok := callbackRoots.Load(self)
+	if !ok {
+		return 0x80004005
+	}
+	c := value.(*comCallback)
+	if c.ScalarFn == nil {
+		return 0
+	}
 	return c.ScalarFn(a, b)
 }
 
-// newCallback 创建初始引用计数为1的一次性COM回调
+// newCallback 创建初始引用计数为1并固定的COM对象参数回调
 // 入参: iid 接口标识, fn 回调函数
 // 返回: *comCallback 回调对象, uintptr 回调地址
 func newCallback(iid string, fn func(uintptr, *comObject) uintptr) (*comCallback, uintptr) {
@@ -321,12 +389,13 @@ func newCallback(iid string, fn func(uintptr, *comObject) uintptr) (*comCallback
 	ole32.NewProc("CLSIDFromString").Call(uintptr(unsafe.Pointer(wide(iid))), uintptr(unsafe.Pointer(&g)))
 	c := &comCallback{Table: &callbackTable, IID: g, Fn: fn}
 	c.Refs.Store(1)
+	c.pin.Pin(c)
 	p := uintptr(unsafe.Pointer(c))
 	callbackRoots.Store(p, c)
 	return c, p
 }
 
-// newScalarCallback 创建初始引用计数为1的一次性COM标量参数回调
+// newScalarCallback 创建初始引用计数为1并固定的COM标量参数回调
 // 入参: iid 接口标识, fn 回调函数
 // 返回: *comCallback 回调对象, uintptr 回调地址
 func newScalarCallback(iid string, fn func(uintptr, uintptr) uintptr) (*comCallback, uintptr) {
@@ -334,6 +403,7 @@ func newScalarCallback(iid string, fn func(uintptr, uintptr) uintptr) (*comCallb
 	ole32.NewProc("CLSIDFromString").Call(uintptr(unsafe.Pointer(wide(iid))), uintptr(unsafe.Pointer(&g)))
 	c := &comCallback{Table: &scalarCallbackTable, IID: g, ScalarFn: fn}
 	c.Refs.Store(1)
+	c.pin.Pin(c)
 	p := uintptr(unsafe.Pointer(c))
 	callbackRoots.Store(p, c)
 	return c, p
@@ -343,12 +413,12 @@ func newScalarCallback(iid string, fn func(uintptr, uintptr) uintptr) (*comCallb
 // 入参: parent 运行上下文, o 宿主选项
 // 返回: error 启动或运行错误
 func run(parent context.Context, o Options) error {
-	n := &nativeWindow{options: o, done: make(chan struct{})}
+	n := &nativeWindow{options: o, bridgeToken: rand.Text(), done: make(chan struct{})}
 	if !active.CompareAndSwap(nil, n) {
-		return errors.New("another Run is active")
+		return ErrAlreadyRunning
 	}
 	defer func() {
-		if n.hwnd != 0 && o.OnClose != nil {
+		if n.onCloseReady && o.OnClose != nil {
 			o.OnClose()
 		}
 	}()
@@ -371,9 +441,13 @@ func run(parent context.Context, o Options) error {
 	}
 	n.ctx, n.cancel = context.WithCancel(parent)
 	defer n.temporary.close()
-	defer n.cancel()
+	defer func() {
+		n.cancel()
+		n.titleBarWG.Wait()
+	}()
 	if o.OnTitleBarChanged != nil {
 		n.titleBarEvents = make(chan TitleBarInfo, 1)
+		n.titleBarWG.Add(1)
 		go n.deliverTitleBarChanges()
 	}
 	hr, _, _ := ole32.NewProc("CoInitializeEx").Call(0, 2)
@@ -393,7 +467,7 @@ func run(parent context.Context, o Options) error {
 	}
 	create, err := dll.FindProc("CreateWebViewEnvironmentWithOptionsInternal")
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %w", ErrRuntimeUnavailable, err)
 	}
 	if o.UserDataDir == "" {
 		if o.AppID == "" {
@@ -465,6 +539,12 @@ func run(parent context.Context, o Options) error {
 		for args := range n.resources {
 			n.finishResource(args)
 		}
+		if n.webview != nil {
+			for _, item := range n.eventTokens {
+				com(n.webview, item.removeIndex, uintptr(item.token))
+			}
+		}
+		n.eventTokens = nil
 		if n.controller != nil {
 			com(n.controller, 24)
 		}
@@ -474,6 +554,11 @@ func run(parent context.Context, o Options) error {
 		n.webview = nil
 		n.controller = nil
 		n.environment = nil
+		if o.Instance != nil {
+			if entry, ok := o.Instance.listener.(*windowInstance); ok {
+				entry.detachWindow(n)
+			}
+		}
 		if o.AppID != "" {
 			_ = n.setAppID("")
 		}
@@ -484,7 +569,7 @@ func run(parent context.Context, o Options) error {
 			kernel32.NewProc("CloseHandle").Call(browser)
 		}
 		for _, c := range n.callbacks {
-			callbackRelease(c)
+			releaseCallback(c)
 		}
 		n.callbacks = nil
 	}()
@@ -510,8 +595,13 @@ func run(parent context.Context, o Options) error {
 	if err := n.updateIcons(); err != nil {
 		return err
 	}
-	shell32.NewProc("DragAcceptFiles").Call(n.hwnd, 1)
+	if o.OnDrop != nil {
+		shell32.NewProc("DragAcceptFiles").Call(n.hwnd, 1)
+	}
 	envObj, envCB := newCallback("{4E8A3389-C9D8-4BD2-B6B5-124FEE6CC14D}", func(hr uintptr, env *comObject) uintptr {
+		if n.closed {
+			return 0
+		}
 		if n.ctx.Err() != nil {
 			n.initializing = false
 			n.fail(n.ctx.Err())
@@ -519,7 +609,12 @@ func run(parent context.Context, o Options) error {
 		}
 		if err := hresult(hr); err != nil {
 			n.initializing = false
-			n.fail(err)
+			n.fail(fmt.Errorf("%w: %w", ErrRuntimeUnavailable, err))
+			return 0
+		}
+		if env == nil {
+			n.initializing = false
+			n.fail(ErrRuntimeUnavailable)
 			return 0
 		}
 		n.environment = env
@@ -529,17 +624,25 @@ func run(parent context.Context, o Options) error {
 			err = checkRuntimeVersion(version)
 		}
 		if err != nil {
+			n.initializing = false
 			n.fail(err)
 			return 0
 		}
 		ctrlObj, cb := newCallback("{6C4819F3-C9B7-4260-8127-C9F5BDE7F68C}", func(hr uintptr, controller *comObject) uintptr {
 			n.initializing = false
+			if n.closed {
+				return 0
+			}
 			if n.ctx.Err() != nil {
 				n.fail(n.ctx.Err())
 				return 0
 			}
 			if err := hresult(hr); err != nil {
 				n.fail(err)
+				return 0
+			}
+			if controller == nil {
+				n.fail(ErrRuntimeUnavailable)
 				return 0
 			}
 			n.controller = controller
@@ -558,17 +661,19 @@ func run(parent context.Context, o Options) error {
 			parent = n.contentWindow
 		}
 		err = hresult(com(env, 3, parent, cb))
-		callbackRelease(ctrlObj)
+		releaseCallback(ctrlObj)
 		if err != nil {
+			n.initializing = false
 			n.fail(err)
 		}
 		return 0
 	})
 	n.initializing = true
 	hr, _, _ = create.Call(1, runtimeType, uintptr(unsafe.Pointer(wide(o.UserDataDir))), 0, envCB)
-	callbackRelease(envObj)
+	releaseCallback(envObj)
 	if err := hresult(hr); err != nil {
-		return fmt.Errorf("create WebView2 (install Microsoft WebView2 Runtime): %w", err)
+		n.initializing = false
+		return fmt.Errorf("%w: create WebView2 (install Microsoft WebView2 Runtime): %w", ErrRuntimeUnavailable, err)
 	}
 	go func() {
 		select {
@@ -670,22 +775,36 @@ func windowProc(hwnd, msg, wparam, lparam uintptr) uintptr {
 			}
 		case 6:
 			if wparam&0xffff != 0 && n.options.Instance != nil {
-				recordInstanceActivation(hwnd)
+				if entry, ok := n.options.Instance.listener.(*windowInstance); ok {
+					entry.recordActivation(hwnd)
+				}
 			}
 			n.scheduleTitleBarChange()
 		case 0x10:
 			n.requestClose()
 			return 0
 		case 0x2e0:
-			n.dpi = uint32(wparam & 0xffff)
-			r := *(**rect)(unsafe.Pointer(&lparam))
-			user32.NewProc("SetWindowPos").Call(hwnd, 0, uintptr(r.Left), uintptr(r.Top), uintptr(r.Right-r.Left), uintptr(r.Bottom-r.Top), 0x14)
+			dpi := uint32(wparam & 0xffff)
+			if dpi == 0 {
+				dpi = uint32(wparam >> 16)
+			}
+			if dpi != 0 {
+				n.dpi = dpi
+			}
+			if lparam != 0 {
+				r := *(**rect)(unsafe.Pointer(&lparam))
+				user32.NewProc("SetWindowPos").Call(hwnd, 0, uintptr(r.Left), uintptr(r.Top), uintptr(r.Right-r.Left), uintptr(r.Bottom-r.Top), 0x14)
+			}
 			if err := n.updateIcons(); err != nil {
 				n.reportError(err)
 			}
+			n.updateTrayIcons()
 			n.resize()
 			return 0
 		case 0x24:
+			if lparam == 0 {
+				return 0
+			}
 			info := *(**[5]point)(unsafe.Pointer(&lparam))
 			o := n.options
 			minw, minh, maxw, maxh := o.MinWidth, o.MinHeight, o.MaxWidth, o.MaxHeight
@@ -722,15 +841,24 @@ func windowProc(hwnd, msg, wparam, lparam uintptr) uintptr {
 			return 0
 		case 0x233:
 			count, _, _ := shell32.NewProc("DragQueryFileW").Call(wparam, 0xffffffff, 0, 0)
+			if count == 0 || n.options.OnDrop == nil {
+				shell32.NewProc("DragFinish").Call(wparam)
+				return 0
+			}
 			paths := make([]string, 0, count)
 			for i := uintptr(0); i < count; i++ {
 				size, _, _ := shell32.NewProc("DragQueryFileW").Call(wparam, i, 0, 0)
+				if size == 0 {
+					continue
+				}
 				b := make([]uint16, size+1)
 				shell32.NewProc("DragQueryFileW").Call(wparam, i, uintptr(unsafe.Pointer(&b[0])), size+1)
-				paths = append(paths, syscall.UTF16ToString(b))
+				if path := syscall.UTF16ToString(b); path != "" {
+					paths = append(paths, path)
+				}
 			}
 			shell32.NewProc("DragFinish").Call(wparam)
-			if n.options.OnDrop != nil {
+			if len(paths) > 0 {
 				go func() {
 					defer func() {
 						if v := recover(); v != nil {
@@ -758,7 +886,7 @@ func openURL(raw string) error {
 	return nil
 }
 
-// callback 注册随窗口生命周期释放的COM回调
+// callback 注册随窗口生命周期释放的COM对象参数回调
 // 入参: iid 接口标识, fn 回调函数
 // 返回: uintptr 回调地址
 func (n *nativeWindow) callback(iid string, fn func(uintptr, *comObject) uintptr) uintptr {
@@ -826,7 +954,9 @@ func (n *nativeWindow) setAppID(appID string) error {
 		value.Type = 31
 		value.Text = wide(appID)
 	}
-	return hresult(com(store, 6, uintptr(unsafe.Pointer(&key)), uintptr(unsafe.Pointer(&value))))
+	hr = com(store, 6, uintptr(unsafe.Pointer(&key)), uintptr(unsafe.Pointer(&value)))
+	runtime.KeepAlive(value.Text)
+	return hresult(hr)
 }
 
 // drainTop 仅在最外层消息循环运行模态操作，避免重入WebView2回调
@@ -875,14 +1005,28 @@ func (n *nativeWindow) style() uintptr {
 	return 0x00CF0000
 }
 
-// fail 保存初始化错误并退出消息循环
-// 入参: err 运行错误
-func (n *nativeWindow) fail(err error) {
-	n.err = err
+// postQuit 退出主消息循环，存在嵌套模态循环时延迟至其返回后再退出
+func (n *nativeWindow) postQuit() {
 	if n.activeTrayMenu != nil {
 		n.activeTrayMenu.endMenu()
 	}
+	if n.activeDialog != nil {
+		com(n.activeDialog, 23, 0x800704c7)
+	}
+	if n.modalActive > 0 {
+		n.quitAfterModal = true
+		return
+	}
 	user32.NewProc("PostQuitMessage").Call(0)
+}
+
+// fail 在STA主线程保存首个致命错误并退出消息循环
+// 入参: err 运行错误
+func (n *nativeWindow) fail(err error) {
+	if n.err == nil {
+		n.err = err
+	}
+	n.postQuit()
 }
 
 // reportError 异步向宿主报告非致命运行错误
@@ -1020,8 +1164,8 @@ func (n *nativeWindow) center(monitor uintptr) error {
 	}
 	var frame rect
 	hr, _, _ := dwmapi.NewProc("DwmGetWindowAttribute").Call(n.hwnd, 9, uintptr(unsafe.Pointer(&frame)), unsafe.Sizeof(frame))
-	if err := hresult(hr); err != nil {
-		return err
+	if hresult(hr) != nil || frame.Right <= frame.Left || frame.Bottom <= frame.Top {
+		frame = bounds
 	}
 	border := rect{Left: frame.Left - bounds.Left, Top: frame.Top - bounds.Top, Right: bounds.Right - frame.Right, Bottom: bounds.Bottom - frame.Bottom}
 	if !n.options.FixedSize {
@@ -1039,25 +1183,20 @@ func (n *nativeWindow) center(monitor uintptr) error {
 	return nil
 }
 
-// setClientSize 在宿主线程应用逻辑客户区尺寸及约束
+// setClientSize 在宿主线程应用逻辑客户区尺寸及约束，不重复深拷贝图标
 // 入参: w 客户区宽度, h 客户区高度
 // 返回: error 调整错误
 func (n *nativeWindow) setClientSize(w, h int) error {
-	o := n.options
-	o.Width = w
-	o.Height = h
-	if w <= 0 || h <= 0 {
-		return errors.New("invalid size")
-	}
-	if err := validate(&o); err != nil {
+	width, height, err := clampWindowSize(n.options, w, h)
+	if err != nil {
 		return err
 	}
-	r := rect{Right: n.pixels(o.Width), Bottom: n.pixels(o.Height)}
+	r := rect{Right: n.pixels(width), Bottom: n.pixels(height)}
 	if err := n.adjustRect(&r); err != nil {
 		return err
 	}
 	previousWidth, previousHeight := n.options.Width, n.options.Height
-	n.options.Width, n.options.Height = o.Width, o.Height
+	n.options.Width, n.options.Height = width, height
 	ok, _, e := user32.NewProc("SetWindowPos").Call(n.hwnd, 0, 0, 0, uintptr(r.Right-r.Left), uintptr(r.Bottom-r.Top), 0x16)
 	if ok == 0 {
 		n.options.Width, n.options.Height = previousWidth, previousHeight
@@ -1085,7 +1224,7 @@ func (n *nativeWindow) resize() {
 	n.scheduleTitleBarChange()
 }
 
-// setup 注册资源与桥接并等待注入完成后导航
+// setup 注册资源与桥接并保存事件令牌，等待注入完成后导航
 // 返回: error 初始化错误
 func (n *nativeWindow) setup() error {
 	if err := n.initializeTitleBarZoom(); err != nil {
@@ -1098,8 +1237,18 @@ func (n *nativeWindow) setup() error {
 	if err := hresult(com(n.controller, 4, 1)); err != nil {
 		return err
 	}
-	var token int64
+	register := func(addIndex, removeIndex int, handler uintptr) error {
+		var token int64
+		if err := hresult(com(n.webview, addIndex, handler, uintptr(unsafe.Pointer(&token)))); err != nil {
+			return err
+		}
+		n.eventTokens = append(n.eventTokens, eventToken{removeIndex: removeIndex, token: token})
+		return nil
+	}
 	nav := n.callback("{9ADBE429-F36D-432B-9DDC-F8881FBD76E3}", func(_ uintptr, args *comObject) uintptr {
+		if n.closed || n.webview == nil || args == nil {
+			return 0
+		}
 		uri, err := comString(args, 3)
 		if err != nil || !localURL(uri) {
 			com(args, 8, 1)
@@ -1117,10 +1266,13 @@ func (n *nativeWindow) setup() error {
 		}
 		return 0
 	})
-	if err := hresult(com(n.webview, 7, nav, uintptr(unsafe.Pointer(&token)))); err != nil {
+	if err := register(7, 8, nav); err != nil {
 		return err
 	}
 	popup := n.callback("{D4C185FE-C81C-4989-97AF-2D3FA7AB5651}", func(_ uintptr, args *comObject) uintptr {
+		if n.closed || n.webview == nil || args == nil {
+			return 0
+		}
 		com(args, 6, 1)
 		uri, err := comString(args, 3)
 		if err == nil && externalURL(uri) && !localURL(uri) {
@@ -1128,10 +1280,13 @@ func (n *nativeWindow) setup() error {
 		}
 		return 0
 	})
-	if err := hresult(com(n.webview, 44, popup, uintptr(unsafe.Pointer(&token)))); err != nil {
+	if err := register(44, 45, popup); err != nil {
 		return err
 	}
 	msg := n.callback("{57213F19-00E6-49FA-8E07-898EA01ECBD2}", func(_ uintptr, args *comObject) uintptr {
+		if n.closed || n.webview == nil || args == nil {
+			return 0
+		}
 		source, err := comString(args, 3)
 		if err != nil || !localURL(source) {
 			return 0
@@ -1141,10 +1296,14 @@ func (n *nativeWindow) setup() error {
 			return 0
 		}
 		generation := n.generation
-		var message envelope
-		if json.Unmarshal([]byte(raw), &message) != nil {
+		var received struct {
+			envelope
+			Token string `json:"token"`
+		}
+		if json.Unmarshal([]byte(raw), &received) != nil || received.Token != n.bridgeToken {
 			return 0
 		}
+		message := received.envelope
 		if message.Type == "drop" {
 			n.fileDrop(args)
 			return 0
@@ -1172,14 +1331,16 @@ func (n *nativeWindow) setup() error {
 		}
 		if message.Binary {
 			b := marshalReply(envelope{ID: message.ID, Type: "upload"})
-			com(n.webview, 32, uintptr(unsafe.Pointer(wide(string(b)))))
+			if hresult(com(n.webview, 32, uintptr(unsafe.Pointer(wide(string(b)))))) != nil {
+				calls.remove(message.ID)
+			}
 			return 0
 		}
 		go func() {
 			reply := calls.run(call, n.options.Bindings, nil, 0)
 			b := marshalReply(reply)
 			err := n.enqueue(func() {
-				if generation == n.generation {
+				if !n.closed && n.webview != nil && generation == n.generation {
 					if hresult(com(n.webview, 32, uintptr(unsafe.Pointer(wide(string(b)))))) != nil {
 						calls.remove(message.ID)
 					}
@@ -1193,20 +1354,26 @@ func (n *nativeWindow) setup() error {
 		}()
 		return 0
 	})
-	if err := hresult(com(n.webview, 34, msg, uintptr(unsafe.Pointer(&token)))); err != nil {
+	if err := register(34, 35, msg); err != nil {
 		return err
 	}
 	resource := n.callback("{AB00B74C-15F1-4646-80E8-E76341D25D71}", func(_ uintptr, args *comObject) uintptr {
+		if n.closed || n.webview == nil || args == nil {
+			return 0
+		}
 		n.resource(args)
 		return 0
 	})
-	if err := hresult(com(n.webview, 55, resource, uintptr(unsafe.Pointer(&token)))); err != nil {
+	if err := register(55, 56, resource); err != nil {
 		return err
 	}
 	if err := hresult(com(n.webview, 57, uintptr(unsafe.Pointer(wide("*"))), 0)); err != nil {
 		return err
 	}
 	loaded := n.callback("{D33A35BF-1C49-4F98-93AB-006E0533FE1C}", func(_ uintptr, args *comObject) uintptr {
+		if n.closed || n.webview == nil || args == nil {
+			return 0
+		}
 		if n.ctx.Err() != nil {
 			n.fail(n.ctx.Err())
 			return 0
@@ -1233,42 +1400,50 @@ func (n *nativeWindow) setup() error {
 		}
 		return 0
 	})
-	if err := hresult(com(n.webview, 15, loaded, uintptr(unsafe.Pointer(&token)))); err != nil {
+	if err := register(15, 16, loaded); err != nil {
 		return err
 	}
-	closed := n.callback("{5C19E9E0-092F-486B-AFFA-CA8231913039}", func(_ uintptr, args *comObject) uintptr {
-		if n.activeTrayMenu != nil {
-			n.activeTrayMenu.endMenu()
+	closed := n.callback("{5C19E9E0-092F-486B-AFFA-CA8231913039}", func(_ uintptr, _ *comObject) uintptr {
+		if n.closed {
+			return 0
 		}
-		user32.NewProc("PostQuitMessage").Call(0)
+		n.postQuit()
 		return 0
 	})
-	if err := hresult(com(n.webview, 59, closed, uintptr(unsafe.Pointer(&token)))); err != nil {
+	if err := register(59, 60, closed); err != nil {
 		return err
 	}
-	completedObj, completed := newCallback("{B99369F3-9B11-47B5-BC6F-8E7895FCEA17}", func(hr uintptr, _ *comObject) uintptr {
+	completedObj, completed := newScalarCallback("{B99369F3-9B11-47B5-BC6F-8E7895FCEA17}", func(hr, _ uintptr) uintptr {
+		if n.closed {
+			return 0
+		}
 		if err := hresult(hr); err != nil {
 			n.fail(err)
 			return 0
 		}
+		if n.ctx.Err() != nil {
+			n.fail(n.ctx.Err())
+			return 0
+		}
+		n.onCloseReady = true
 		go func() {
 			if n.options.OnReady != nil {
-				panicked := false
+				var panicErr error
 				func() {
 					defer func() {
 						if v := recover(); v != nil {
-							panicked = true
-							n.fail(fmt.Errorf("OnReady panic: %v", v))
+							panicErr = fmt.Errorf("OnReady panic: %v", v)
 						}
 					}()
 					n.options.OnReady(&Window{native: n})
 				}()
-				if panicked {
+				if panicErr != nil {
+					_ = n.enqueue(func() { n.fail(panicErr) })
 					return
 				}
 			}
 			_ = n.enqueue(func() {
-				if n.closeRequested {
+				if n.closed || n.webview == nil || n.closeRequested {
 					return
 				}
 				n.titleBarReady = true
@@ -1280,8 +1455,9 @@ func (n *nativeWindow) setup() error {
 		}()
 		return 0
 	})
-	defer callbackRelease(completedObj)
-	return hresult(com(n.webview, 27, uintptr(unsafe.Pointer(wide(bridgeScript))), completed))
+	defer releaseCallback(completedObj)
+	script := buildWindowsBridgeScript(n.bridgeToken)
+	return hresult(com(n.webview, 27, uintptr(unsafe.Pointer(wide(script))), completed))
 }
 
 // external 异步打开外部地址并通知宿主错误
@@ -1307,14 +1483,13 @@ func (n *nativeWindow) requestClose() {
 		n.activeTrayMenu.endMenu()
 	}
 	if n.initializing {
+		n.initializing = false
 		n.cancel()
+		n.postQuit()
 		return
 	}
 	if n.ctx.Err() != nil || n.webview == nil {
-		if n.activeDialog != nil {
-			com(n.activeDialog, 23, 0x800704c7)
-		}
-		user32.NewProc("PostQuitMessage").Call(0)
+		n.postQuit()
 		return
 	}
 	if n.closing {
@@ -1340,6 +1515,9 @@ func (n *nativeWindow) requestClose() {
 		}
 		_ = n.enqueue(func() {
 			n.closing = false
+			if n.closed {
+				return
+			}
 			pending := n.closePending
 			n.closePending = false
 			if !allowed {
@@ -1348,18 +1526,22 @@ func (n *nativeWindow) requestClose() {
 				}
 				return
 			}
-			cb, callback := newCallback("{5C4889F0-5EF6-4C5A-952C-D8F1B92D0574}", func(hr uintptr, _ *comObject) uintptr {
+			if n.webview == nil {
+				n.postQuit()
+				return
+			}
+			cb, callback := newScalarCallback("{5C4889F0-5EF6-4C5A-952C-D8F1B92D0574}", func(hr, _ uintptr) uintptr {
 				n.closeRequested = false
 				if err := hresult(hr); err != nil {
-					n.err = err
+					n.fail(err)
 				}
 				return 0
 			})
-			defer callbackRelease(cb)
+			defer releaseCallback(cb)
 			n.closeRequested = true
 			if err := hresult(com(n.webview, 36, uintptr(unsafe.Pointer(wide("Page.close"))), uintptr(unsafe.Pointer(wide("{}"))), callback)); err != nil {
 				n.closeRequested = false
-				n.err = err
+				n.fail(err)
 			}
 		})
 	}()

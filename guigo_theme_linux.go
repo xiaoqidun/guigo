@@ -262,7 +262,11 @@ func linuxGTKSettingsDark() bool {
 				hasPreferDark = true
 				preferDark = val == "1" || val == "true"
 			} else if key == "gtk-theme-name" {
-				themeDark = strings.Contains(val, "dark")
+				if strings.Contains(val, ":light") {
+					themeDark = false
+				} else {
+					themeDark = strings.Contains(val, "dark")
+				}
 			}
 		}
 		if hasPreferDark {

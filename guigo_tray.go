@@ -15,6 +15,7 @@
 package guigo
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -59,23 +60,23 @@ type TrayOptions struct {
 	Items []TrayItem
 	// MenuOnActivate 在主激活时打开菜单而不调用OnActivate，桌面也可能将所有点击统一为菜单操作
 	MenuOnActivate bool
-	// OnSelect 在后台协程接收启用菜单项的ID，多次回调可能并发执行
+	// OnSelect 在后台Goroutine接收启用菜单项的ID，多次回调可能并发执行
 	OnSelect func(string)
-	// OnActivate 在后台协程接收系统激活操作，多次回调可能并发执行
+	// OnActivate 在后台Goroutine接收系统激活操作，多次回调可能并发执行
 	OnActivate func()
 	// OnSecondaryActivate 接收次要激活操作，如鼠标中键，具体手势由桌面决定
-	// 回调在后台协程执行，多次回调可能并发执行
+	// 回调在后台Goroutine执行，多次回调可能并发执行
 	OnSecondaryActivate func()
 }
 
-// Tray 持有窗口所属的系统托盘，可由后台协程操作，随窗口销毁而释放
+// Tray 持有窗口所属的系统托盘，可由后台Goroutine操作，随窗口销毁而释放
 // 托盘宿主丢失且无法恢复时窗口会重新显示，调用方可用Available查询当前状态
 type Tray struct {
 	available  atomic.Bool
 	closed     atomic.Bool
 	once       sync.Once
 	close      func() error
-	setOptions func(TrayOptions) error
+	setOptions func(context.Context, TrayOptions) error
 	err        error
 }
 
@@ -141,13 +142,19 @@ func prepareTrayItems(items []TrayItem, seen map[string]bool) ([]TrayItem, error
 // NewTray 为当前窗口创建独立托盘，可创建多个，随窗口销毁而释放
 // Windows使用系统通知区域，Linux需要支持StatusNotifierItem和DBusMenu的桌面宿主
 // 无可用宿主时返回ErrTrayUnavailable，未适配的平台返回ErrUnsupportedPlatform
-// 入参: options 托盘配置，图标及菜单数据在返回前复制
+// 入参: ctx 调用上下文, options 托盘配置，图标及菜单数据在返回前复制
 // 返回: *Tray 托盘句柄, error 创建错误
-func (w *Window) NewTray(options TrayOptions) (*Tray, error) {
+func (w *Window) NewTray(ctx context.Context, options TrayOptions) (*Tray, error) {
+	if ctx == nil {
+		return nil, errors.New("nil context")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if w == nil || w.native == nil {
 		return nil, ErrClosed
 	}
-	return w.native.newTray(options)
+	return w.native.newTray(ctx, options)
 }
 
 // Available 查询托盘是否已注册且尚未关闭，不表示当前图标一定展开显示
@@ -158,13 +165,19 @@ func (t *Tray) Available() bool {
 
 // SetOptions 完整替换托盘配置，包括回调，零值含义与NewTray相同
 // 更新时可关闭已展开的菜单，已开始执行的回调不受影响
-// 入参: options 新托盘配置，图标及菜单数据在返回前复制
+// 入参: ctx 调用上下文, options 新托盘配置，图标及菜单数据在返回前复制
 // 返回: error 配置或更新错误，已关闭时返回ErrClosed
-func (t *Tray) SetOptions(options TrayOptions) error {
+func (t *Tray) SetOptions(ctx context.Context, options TrayOptions) error {
+	if ctx == nil {
+		return errors.New("nil context")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if t == nil || t.setOptions == nil || t.closed.Load() {
 		return ErrClosed
 	}
-	return t.setOptions(options)
+	return t.setOptions(ctx, options)
 }
 
 // Close 移除托盘，不关闭窗口，重复调用或窗口已销毁时返回成功

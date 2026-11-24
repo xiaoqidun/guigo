@@ -176,7 +176,7 @@ func (n *nativeWindow) setTitleBarColors(colors TitleBarColors) error {
 		n.options.TitleBarColors = colors
 		if err := n.applyTitleBarColors(n.currentTitleBarInfo().Active); err != nil {
 			n.options.TitleBarColors = previous
-			n.applyTitleBarColors(n.currentTitleBarInfo().Active)
+			_ = n.applyTitleBarColors(n.currentTitleBarInfo().Active)
 			return err
 		}
 		n.publishTitleBarChange(false)
@@ -330,7 +330,7 @@ func (n *nativeWindow) initializeTitleBar() error {
 	return n.layoutTitleBar()
 }
 
-// applyTitleBarColors 同步系统标题栏配色，不替换窗口按钮或命中行为
+// applyTitleBarColors 同步系统标题栏配色，零值跟随系统深浅色外观，不替换窗口按钮或命中行为
 // 入参: focused 窗口是否激活
 // 返回: error 系统配色错误，不支持配色属性的系统保留原生绘制
 func (n *nativeWindow) applyTitleBarColors(focused bool) error {
@@ -339,7 +339,11 @@ func (n *nativeWindow) applyTitleBarColors(focused bool) error {
 		return nil
 	}
 	background, foreground, dark := uint32(0xffffffff), uint32(0xffffffff), uint32(0)
-	if colors != (TitleBarColors{}) {
+	if colors == (TitleBarColors{}) {
+		if systemDark() {
+			dark = 1
+		}
+	} else {
 		bg, fg := colors.Background, colors.Foreground
 		if !focused {
 			bg, fg = colors.InactiveBackground, colors.InactiveForeground
@@ -488,13 +492,17 @@ func (n *nativeWindow) titleBarProc(hwnd, msg, wparam, lparam uintptr) (uintptr,
 	if n.options.TitleBar != TitleBarContent {
 		return 0, false
 	}
-	if n.options.TitleBarColors != (TitleBarColors{}) && n.hwnd != 0 {
-		if msg == 0x86 || msg == 0x31a || msg == 0x31e {
+	if n.hwnd != 0 {
+		if n.options.TitleBarColors != (TitleBarColors{}) && (msg == 0x86 || msg == 0x31a || msg == 0x31e) {
 			focused := n.currentTitleBarInfo().Active
 			if msg == 0x86 {
 				focused = wparam != 0
 			}
 			if err := n.applyTitleBarColors(focused); err != nil {
+				n.fail(err)
+			}
+		} else if n.options.TitleBarColors == (TitleBarColors{}) && (msg == 0x1a || msg == 0x31a || msg == 0x31e) {
+			if err := n.applyTitleBarColors(n.currentTitleBarInfo().Active); err != nil {
 				n.fail(err)
 			}
 		}
@@ -503,7 +511,7 @@ func (n *nativeWindow) titleBarProc(hwnd, msg, wparam, lparam uintptr) (uintptr,
 		n.showTitleBarMenu(lparam)
 		return 0, true
 	}
-	if msg == 0x83 {
+	if msg == 0x83 && lparam != 0 {
 		r := *(**rect)(unsafe.Pointer(&lparam))
 		top := r.Top
 		user32.NewProc("DefWindowProcW").Call(hwnd, msg, wparam, lparam)
@@ -592,9 +600,12 @@ func (n *nativeWindow) scheduleTitleBarChange() {
 	}
 }
 
-// publishTitleBarChange 仅发布变化后的最新布局，避免后台回调阻塞宿主线程
+// publishTitleBarChange 仅在OnReady完成后发布变化后的最新布局，避免后台回调阻塞宿主线程
 // 入参: initial 是否强制发送初始状态
 func (n *nativeWindow) publishTitleBarChange(initial bool) {
+	if !initial && !n.titleBarReady {
+		return
+	}
 	info := n.currentTitleBarInfo()
 	if !initial && info == n.titleBarState && n.dpi == n.titleBarDPI {
 		return
@@ -617,6 +628,7 @@ func (n *nativeWindow) publishTitleBarChange(initial bool) {
 
 // deliverTitleBarChanges 串行执行业务回调并隔离异常
 func (n *nativeWindow) deliverTitleBarChanges() {
+	defer n.titleBarWG.Done()
 	for {
 		select {
 		case <-n.ctx.Done():

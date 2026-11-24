@@ -41,7 +41,19 @@ var (
 	streamRoots sync.Map
 	// streamTable 保存原生IStream虚函数表地址
 	streamTable [14]uintptr
+	// mtaOnce 保证常驻COM MTA工作线程只初始化一次
+	mtaOnce sync.Once
+	// mtaQueue 接收需要在进程常驻MTA线程执行的FTM创建请求
+	mtaQueue chan mtaTask
+	// mtaErr 记录常驻MTA线程的初始化错误
+	mtaErr error
 )
+
+// mtaTask 保存待常驻MTA线程执行的操作与结果Channel
+type mtaTask struct {
+	fn   func() error
+	done chan error
+}
 
 // temporaryDirectory 管理当前窗口的临时文件目录
 type temporaryDirectory struct {
@@ -59,7 +71,6 @@ type temporaryFile struct {
 // responseSpool 为生产者和原生流提供有界内存的可寻址共享存储
 type responseSpool struct {
 	mu       sync.Mutex
-	cond     *sync.Cond
 	file     io.ReadSeekCloser
 	size     int64
 	complete bool
@@ -76,6 +87,7 @@ type nativeStream struct {
 	offset  int64
 	spool   *responseSpool
 	marshal *comObject
+	pin     runtime.Pinner
 }
 
 // streamStat 对应STATSTG
@@ -113,7 +125,37 @@ func init() {
 	}
 }
 
-// newResponseSpool 创建可增量读取的临时存储
+// runOnMTA 在进程常驻MTA线程执行操作，避免反复启停MTA破坏进程COM公寓
+// 入参: fn 待执行操作
+// 返回: error 初始化或执行错误
+func runOnMTA(fn func() error) error {
+	mtaOnce.Do(func() {
+		ready := make(chan error, 1)
+		queue := make(chan mtaTask)
+		go func() {
+			runtime.LockOSThread()
+			hr, _, _ := ole32.NewProc("CoInitializeEx").Call(0, 0)
+			if err := hresult(hr); err != nil && uint32(hr) != 0x80010106 {
+				ready <- err
+				return
+			}
+			mtaQueue = queue
+			ready <- nil
+			for task := range queue {
+				task.done <- task.fn()
+			}
+		}()
+		mtaErr = <-ready
+	})
+	if mtaErr != nil {
+		return mtaErr
+	}
+	done := make(chan error, 1)
+	mtaQueue <- mtaTask{fn: fn, done: done}
+	return <-done
+}
+
+// newResponseSpool 创建可寻址响应临时存储
 // 入参: ctx 运行上下文, directory 临时目录
 // 返回: *responseSpool 响应存储, error 创建错误
 func newResponseSpool(ctx context.Context, directory *temporaryDirectory) (*responseSpool, error) {
@@ -122,19 +164,38 @@ func newResponseSpool(ctx context.Context, directory *temporaryDirectory) (*resp
 		return nil, err
 	}
 	s := &responseSpool{file: file, refs: 1}
-	s.cond = sync.NewCond(&s.mu)
 	s.stop = context.AfterFunc(ctx, func() { s.finish(ctx.Err()) })
 	return s, nil
 }
 
-// streamQuery 提供流接口和敏捷对象标记
-// 入参: stream 原生流, iid 接口标识, out 接口输出
+// lookupStream 从活动根表安全检索原生流对象
+// 入参: self 原生流地址
+// 返回: *nativeStream 流对象, bool 是否存在
+func lookupStream(self uintptr) (*nativeStream, bool) {
+	value, ok := streamRoots.Load(self)
+	if !ok {
+		return nil, false
+	}
+	return value.(*nativeStream), true
+}
+
+// streamQuery 提供流接口和敏捷对象标记并隔离异常
+// 入参: self 原生流地址, iid 接口标识, out 接口输出
 // 返回: uintptr HRESULT结果
-func streamQuery(stream *nativeStream, iid *syscall.GUID, out **comObject) uintptr {
-	if out == nil {
+func streamQuery(self uintptr, iid *syscall.GUID, out *uintptr) (result uintptr) {
+	defer func() {
+		if recover() != nil {
+			result = 0x80004005
+		}
+	}()
+	if out == nil || iid == nil {
 		return 0x80004003
 	}
-	*out = nil
+	*out = 0
+	stream, ok := lookupStream(self)
+	if !ok {
+		return 0x80004005
+	}
 	g := *iid
 	if g == guid("{00000003-0000-0000-C000-000000000046}") && stream.marshal != nil {
 		return com(stream.marshal, 0, uintptr(unsafe.Pointer(iid)), uintptr(unsafe.Pointer(out)))
@@ -142,35 +203,60 @@ func streamQuery(stream *nativeStream, iid *syscall.GUID, out **comObject) uintp
 	if g != guid("{00000000-0000-0000-C000-000000000046}") && g != guid("{0000000C-0000-0000-C000-000000000046}") && g != guid("{0C733A30-2A1C-11CE-ADE5-00AA0044773D}") && g != guid("{94EA2B94-E9CC-49E0-C0FF-EE64CA8F5B90}") {
 		return 0x80004002
 	}
-	*out = (*comObject)(unsafe.Pointer(stream))
-	streamAddRef(stream)
+	*out = self
+	stream.refs.Add(1)
 	return 0
 }
 
 // streamAddRef 增加原生流引用
-// 入参: stream 原生流
+// 入参: self 原生流地址
 // 返回: uintptr 引用计数
-func streamAddRef(stream *nativeStream) uintptr {
+func streamAddRef(self uintptr) (result uintptr) {
+	defer func() {
+		if recover() != nil {
+			result = 0
+		}
+	}()
+	stream, ok := lookupStream(self)
+	if !ok {
+		return 0
+	}
 	return uintptr(stream.refs.Add(1))
 }
 
-// streamRelease 释放原生流引用
-// 入参: stream 原生流
+// streamRelease 释放原生流引用并解除对象固定
+// 入参: self 原生流地址
 // 返回: uintptr 引用计数
-func streamRelease(stream *nativeStream) uintptr {
+func streamRelease(self uintptr) (result uintptr) {
+	defer func() {
+		if recover() != nil {
+			result = 0
+		}
+	}()
+	stream, ok := lookupStream(self)
+	if !ok {
+		return 0
+	}
 	refs := stream.refs.Add(-1)
-	if refs == 0 {
-		streamRoots.Delete(uintptr(unsafe.Pointer(stream)))
+	if refs <= 0 {
+		streamRoots.Delete(self)
 		release(stream.marshal)
 		stream.spool.drop()
+		stream.pin.Unpin()
+		return 0
 	}
 	return uintptr(refs)
 }
 
-// streamRead 等待增量内容并读取最多指定字节
-// 入参: stream 原生流, buffer 输出缓冲区, count 读取上限, read 已读字节数输出
+// streamRead 读取最多指定字节的完整响应内容
+// 入参: self 原生流地址, buffer 输出缓冲区, count 读取上限, read 已读字节数输出
 // 返回: uintptr HRESULT结果
-func streamRead(stream *nativeStream, buffer *byte, count uint32, read *uint32) uintptr {
+func streamRead(self uintptr, buffer *byte, count uint32, read *uint32) (result uintptr) {
+	defer func() {
+		if recover() != nil {
+			result = 0x80004005
+		}
+	}()
 	if read != nil {
 		*read = 0
 	}
@@ -180,14 +266,15 @@ func streamRead(stream *nativeStream, buffer *byte, count uint32, read *uint32) 
 	if buffer == nil {
 		return 0x80030009
 	}
+	stream, ok := lookupStream(self)
+	if !ok {
+		return 0x80004005
+	}
 	stream.mu.Lock()
 	defer stream.mu.Unlock()
 	s := stream.spool
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for s.size-stream.offset < int64(uint32(count)) && !s.complete {
-		s.cond.Wait()
-	}
 	if stream.offset >= s.size {
 		if s.err != nil {
 			return 0x8003001e
@@ -195,7 +282,7 @@ func streamRead(stream *nativeStream, buffer *byte, count uint32, read *uint32) 
 		return 1
 	}
 	available := s.size - stream.offset
-	length := int64(uint32(count))
+	length := int64(count)
 	if length > available {
 		length = available
 	}
@@ -218,12 +305,21 @@ func streamRead(stream *nativeStream, buffer *byte, count uint32, read *uint32) 
 }
 
 // streamSeek 设置独立流位置
-// 入参: stream 原生流, offset 偏移量, origin 起始位置, position 最终位置输出
+// 入参: self 原生流地址, offset 偏移量, origin 起始位置, position 最终位置输出
 // 返回: uintptr HRESULT结果
-func streamSeek(stream *nativeStream, offset int64, origin uint32, position *uint64) uintptr {
+func streamSeek(self uintptr, offset int64, origin uint32, position *uint64) (result uintptr) {
+	defer func() {
+		if recover() != nil {
+			result = 0x80004005
+		}
+	}()
+	stream, ok := lookupStream(self)
+	if !ok {
+		return 0x80004005
+	}
 	stream.mu.Lock()
 	defer stream.mu.Unlock()
-	next := int64(offset)
+	next := offset
 	switch origin {
 	case 0:
 	case 1:
@@ -231,9 +327,6 @@ func streamSeek(stream *nativeStream, offset int64, origin uint32, position *uin
 	case 2:
 		s := stream.spool
 		s.mu.Lock()
-		for !s.complete {
-			s.cond.Wait()
-		}
 		next += s.size
 		s.mu.Unlock()
 	default:
@@ -250,11 +343,20 @@ func streamSeek(stream *nativeStream, offset int64, origin uint32, position *uin
 }
 
 // streamGetStat 返回当前流类型及已知长度
-// 入参: stream 原生流, out 状态输出, flags 查询标记
+// 入参: self 原生流地址, out 状态输出, flags 查询标记
 // 返回: uintptr HRESULT结果
-func streamGetStat(stream *nativeStream, out *streamStat, flags uint32) uintptr {
+func streamGetStat(self uintptr, out *streamStat, flags uint32) (result uintptr) {
+	defer func() {
+		if recover() != nil {
+			result = 0x80004005
+		}
+	}()
 	if out == nil {
 		return 0x80030009
+	}
+	stream, ok := lookupStream(self)
+	if !ok {
+		return 0x80004005
 	}
 	s := stream.spool
 	s.mu.Lock()
@@ -264,13 +366,22 @@ func streamGetStat(stream *nativeStream, out *streamStat, flags uint32) uintptr 
 }
 
 // streamClone 克隆共享内容但独立位置的流
-// 入参: stream 原生流, out 克隆接口输出
+// 入参: self 原生流地址, out 克隆接口输出
 // 返回: uintptr HRESULT结果
-func streamClone(stream *nativeStream, out **comObject) uintptr {
+func streamClone(self uintptr, out **comObject) (result uintptr) {
+	defer func() {
+		if recover() != nil {
+			result = 0x80004005
+		}
+	}()
 	if out == nil {
 		return 0x80030009
 	}
 	*out = nil
+	stream, ok := lookupStream(self)
+	if !ok {
+		return 0x80004005
+	}
 	stream.mu.Lock()
 	defer stream.mu.Unlock()
 	cloned, err := stream.spool.native(stream.offset)
@@ -282,9 +393,9 @@ func streamClone(stream *nativeStream, out **comObject) uintptr {
 }
 
 // streamWrite 拒绝写入只读流
-// 入参: stream 原生流, buffer 输入缓冲区, count 数据长度, written 写入长度输出
+// 入参: self 原生流地址, buffer 输入缓冲区, count 数据长度, written 写入长度输出
 // 返回: uintptr HRESULT结果
-func streamWrite(stream *nativeStream, buffer *byte, count uint32, written *uint32) uintptr {
+func streamWrite(self uintptr, buffer *byte, count uint32, written *uint32) uintptr {
 	if written != nil {
 		*written = 0
 	}
@@ -292,37 +403,37 @@ func streamWrite(stream *nativeStream, buffer *byte, count uint32, written *uint
 }
 
 // streamSetSize 拒绝调整只读流长度
-// 入参: stream 原生流, size 目标长度
+// 入参: self 原生流地址, size 目标长度
 // 返回: uintptr HRESULT结果
-func streamSetSize(stream *nativeStream, size uint64) uintptr {
+func streamSetSize(self uintptr, size uint64) uintptr {
 	return 0x80030005
 }
 
 // streamCopy 返回不支持流间复制
-// 入参: stream 原生流, target 目标流, count 复制长度, read 读取长度输出, written 写入长度输出
+// 入参: self 原生流地址, target 目标流, count 复制长度, read 读取长度输出, written 写入长度输出
 // 返回: uintptr HRESULT结果
-func streamCopy(stream *nativeStream, target *comObject, count uint64, read, written *uint64) uintptr {
+func streamCopy(self uintptr, target *comObject, count uint64, read, written *uint64) uintptr {
 	return 0x80004001
 }
 
 // streamCommit 完成只读流的空提交
-// 入参: stream 原生流, flags 提交标记
+// 入参: self 原生流地址, flags 提交标记
 // 返回: uintptr HRESULT结果
-func streamCommit(stream *nativeStream, flags uint32) uintptr {
+func streamCommit(self uintptr, flags uint32) uintptr {
 	return 0
 }
 
 // streamRevert 返回不支持回滚
-// 入参: stream 原生流
+// 入参: self 原生流地址
 // 返回: uintptr HRESULT结果
-func streamRevert(stream *nativeStream) uintptr {
+func streamRevert(self uintptr) uintptr {
 	return 0x80030001
 }
 
 // streamRegion 返回不支持区域锁定
-// 入参: stream 原生流, offset 区域偏移, count 区域长度, kind 锁定类型
+// 入参: self 原生流地址, offset 区域偏移, count 区域长度, kind 锁定类型
 // 返回: uintptr HRESULT结果
-func streamRegion(stream *nativeStream, offset, count uint64, kind uint32) uintptr {
+func streamRegion(self uintptr, offset, count uint64, kind uint32) uintptr {
 	return 0x80030001
 }
 
@@ -392,7 +503,7 @@ func (d *temporaryDirectory) create(prefix string) (*temporaryFile, error) {
 	return nil, os.ErrExist
 }
 
-// Write 增量追加内容并唤醒原生读取器
+// Write 增量追加内容至响应存储
 // 入参: b 待写入数据
 // 返回: int 写入字节数, error 写入错误
 func (s *responseSpool) Write(b []byte) (int, error) {
@@ -413,7 +524,6 @@ func (s *responseSpool) Write(b []byte) (int, error) {
 		s.err = err
 		s.complete = true
 	}
-	s.cond.Broadcast()
 	return n, err
 }
 
@@ -426,7 +536,6 @@ func (s *responseSpool) finish(err error) {
 		s.complete = true
 		s.err = err
 	}
-	s.cond.Broadcast()
 }
 
 // drop 释放生产者或流引用并回收临时文件
@@ -442,7 +551,7 @@ func (s *responseSpool) drop() {
 	}
 }
 
-// native 创建独立位置的COM流
+// native 在常驻MTA线程创建支持跨线程封送的COM只读流
 // 入参: offset 初始偏移
 // 返回: *comObject 原生流, error 创建错误
 func (s *responseSpool) native(offset int64) (*comObject, error) {
@@ -451,20 +560,15 @@ func (s *responseSpool) native(offset int64) (*comObject, error) {
 	s.mu.Unlock()
 	stream := &nativeStream{table: &streamTable, spool: s, offset: offset}
 	stream.refs.Store(1)
+	stream.pin.Pin(stream)
 	p := uintptr(unsafe.Pointer(stream))
 	streamRoots.Store(p, stream)
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-	hr, _, _ := ole32.NewProc("CoInitializeEx").Call(0, 0)
-	if hresult(hr) == nil {
-		defer ole32.NewProc("CoUninitialize").Call()
-	} else if uint32(hr) != 0x80010106 {
-		streamRelease(stream)
-		return nil, hresult(hr)
-	}
-	hr, _, _ = ole32.NewProc("CoCreateFreeThreadedMarshaler").Call(p, uintptr(unsafe.Pointer(&stream.marshal)))
-	if err := hresult(hr); err != nil {
-		streamRelease(stream)
+	err := runOnMTA(func() error {
+		hr, _, _ := ole32.NewProc("CoCreateFreeThreadedMarshaler").Call(p, uintptr(unsafe.Pointer(&stream.marshal)))
+		return hresult(hr)
+	})
+	if err != nil {
+		streamRelease(p)
 		return nil, err
 	}
 	return (*comObject)(unsafe.Pointer(stream)), nil

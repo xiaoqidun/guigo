@@ -98,7 +98,7 @@ func (n *nativeWindow) printCapabilities(ctx context.Context) (PrintCapabilities
 // showPrintUI 返回未适配平台的打印错误
 // 入参: ctx 调用上下文, kind 打印窗口类型
 // 返回: error 平台错误
-func (n *nativeWindow) showPrintUI(ctx context.Context, kind string) error {
+func (n *nativeWindow) showPrintUI(ctx context.Context, kind PrintDialogKind) error {
 	return ErrUnsupportedPlatform
 }
 
@@ -150,16 +150,16 @@ func (n *nativeWindow) setSize(w, h int) error {
 }
 
 // dialog 返回平台不支持错误
-// 入参: o 对话框选项, mode 对话框类型
+// 入参: ctx 调用上下文, o 对话框选项, mode 对话框类型
 // 返回: string 空路径, error 平台错误
-func (n *nativeWindow) dialog(o DialogOptions, mode int) (string, error) {
+func (n *nativeWindow) dialog(ctx context.Context, o DialogOptions, mode int) (string, error) {
 	return "", ErrUnsupportedPlatform
 }
 
 // dialogs 返回平台不支持错误
-// 入参: o 对话框选项, mode 对话框类型
+// 入参: ctx 调用上下文, o 对话框选项, mode 对话框类型
 // 返回: []string 空路径列表, error 平台错误
-func (n *nativeWindow) dialogs(o DialogOptions, mode int) ([]string, error) {
+func (n *nativeWindow) dialogs(ctx context.Context, o DialogOptions, mode int) ([]string, error) {
 	return nil, ErrUnsupportedPlatform
 }
 

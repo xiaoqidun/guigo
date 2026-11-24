@@ -51,15 +51,15 @@ func runtimeVersion(value string) ([4]uint32, error) {
 	var version [4]uint32
 	parts := strings.Split(value, ".")
 	if len(parts) != len(version) {
-		return version, fmt.Errorf("invalid WebView2 Runtime version: %s", value)
+		return version, fmt.Errorf("%w: invalid WebView2 Runtime version: %s", ErrRuntimeUnavailable, value)
 	}
 	for i, part := range parts {
 		if part == "" || strings.IndexFunc(part, func(r rune) bool { return r < '0' || r > '9' }) >= 0 {
-			return version, fmt.Errorf("invalid WebView2 Runtime version: %s", value)
+			return version, fmt.Errorf("%w: invalid WebView2 Runtime version: %s", ErrRuntimeUnavailable, value)
 		}
 		n, err := strconv.ParseUint(part, 10, 32)
 		if err != nil {
-			return version, fmt.Errorf("invalid WebView2 Runtime version: %s", value)
+			return version, fmt.Errorf("%w: invalid WebView2 Runtime version: %s", ErrRuntimeUnavailable, value)
 		}
 		version[i] = uint32(n)
 	}
@@ -88,7 +88,7 @@ func checkRuntimeVersion(version string) error {
 	}
 	minimum, _ := runtimeVersion(minimumRuntime)
 	if runtimeVersionLess(current, minimum) {
-		return fmt.Errorf("WebView2 Runtime %s is older than required %s", version, minimumRuntime)
+		return fmt.Errorf("%w: WebView2 Runtime %s is older than required %s", ErrRuntimeUnavailable, version, minimumRuntime)
 	}
 	return nil
 }
@@ -195,7 +195,7 @@ func installedRuntimes() ([]string, error) {
 		}
 	}
 	if len(paths) == 0 {
-		return nil, fmt.Errorf("Microsoft WebView2 Runtime %s or later required", minimumRuntime)
+		return nil, fmt.Errorf("%w: Microsoft WebView2 Runtime %s or later required", ErrRuntimeUnavailable, minimumRuntime)
 	}
 	return paths, nil
 }
@@ -233,9 +233,9 @@ func loadRuntimePaths(paths []string) (*syscall.DLL, error) {
 		failures = append(failures, fmt.Errorf("%s: %w", path, err))
 	}
 	if len(failures) == 0 {
-		return nil, errors.New("no WebView2 Runtime candidates")
+		return nil, fmt.Errorf("%w: no WebView2 Runtime candidates", ErrRuntimeUnavailable)
 	}
-	return nil, errors.Join(failures...)
+	return nil, fmt.Errorf("%w: %w", ErrRuntimeUnavailable, errors.Join(failures...))
 }
 
 // loadRuntimeModule 加载并复用原生运行时模块
@@ -251,12 +251,12 @@ func loadRuntimeModule(path string) (*syscall.DLL, error) {
 	}
 	handle, _, err := kernel32.NewProc("LoadLibraryExW").Call(uintptr(unsafe.Pointer(wide(path))), 0, 0x1100)
 	if handle == 0 {
-		return nil, fmt.Errorf("load WebView2 Runtime: %w", err)
+		return nil, fmt.Errorf("%w: load WebView2 Runtime: %w", ErrRuntimeUnavailable, err)
 	}
 	dll := &syscall.DLL{Name: path, Handle: syscall.Handle(handle)}
 	if _, err := dll.FindProc("CreateWebViewEnvironmentWithOptionsInternal"); err != nil {
 		dll.Release()
-		return nil, fmt.Errorf("unsupported WebView2 Runtime: %w", err)
+		return nil, fmt.Errorf("%w: unsupported WebView2 Runtime: %w", ErrRuntimeUnavailable, err)
 	}
 	for _, existing := range runtimeLibraries {
 		if existing.Handle == dll.Handle {

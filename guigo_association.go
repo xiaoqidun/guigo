@@ -116,14 +116,14 @@ func validateAssociation(o AssociationOptions, scope AssociationScope) error {
 		return errors.New("invalid association options")
 	}
 	for _, value := range append([]string{o.Name, o.Description}, o.Arguments...) {
-		if strings.ContainsRune(value, 0) {
-			return errors.New("association text contains NUL")
+		if strings.ContainsAny(value, "\x00\r\n") {
+			return errors.New("association text contains invalid control characters")
 		}
 	}
 	ids, extensions := make(map[string]bool), make(map[string]bool)
 	for _, kind := range o.Types {
 		id := strings.ToLower(kind.ID)
-		if validateAppID(kind.ID) != nil || strings.Contains(kind.ID, ".") || kind.Name == "" || strings.ContainsRune(kind.Name, 0) || len(kind.Extensions) == 0 || ids[id] {
+		if validateAppID(kind.ID) != nil || strings.Contains(kind.ID, ".") || kind.Name == "" || strings.ContainsAny(kind.Name, "\x00\r\n") || len(kind.Extensions) == 0 || ids[id] {
 			return errors.New("invalid association file type")
 		}
 		ids[id] = true

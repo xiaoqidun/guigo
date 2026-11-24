@@ -23,12 +23,14 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"unsafe"
+
+	"golang.org/x/sys/unix"
 )
 
 // linuxHeaderID 为临时请求头回调分配递增标识
@@ -58,6 +60,13 @@ type linuxWriter struct {
 	stop    func() bool
 }
 
+// isLinuxPeerCanceled 判断写端错误是否来自WebKit取消单个请求关闭读端
+// 入参: err 写入错误
+// 返回: bool 是否为对端取消
+func isLinuxPeerCanceled(err error) bool {
+	return errors.Is(err, unix.EPIPE) || errors.Is(err, os.ErrClosed) || errors.Is(err, io.ErrClosedPipe)
+}
+
 // linuxHeaders 复制请求头到Go对象
 // 入参: key 字段名, value 字段值, data 注册标识
 func linuxHeaders(key, value *byte, data uintptr) {
@@ -66,7 +75,7 @@ func linuxHeaders(key, value *byte, data uintptr) {
 	}
 }
 
-// linuxResource 获取原生请求并交给后台协程
+// linuxResource 获取原生请求并交给后台Goroutine
 // 入参: request 请求对象, data 用户数据
 func linuxResource(request, data uintptr) {
 	n := active.Load()
@@ -80,7 +89,7 @@ func linuxResource(request, data uintptr) {
 	}
 	req, err := http.NewRequestWithContext(requestContext, gtk.RequestMethod(request), uri, nil)
 	if err != nil {
-		n.fail(err)
+		n.reportError(err)
 		return
 	}
 	req.RequestURI = req.URL.RequestURI()
@@ -123,8 +132,8 @@ func linuxResource(request, data uintptr) {
 			if w.stop != nil {
 				w.stop()
 			}
-			if w.err != nil && req.Context().Err() == nil {
-				n.fail(w.err)
+			if w.err != nil && req.Context().Err() == nil && !isLinuxPeerCanceled(w.err) {
+				n.reportError(w.err)
 			}
 		}()
 		if !localURL(uri) {
@@ -132,6 +141,10 @@ func linuxResource(request, data uintptr) {
 			return
 		}
 		if req.URL.Path == "/__guigo/call" {
+			if req.Header.Get("X-Guigo-Token") != n.bridgeToken {
+				http.Error(w, "Forbidden", 403)
+				return
+			}
 			if req.Method != http.MethodPost {
 				http.Error(w, "Method Not Allowed", 405)
 				return
@@ -150,7 +163,7 @@ func linuxResource(request, data uintptr) {
 				defer stop()
 			}
 			size, err := strconv.ParseInt(req.Header.Get("X-Guigo-Length"), 10, 64)
-			if err != nil || size < 4 || req.Body == nil {
+			if err != nil || size < 4 || size > maxBinaryCallSize || req.Body == nil {
 				calls.finish(call)
 				http.Error(w, "Invalid binary size", 400)
 				return
@@ -173,6 +186,7 @@ func linuxResource(request, data uintptr) {
 			}
 			if resource != nil {
 				if resource.Body == nil {
+					w.err = errors.New("missing resource body")
 					http.Error(w, "Missing resource body", 500)
 					return
 				}
@@ -182,6 +196,9 @@ func linuxResource(request, data uintptr) {
 				}
 				if err != nil || size < 0 {
 					w.err = err
+					if w.err == nil {
+						w.err = errors.New("invalid resource stream")
+					}
 					http.Error(w, "Invalid resource stream", 500)
 					return
 				}
@@ -231,6 +248,7 @@ func (r *linuxInput) Read(data []byte) (int, error) {
 	defer gtk.Unref(cancel)
 	var nativeErr *linuxError
 	count := gtk.InputRead(stream, unsafe.Pointer(&data[0]), uintptr(len(data)), cancel, &nativeErr)
+	runtime.KeepAlive(data)
 	if count < 0 {
 		return 0, nativeError(nativeErr)
 	}
@@ -271,7 +289,7 @@ func (r *linuxInput) cancelRead() {
 // 返回: http.Header 响应头
 func (w *linuxWriter) Header() http.Header { return w.header }
 
-// WriteHeader 创建管道并发布原生响应
+// WriteHeader 创建带FD_CLOEXEC标记的管道并发布原生响应
 // 入参: status HTTP状态码
 func (w *linuxWriter) WriteHeader(status int) {
 	if w.status != 0 {
@@ -284,20 +302,19 @@ func (w *linuxWriter) WriteHeader(status int) {
 	reader, writer, err := os.Pipe()
 	if err != nil {
 		w.err = err
-		w.window.fail(err)
 		_ = w.window.enqueue(func() { w.window.finishResponse(w.request, 500, nil) })
 		return
 	}
-	fd, err := syscall.Dup(int(reader.Fd()))
+	fd, err := unix.FcntlInt(reader.Fd(), unix.F_DUPFD_CLOEXEC, 0)
+	runtime.KeepAlive(reader)
 	_ = reader.Close()
 	if err != nil {
 		_ = writer.Close()
 		w.err = err
-		w.window.fail(err)
 		_ = w.window.enqueue(func() { w.window.finishResponse(w.request, 500, nil) })
 		return
 	}
-	stream := gtk.UnixInput(int32(fd), true)
+	stream := gtk.UnixInput(int32(fd), 1)
 	w.pipe = writer
 	stop := context.AfterFunc(w.ctx, func() { _ = writer.Close() })
 	w.stop = stop
@@ -323,7 +340,7 @@ func (w *linuxWriter) WriteHeader(status int) {
 	}
 }
 
-// Write 发送HTTP响应内容
+// Write 发送HTTP响应内容并记录写端错误
 // 入参: data 响应数据
 // 返回: int 写入长度, error 写入错误
 func (w *linuxWriter) Write(data []byte) (int, error) {
@@ -339,7 +356,11 @@ func (w *linuxWriter) Write(data []byte) (int, error) {
 	if w.pipe == nil {
 		return 0, errors.New("response stream unavailable")
 	}
-	return w.pipe.Write(data)
+	n, err := w.pipe.Write(data)
+	if err != nil {
+		w.err = err
+	}
+	return n, err
 }
 
 // respondStream 将原生流交给WebKit并释放请求引用
@@ -381,7 +402,7 @@ func (n *nativeWindow) finishResponse(request uintptr, status int, headers http.
 	var nativeErr *linuxError
 	stream := gtk.FileRead(file, 0, &nativeErr)
 	if stream == 0 {
-		n.fail(nativeError(nativeErr))
+		n.reportError(nativeError(nativeErr))
 		delete(n.resources, request)
 		gtk.Unref(request)
 		return

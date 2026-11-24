@@ -17,6 +17,7 @@
 package guigo
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -28,6 +29,8 @@ import (
 type linuxDialog struct {
 	object, cancel uintptr
 	mode           int
+	ctx            context.Context
+	stop           func() bool
 	result         chan linuxDialogResult
 }
 
@@ -67,7 +70,9 @@ func linuxDialogFinished(object, result, id uintptr) {
 			canceled = domain == gtk.DialogErrorQuark() && (code == 1 || code == 2) || domain == gtk.IOErrorQuark() && code == 19
 		}
 		err := nativeError(nativeErr)
-		if n.ctx.Err() != nil {
+		if dialog.ctx.Err() != nil {
+			err = dialog.ctx.Err()
+		} else if n.ctx.Err() != nil {
 			err = ErrClosed
 		} else if err == nil || canceled {
 			err = ErrCanceled
@@ -76,6 +81,10 @@ func linuxDialogFinished(object, result, id uintptr) {
 		return
 	}
 	defer gtk.Unref(value)
+	if err := dialog.ctx.Err(); err != nil {
+		n.finishDialog(id, nil, err)
+		return
+	}
 	if n.ctx.Err() != nil {
 		n.finishDialog(id, nil, ErrClosed)
 		return
@@ -108,10 +117,10 @@ func linuxDialogFinished(object, result, id uintptr) {
 }
 
 // dialog 选择单个文件或目录
-// 入参: o 对话框选项, mode 对话框类型
+// 入参: ctx 调用上下文, o 对话框选项, mode 对话框类型
 // 返回: string 文件路径, error 对话框错误
-func (n *nativeWindow) dialog(o DialogOptions, mode int) (string, error) {
-	paths, err := n.dialogs(o, mode)
+func (n *nativeWindow) dialog(ctx context.Context, o DialogOptions, mode int) (string, error) {
+	paths, err := n.dialogs(ctx, o, mode)
 	if err != nil {
 		return "", err
 	}
@@ -121,24 +130,42 @@ func (n *nativeWindow) dialog(o DialogOptions, mode int) (string, error) {
 	return paths[0], nil
 }
 
-// dialogs 在GTK线程显示异步文件对话框并等待结果
-// 入参: o 对话框选项, mode 对话框类型
+// dialogs 在GTK线程显示异步文件对话框，限制单窗口并发并响应上下文取消
+// 入参: ctx 调用上下文, o 对话框选项, mode 对话框类型
 // 返回: []string 文件路径, error 对话框错误
-func (n *nativeWindow) dialogs(o DialogOptions, mode int) ([]string, error) {
+func (n *nativeWindow) dialogs(ctx context.Context, o DialogOptions, mode int) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if n.ctx.Err() != nil {
 		return nil, ErrClosed
 	}
 	result := make(chan linuxDialogResult, 1)
-	err := n.enqueue(func() {
+	err := n.enqueueCleanup(func() {
+		if err := ctx.Err(); err != nil {
+			result <- linuxDialogResult{err: err}
+			return
+		}
 		if n.ctx.Err() != nil {
 			result <- linuxDialogResult{err: ErrClosed}
 			return
 		}
+		if len(n.dialogsPending) > 0 {
+			result <- linuxDialogResult{err: ErrDialogBusy}
+			return
+		}
 		n.nextDialog++
 		id := n.nextDialog
-		dialog := &linuxDialog{object: gtk.DialogNew(), cancel: gtk.CancelNew(), mode: mode, result: result}
+		dialog := &linuxDialog{object: gtk.DialogNew(), cancel: gtk.CancelNew(), mode: mode, ctx: ctx, result: result}
+		dialog.stop = context.AfterFunc(ctx, func() {
+			_ = n.enqueue(func() {
+				if activeDialog := n.dialogsPending[id]; activeDialog == dialog {
+					gtk.Cancel(activeDialog.cancel)
+				}
+			})
+		})
 		n.dialogsPending[id] = dialog
-		gtk.DialogModal(dialog.object, true)
+		gtk.DialogModal(dialog.object, 1)
 		if o.Title != "" {
 			gtk.DialogTitle(dialog.object, o.Title)
 		}
@@ -192,21 +219,30 @@ func (n *nativeWindow) dialogs(o DialogOptions, mode int) ([]string, error) {
 		case 3:
 			launch = gtk.DialogMultiple
 		}
+		if err := ctx.Err(); err != nil {
+			n.finishDialog(id, nil, err)
+			return
+		}
 		if n.ctx.Err() != nil {
 			n.finishDialog(id, nil, ErrClosed)
 			return
 		}
 		launch(dialog.object, n.window, dialog.cancel, linuxCallbacks.dialog, id)
-	})
+	}, func() { result <- linuxDialogResult{err: ErrClosed} })
 	if err != nil {
 		return nil, err
 	}
 	select {
 	case value := <-result:
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if n.ctx.Err() != nil {
 			return nil, ErrClosed
 		}
 		return value.paths, value.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	case <-n.done:
 		return nil, ErrClosed
 	}
@@ -220,10 +256,16 @@ func (n *nativeWindow) finishDialog(id uintptr, paths []string, err error) {
 		return
 	}
 	delete(n.dialogsPending, id)
+	if dialog.stop != nil {
+		dialog.stop()
+	}
 	gtk.Unref(dialog.object)
 	gtk.Unref(dialog.cancel)
-	dialog.result <- linuxDialogResult{paths: paths, err: err}
-	if n.ctx.Err() != nil && len(n.dialogsPending) == 0 {
+	select {
+	case dialog.result <- linuxDialogResult{paths: paths, err: err}:
+	default:
+	}
+	if n.closed && len(n.dialogsPending) == 0 {
 		n.shutdown()
 	}
 }

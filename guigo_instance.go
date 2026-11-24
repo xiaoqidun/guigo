@@ -20,16 +20,42 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
-// instanceLimit 限制单次实例消息的字节数
-const instanceLimit = 1 << 20
+const (
+	// defaultInstanceLimit 限制单次实例消息的默认字节数
+	defaultInstanceLimit = 1 << 20
+	// maxInstanceLimit 限制单次实例消息可配置的最大字节数
+	maxInstanceLimit = 16 << 20
+	// defaultInstanceTimeout 指定实例竞争及转交的默认超时时间
+	defaultInstanceTimeout = 10 * time.Second
+	// maxInstanceErrorBytes 限制经实例通道返回的错误文本最大字节数
+	maxInstanceErrorBytes = 4096
+)
 
 // errInstanceWindow 表示窗口已不属于当前桌面，需要重新选择接收端
 var errInstanceWindow = errors.New("instance window is not on current desktop")
+
+// InstanceOptions 定义单实例入口的标识、转交消息及匹配策略
+type InstanceOptions struct {
+	// AppID 指定调用方实例键，非空且不得包含NUL字符，用于隔离不同应用的单实例入口
+	AppID string
+	// Payload 指定转交给已有实例的初始消息，长度不得超过MaxPayloadBytes
+	Payload []byte
+	// Window 启用桌面窗口单实例策略，Windows按当前虚拟桌面最近激活的同组窗口优先转交
+	// 返回入口后应传入Options.Instance启动窗口并在退出后关闭，其他平台沿用当前会话单实例策略
+	Window bool
+	// Timeout 指定发现、转交及单次消息接收的超时时间，非正值默认使用10秒
+	Timeout time.Duration
+	// MaxPayloadBytes 指定单次收发消息的字节上限，非正值默认使用1MiB，最大允许16MiB
+	MaxPayloadBytes int
+}
 
 // instanceConn 提供支持截止时间的本机通信连接
 type instanceConn interface {
@@ -48,27 +74,68 @@ type Instance struct {
 	listener instanceListener
 	cancel   context.CancelFunc
 	done     chan struct{}
+	timeout  time.Duration
+	limit    int
 	once     sync.Once
 	err      error
 }
 
-// OpenInstance 创建实例入口，已有实例时转交消息并返回nil
+// normalizeInstanceOptions 校验并补全单实例默认配置
+// 入参: options 单实例选项
+// 返回: InstanceOptions 归一化后的选项, error 参数错误
+func normalizeInstanceOptions(options InstanceOptions) (InstanceOptions, error) {
+	if options.AppID == "" || strings.ContainsRune(options.AppID, 0) {
+		return InstanceOptions{}, errors.New("invalid instance options")
+	}
+	if options.MaxPayloadBytes < 0 || options.MaxPayloadBytes > maxInstanceLimit {
+		return InstanceOptions{}, errors.New("invalid instance payload limit")
+	}
+	if options.MaxPayloadBytes == 0 {
+		options.MaxPayloadBytes = defaultInstanceLimit
+	}
+	if len(options.Payload) > options.MaxPayloadBytes {
+		return InstanceOptions{}, errors.New("instance payload exceeds limit")
+	}
+	if options.Timeout <= 0 {
+		options.Timeout = defaultInstanceTimeout
+	}
+	return options, nil
+}
+
+// OpenInstance 创建单实例入口，已有同组实例时转交消息并返回nil
 // 首个实例不调用receive处理自己的消息，调用方自行处理初始请求
 // receive串行执行，应快速接收或入队；返回nil表示已接受，不表示业务已完成
 // receive应响应上下文取消，不得同步调用当前实例的Close
 // receive返回ErrClosed时，发送方等待入口释放后重新竞争
 // 不同用户、登录会话及Windows提升权限分别隔离，不修改窗口应用标识
-// 入参: ctx 生命周期上下文, key 调用方实例键, data 转交消息，最大1MiB, receive 接收回调
-// 返回: *Instance 首个实例入口或nil, error 创建或转交错误
-func OpenInstance(ctx context.Context, key string, data []byte, receive func(context.Context, []byte) error) (*Instance, error) {
-	if ctx == nil || key == "" || receive == nil || len(data) > instanceLimit {
-		return nil, errors.New("invalid instance options")
+// 入参: ctx 生命周期上下文, options 实例配置, receive 接收回调
+// 返回: *Instance 新实例入口或nil, error 创建或转交错误
+func OpenInstance(ctx context.Context, options InstanceOptions, receive func(context.Context, []byte) error) (*Instance, error) {
+	if ctx == nil {
+		return nil, errors.New("nil context")
 	}
-	address, err := instanceAddress(key)
+	if receive == nil {
+		return nil, errors.New("nil instance receiver")
+	}
+	normalized, err := normalizeInstanceOptions(options)
 	if err != nil {
 		return nil, err
 	}
-	request, cancel := context.WithTimeout(ctx, 10*time.Second)
+	if normalized.Window {
+		return openWindowInstance(ctx, normalized, receive)
+	}
+	return openSessionInstance(ctx, normalized, receive)
+}
+
+// openSessionInstance 在当前用户和会话范围内竞争或转交单实例入口
+// 入参: ctx 生命周期上下文, options 归一化实例配置, receive 接收回调
+// 返回: *Instance 新实例入口或nil, error 创建或转交错误
+func openSessionInstance(ctx context.Context, options InstanceOptions, receive func(context.Context, []byte) error) (*Instance, error) {
+	address, err := instanceAddress(options.AppID)
+	if err != nil {
+		return nil, err
+	}
+	request, cancel := context.WithTimeout(ctx, options.Timeout)
 	defer cancel()
 	for {
 		if err := request.Err(); err != nil {
@@ -79,11 +146,11 @@ func OpenInstance(ctx context.Context, key string, data []byte, receive func(con
 			return nil, err
 		}
 		if listener != nil {
-			return startInstance(ctx, listener, receive), nil
+			return startInstance(ctx, listener, options.Timeout, options.MaxPayloadBytes, receive), nil
 		}
 		conn, err := dialInstance(request, address)
 		if err == nil {
-			err = forwardInstance(request, conn, data)
+			err = forwardInstance(request, conn, options.Payload, options.MaxPayloadBytes)
 			if !errors.Is(err, ErrClosed) {
 				return nil, err
 			}
@@ -98,33 +165,20 @@ func OpenInstance(ctx context.Context, key string, data []byte, receive func(con
 	}
 }
 
-// OpenWindowInstance 优先转交到当前虚拟桌面最近激活的同组窗口，没有时创建入口
-// Windows按窗口实时所属桌面选择，其他平台沿用OpenInstance的复用范围
-// 返回入口后应传入Options.Instance启动窗口，并在运行结束后关闭入口
-// 窗口登记前同组启动会等待；消息接收及用户隔离约定与OpenInstance相同
-// 入参: ctx 生命周期上下文, key 调用方实例键, data 转交消息, receive 接收回调
-// 返回: *Instance 新窗口入口或nil, error 创建或转交错误
-func OpenWindowInstance(ctx context.Context, key string, data []byte, receive func(context.Context, []byte) error) (*Instance, error) {
-	if ctx == nil || key == "" || receive == nil || len(data) > instanceLimit {
-		return nil, errors.New("invalid instance options")
-	}
-	return openWindowInstance(ctx, key, data, receive)
-}
-
 // startInstance 启动入口接收循环
-// 入参: ctx 生命周期上下文, listener 接收端, receive 接收回调
+// 入参: ctx 生命周期上下文, listener 接收端, timeout 单次接收超时, limit 消息字节上限, receive 接收回调
 // 返回: *Instance 实例入口
-func startInstance(ctx context.Context, listener instanceListener, receive func(context.Context, []byte) error) *Instance {
+func startInstance(ctx context.Context, listener instanceListener, timeout time.Duration, limit int, receive func(context.Context, []byte) error) *Instance {
 	life, stop := context.WithCancel(ctx)
-	instance := &Instance{listener: listener, cancel: stop, done: make(chan struct{})}
+	instance := &Instance{listener: listener, cancel: stop, done: make(chan struct{}), timeout: timeout, limit: limit}
 	go instance.serve(life, receive)
 	return instance
 }
 
 // forwardInstance 转交消息并读取接收结果，不重发已确认或结果不明的请求
-// 入参: ctx 请求上下文, conn 本机连接, data 消息
+// 入参: ctx 请求上下文, conn 本机连接, data 消息, limit 消息字节上限
 // 返回: error 转交错误
-func forwardInstance(ctx context.Context, conn instanceConn, data []byte) error {
+func forwardInstance(ctx context.Context, conn instanceConn, data []byte, limit int) error {
 	defer conn.Close()
 	stop := context.AfterFunc(ctx, func() { conn.Close() })
 	defer stop()
@@ -142,10 +196,10 @@ func forwardInstance(ctx context.Context, conn instanceConn, data []byte) error 
 	if ready[0] != 1 {
 		return errors.New("invalid instance readiness")
 	}
-	if err := writeInstanceMessage(conn, data); err != nil {
+	if err := writeInstanceMessage(conn, data, limit); err != nil {
 		return err
 	}
-	reply, err := readInstanceMessage(conn)
+	reply, err := readInstanceMessage(conn, limit)
 	if err != nil {
 		return err
 	}
@@ -176,14 +230,14 @@ func instanceHash(identity, key string) string {
 }
 
 // readInstanceMessage 读取长度受限的实例消息
-// 入参: reader 数据来源
+// 入参: reader 数据来源, limit 消息字节上限
 // 返回: []byte 消息, error 读取错误
-func readInstanceMessage(reader io.Reader) ([]byte, error) {
+func readInstanceMessage(reader io.Reader, limit int) ([]byte, error) {
 	var size uint32
 	if err := binary.Read(reader, binary.LittleEndian, &size); err != nil {
 		return nil, err
 	}
-	if size > instanceLimit {
+	if int64(size) > int64(limit) {
 		return nil, errors.New("instance message too large")
 	}
 	data := make([]byte, size)
@@ -192,10 +246,10 @@ func readInstanceMessage(reader io.Reader) ([]byte, error) {
 }
 
 // writeInstanceMessage 写入长度受限的实例消息
-// 入参: writer 数据目标, data 消息
+// 入参: writer 数据目标, data 消息, limit 消息字节上限
 // 返回: error 写入错误
-func writeInstanceMessage(writer io.Writer, data []byte) error {
-	if len(data) > instanceLimit {
+func writeInstanceMessage(writer io.Writer, data []byte, limit int) error {
+	if len(data) > limit {
 		return errors.New("instance message too large")
 	}
 	if err := binary.Write(writer, binary.LittleEndian, uint32(len(data))); err != nil {
@@ -214,16 +268,39 @@ func writeInstanceMessage(writer io.Writer, data []byte) error {
 	return nil
 }
 
-// Close 停止接收并释放实例入口，可重复调用
+// truncateUTF8 按UTF-8字符边界截断超长字符串
+// 入参: text 原始文本, maxBytes 最大字节数
+// 返回: string 截断后的合法UTF-8字符串
+func truncateUTF8(text string, maxBytes int) string {
+	if maxBytes <= 0 || len(text) <= maxBytes {
+		if maxBytes <= 0 {
+			return ""
+		}
+		return text
+	}
+	end := maxBytes
+	for end > 0 && !utf8.RuneStart(text[end]) {
+		end--
+	}
+	return text[:end]
+}
+
+// Close 停止接收并释放实例入口，可重复调用，nil及零值接收者均安全
 // 返回: error 关闭错误
 func (i *Instance) Close() error {
 	if i == nil {
 		return nil
 	}
 	i.once.Do(func() {
-		i.err = i.listener.Close()
-		<-i.done
-		i.cancel()
+		if i.cancel != nil {
+			i.cancel()
+		}
+		if i.listener != nil {
+			i.err = i.listener.Close()
+		}
+		if i.done != nil {
+			<-i.done
+		}
 	})
 	return i.err
 }
@@ -244,11 +321,19 @@ func (i *Instance) serve(ctx context.Context, receive func(context.Context, []by
 	}
 }
 
-// receive 处理单个连接并等待对方读取回执
+// receive 处理单个连接并隔离回调异常，等待对方读取回执
 // 入参: ctx 生命周期上下文, conn 本机连接, receive 接收回调
 func (i *Instance) receive(ctx context.Context, conn instanceConn, receive func(context.Context, []byte) error) {
 	defer conn.Close()
-	request, cancel := context.WithTimeout(ctx, 10*time.Second)
+	timeout := i.timeout
+	if timeout <= 0 {
+		timeout = defaultInstanceTimeout
+	}
+	limit := i.limit
+	if limit <= 0 {
+		limit = defaultInstanceLimit
+	}
+	request, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	stop := context.AfterFunc(request, func() { conn.Close() })
 	defer stop()
@@ -259,21 +344,31 @@ func (i *Instance) receive(ctx context.Context, conn instanceConn, receive func(
 	if _, err := conn.Write([]byte{1}); err != nil {
 		return
 	}
-	data, err := readInstanceMessage(conn)
+	data, err := readInstanceMessage(conn, limit)
 	if err != nil || request.Err() != nil {
 		return
 	}
+	var receiveErr error
+	func() {
+		defer func() {
+			if v := recover(); v != nil {
+				receiveErr = fmt.Errorf("instance receiver panic: %v", v)
+			}
+		}()
+		receiveErr = receive(request, data)
+	}()
 	reply := []byte{0}
-	if err := receive(request, data); err != nil {
-		if errors.Is(err, ErrClosed) {
+	if receiveErr != nil {
+		if errors.Is(receiveErr, ErrClosed) {
 			reply[0] = 2
-		} else if errors.Is(err, errInstanceWindow) {
+		} else if errors.Is(receiveErr, errInstanceWindow) {
 			reply[0] = 3
 		} else {
-			reply = append([]byte{1}, []byte(err.Error())...)
+			maxErr := min(maxInstanceErrorBytes, max(0, limit-1))
+			reply = append([]byte{1}, []byte(truncateUTF8(receiveErr.Error(), maxErr))...)
 		}
 	}
-	if writeInstanceMessage(conn, reply) == nil {
+	if writeInstanceMessage(conn, reply, limit) == nil {
 		var accepted [1]byte
 		_, _ = io.ReadFull(conn, accepted[:])
 	}

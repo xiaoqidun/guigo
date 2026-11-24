@@ -24,11 +24,66 @@ import (
 	"strings"
 )
 
-// ErrPrintUnsupported 表示当前运行时没有请求的打印能力
-var ErrPrintUnsupported = errors.New("requested printing capability is unavailable")
+const (
+	// PrintDialogSystem 使用系统打印窗口
+	PrintDialogSystem PrintDialogKind = "system"
+	// PrintDialogBrowser 使用WebView内置打印窗口
+	PrintDialogBrowser PrintDialogKind = "browser"
+)
 
-// ErrPrintBusy 表示当前视图仍在处理另一个直接打印作业
-var ErrPrintBusy = errors.New("another print operation is active")
+const (
+	// PrintOrientationPortrait 使用纵向打印
+	PrintOrientationPortrait PrintOrientation = "portrait"
+	// PrintOrientationLandscape 使用横向打印
+	PrintOrientationLandscape PrintOrientation = "landscape"
+)
+
+const (
+	// PrintCollationCollated 按份逐套整理打印
+	PrintCollationCollated PrintCollation = "collated"
+	// PrintCollationUncollated 按页分组不逐套整理打印
+	PrintCollationUncollated PrintCollation = "uncollated"
+)
+
+const (
+	// PrintColorModeColor 使用彩色打印
+	PrintColorModeColor PrintColorMode = "color"
+	// PrintColorModeGrayscale 使用灰度打印
+	PrintColorModeGrayscale PrintColorMode = "grayscale"
+)
+
+const (
+	// PrintDuplexOneSided 使用单面打印
+	PrintDuplexOneSided PrintDuplex = "simplex"
+	// PrintDuplexLongEdge 使用长边翻页双面打印
+	PrintDuplexLongEdge PrintDuplex = "longEdge"
+	// PrintDuplexShortEdge 使用短边翻页双面打印
+	PrintDuplexShortEdge PrintDuplex = "shortEdge"
+)
+
+var (
+	// ErrPrintUnsupported 表示当前运行时没有请求的打印能力
+	ErrPrintUnsupported = errors.New("requested printing capability is unavailable")
+	// ErrPrintBusy 表示当前视图仍在处理另一个直接打印作业
+	ErrPrintBusy = errors.New("another print operation is active")
+	// ErrPrinterNotFound 表示指定的打印机或系统默认打印机不存在
+	ErrPrinterNotFound = errors.New("printer not found")
+)
+
+// PrintDialogKind 定义打印对话框类型
+type PrintDialogKind string
+
+// PrintOrientation 定义纸张打印方向
+type PrintOrientation string
+
+// PrintCollation 定义多份打印的逐份整理方式
+type PrintCollation string
+
+// PrintColorMode 定义打印色彩模式
+type PrintColorMode string
+
+// PrintDuplex 定义单双面打印方式
+type PrintDuplex string
 
 // PrintCapabilities 描述运行时支持的打印机制，不代表打印机已连接或具备所有硬件功能
 type PrintCapabilities struct {
@@ -55,8 +110,8 @@ type PrintCapabilities struct {
 type PrintOptions struct {
 	// Printer 指定系统队列名称，空值采用默认设备
 	Printer string `json:"printer,omitempty"`
-	// Orientation 指定portrait或landscape，空值采用系统默认方向
-	Orientation string `json:"orientation,omitempty"`
+	// Orientation 指定纸张方向，空值采用系统默认方向
+	Orientation PrintOrientation `json:"orientation,omitempty"`
 	// Width 指定未旋转纸张宽度，单位为毫米，与Height同时设置
 	Width float64 `json:"width,omitempty"`
 	// Height 指定未旋转纸张高度，单位为毫米，与Width同时设置
@@ -67,12 +122,12 @@ type PrintOptions struct {
 	Scale float64 `json:"scale,omitempty"`
 	// Copies 指定1至999之间的份数，零值采用系统默认值
 	Copies int `json:"copies,omitempty"`
-	// Collation 指定collated或uncollated，空值采用系统默认顺序
-	Collation string `json:"collation,omitempty"`
-	// Color 指定color或grayscale，空值采用系统默认颜色
-	Color string `json:"color,omitempty"`
-	// Duplex 指定simplex、longEdge或shortEdge，空值采用系统默认单双面
-	Duplex string `json:"duplex,omitempty"`
+	// Collation 指定多份整理顺序，空值采用系统默认顺序
+	Collation PrintCollation `json:"collation,omitempty"`
+	// Color 指定色彩模式，空值采用系统默认颜色
+	Color PrintColorMode `json:"color,omitempty"`
+	// Duplex 指定单双面方式，空值采用系统默认单双面
+	Duplex PrintDuplex `json:"duplex,omitempty"`
 	// PageRanges 指定一基闭区间，如1-3,5，空值打印全部页面
 	PageRanges string `json:"pageRanges,omitempty"`
 	// PagesPerSide 指定每面1、2、4、6、9或16页，零值采用系统默认值
@@ -139,14 +194,18 @@ func validatePrint(o PrintOptions) error {
 			}
 		}
 		width, height := o.Width, o.Height
-		if o.Orientation == "landscape" {
+		if o.Orientation == PrintOrientationLandscape {
 			width, height = height, width
 		}
 		if width > 0 && (o.Margins.Left+o.Margins.Right >= width || o.Margins.Top+o.Margins.Bottom >= height) {
 			return fmt.Errorf("print margins exceed paper size")
 		}
 	}
-	if !slices.Contains([]string{"", "portrait", "landscape"}, o.Orientation) || !slices.Contains([]string{"", "color", "grayscale"}, o.Color) || !slices.Contains([]string{"", "simplex", "longEdge", "shortEdge"}, o.Duplex) || !slices.Contains([]string{"", "collated", "uncollated"}, o.Collation) || !slices.Contains([]int{0, 1, 2, 4, 6, 9, 16}, o.PagesPerSide) {
+	if !slices.Contains([]PrintOrientation{"", PrintOrientationPortrait, PrintOrientationLandscape}, o.Orientation) ||
+		!slices.Contains([]PrintColorMode{"", PrintColorModeColor, PrintColorModeGrayscale}, o.Color) ||
+		!slices.Contains([]PrintDuplex{"", PrintDuplexOneSided, PrintDuplexLongEdge, PrintDuplexShortEdge}, o.Duplex) ||
+		!slices.Contains([]PrintCollation{"", PrintCollationCollated, PrintCollationUncollated}, o.Collation) ||
+		!slices.Contains([]int{0, 1, 2, 4, 6, 9, 16}, o.PagesPerSide) {
 		return fmt.Errorf("invalid print option")
 	}
 	if strings.ContainsAny(o.Printer, "\x00\r\n") {
@@ -185,7 +244,7 @@ func printPageRanges(value string) ([][2]int32, error) {
 	return ranges, nil
 }
 
-// PrintCapabilities 查询当前窗口的打印接口能力，可从后台协程调用
+// PrintCapabilities 查询当前窗口的打印接口能力，可从后台Goroutine调用
 // 入参: ctx 调用上下文
 // 返回: PrintCapabilities 打印机制能力, error 查询或取消错误
 func (w *Window) PrintCapabilities(ctx context.Context) (PrintCapabilities, error) {
@@ -201,12 +260,12 @@ func (w *Window) PrintCapabilities(ctx context.Context) (PrintCapabilities, erro
 	return w.native.printCapabilities(ctx)
 }
 
-// ShowPrintUI 为当前顶层文档打开打印对话框，kind支持system、browser，空值采用system
+// ShowPrintUI 为当前顶层文档打开打印对话框，空值默认采用PrintDialogSystem
 // Windows返回表示对话框请求已交付，不能据此释放内容或认定打印成功
 // 调用方可以监听页面afterprint，在对话框关闭后恢复界面；Linux取消返回ErrCanceled
 // 入参: ctx 调用上下文, kind 打印窗口类型
 // 返回: error 不支持、取消或窗口调用错误
-func (w *Window) ShowPrintUI(ctx context.Context, kind string) error {
+func (w *Window) ShowPrintUI(ctx context.Context, kind PrintDialogKind) error {
 	if ctx == nil {
 		return fmt.Errorf("nil print context")
 	}
@@ -217,9 +276,9 @@ func (w *Window) ShowPrintUI(ctx context.Context, kind string) error {
 		return ErrClosed
 	}
 	if kind == "" {
-		kind = "system"
+		kind = PrintDialogSystem
 	}
-	if kind != "system" && kind != "browser" {
+	if kind != PrintDialogSystem && kind != PrintDialogBrowser {
 		return fmt.Errorf("invalid print dialog kind")
 	}
 	return w.native.showPrintUI(ctx, kind)

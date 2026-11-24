@@ -54,6 +54,12 @@ var (
 	ErrCanceled = errors.New("dialog canceled")
 	// ErrClosed 表示窗口已经关闭
 	ErrClosed = errors.New("window closed")
+	// ErrAlreadyRunning 表示当前进程已有活动窗口循环
+	ErrAlreadyRunning = errors.New("another Run is active")
+	// ErrDialogBusy 表示当前窗口已有活动文件对话框
+	ErrDialogBusy = errors.New("another dialog is active")
+	// ErrRuntimeUnavailable 表示系统原生浏览器或窗口运行时不可用
+	ErrRuntimeUnavailable = errors.New("native runtime unavailable")
 )
 
 // HandlerFunc 异步处理页面调用，调用结束、取消或页面退出时取消上下文
@@ -119,8 +125,9 @@ type TitleBarInfo struct {
 }
 
 // Options 定义窗口、资源和生命周期配置，客户区尺寸单位为逻辑像素
+// 路径前缀/__guigo/由宿主保留用于内部桥接传输，应用资源路径不得占用
 type Options struct {
-	// Instance 指定OpenWindowInstance返回的入口，创建窗口时自动登记，调用方负责关闭入口
+	// Instance 指定OpenInstance在Window为true时返回的入口，创建窗口时自动登记，调用方负责关闭入口
 	Instance *Instance
 	// AppID 指定稳定的应用标识，长度不超过128字节，以英文字母开头，不以点结尾
 	// 允许英文字母、数字、点和连字符，保留大小写，不随程序版本或位置变化
@@ -162,28 +169,29 @@ type Options struct {
 	// UserDataDir 指定持久数据目录，优先于AppID，两者至少设置一个，目录由调用方清理
 	// 相对路径基于当前工作目录，便携程序可传入可执行文件所在目录下的绝对路径
 	UserDataDir string
-	// LibraryPath 指定原生运行时模块的路径，空值查找系统安装的运行时
+	// LibraryPath 指定原生运行时动态库路径，空值查找系统已安装运行时
+	// Windows指向EmbeddedBrowserWebView.dll，Linux指向libwebkitgtk-6.0.so.4且同进程首次加载后固定
 	LibraryPath string
-	// EntryPath 指定资源入口路径，空值使用根路径
+	// EntryPath 指定资源入口路径，空值使用根路径，不得使用/__guigo/保留前缀
 	EntryPath string
-	// FS 提供内嵌或外置静态资源，Handler非空时不使用
+	// FS 提供内嵌或外置静态资源，Handler非空时不使用，/__guigo/路径由宿主保留
 	FS fs.FS
-	// Handler 并发处理本地资源请求，不启动网络服务
+	// Handler 并发处理本地资源请求，不启动网络服务，/__guigo/路径由宿主保留
 	Handler http.Handler
-	// ResourceHandler 优先提供可寻址资源，返回nil, nil时使用Handler
+	// ResourceHandler 优先提供可寻址资源，返回nil, nil时使用Handler，/__guigo/路径由宿主保留
 	ResourceHandler func(*http.Request) (*Resource, error)
 	// Bindings 注册页面可调用的方法，处理器可能并发执行
 	Bindings map[string]HandlerFunc
-	// OnReady 在宿主就绪且首次导航前调用，回调返回后才加载页面
+	// OnReady 在宿主就绪且首次导航前于后台Goroutine调用，回调返回后才加载页面
 	OnReady func(*Window)
 	// OnTitleBarChanged 在OnReady返回后于后台串行接收初始布局及布局、激活、最大化或DPI变化，可调用Window方法
 	// 快速变化可合并为最新状态，回调不应阻塞，关闭时未交付的通知可丢弃
 	OnTitleBarChanged func(TitleBarInfo)
 	// OnClosing 返回是否允许用户关闭窗口，上下文取消时直接关闭
 	OnClosing func(context.Context) bool
-	// OnClose 在窗口退出后调用，回调结束后Run返回
+	// OnClose 在宿主完全退出并释放运行锁后于Run调用方Goroutine执行，启动失败时不调用，返回后Run返回
 	OnClose func()
-	// OnDrop 在后台协程接收系统文件拖放的路径，多次回调可能并发执行
+	// OnDrop 在后台Goroutine接收系统文件拖放的路径，多次回调可能并发执行
 	OnDrop func([]string)
 	// OnError 接收异步操作错误，多次回调可能并发执行
 	OnError func(error)
@@ -231,7 +239,7 @@ type BridgeError struct {
 	Message string
 }
 
-// Window 持有窗口宿主，由OnReady提供，所有公开方法可由后台协程调用
+// Window 持有窗口宿主，由OnReady提供，所有公开方法可由后台Goroutine调用
 type Window struct {
 	native *nativeWindow
 }
@@ -285,6 +293,7 @@ func OpenURL(rawURL string) error {
 }
 
 // Run 运行窗口事件循环，关闭后返回，同一进程不支持同时运行多个实例
+// 当前实现支持windows/amd64及linux/amd64、linux/arm64，其他平台返回ErrUnsupportedPlatform
 // Windows使用调用线程，Linux使用进程内固定的GTK线程
 // 浏览器数据在关闭、启动失败和版本升级时保留，删除由调用方负责
 // 入参: ctx 运行上下文, options 宿主选项
@@ -368,7 +377,7 @@ func dispatch(ctx context.Context, bindings map[string]HandlerFunc, call envelop
 			reply.Error = "handler failed"
 		}
 		var bridge *BridgeError
-		if errors.As(err, &bridge) {
+		if errors.As(err, &bridge) && bridge != nil {
 			reply.ErrorName = bridge.Name
 			reply.Code = bridge.Code
 		}
@@ -416,6 +425,24 @@ func validateAppID(appID string) error {
 		}
 	}
 	return nil
+}
+
+// clampWindowSize 校验并按最小最大约束限制客户区逻辑尺寸
+// 入参: o 宿主选项, width 目标宽度, height 目标高度
+// 返回: int 限制后宽度, int 限制后高度, error 尺寸错误
+func clampWindowSize(o Options, width, height int) (int, int, error) {
+	if width < 1 || height < 1 || width > 32767 || height > 32767 {
+		return 0, 0, errors.New("invalid window dimensions")
+	}
+	width = max(width, o.MinWidth)
+	height = max(height, o.MinHeight)
+	if o.MaxWidth > 0 {
+		width = min(width, o.MaxWidth)
+	}
+	if o.MaxHeight > 0 {
+		height = min(height, o.MaxHeight)
+	}
+	return width, height, nil
 }
 
 // validate 补全默认尺寸并检查约束
@@ -475,18 +502,7 @@ func validate(o *Options) error {
 	if o.MaxWidth > 0 && o.MinWidth > o.MaxWidth || o.MaxHeight > 0 && o.MinHeight > o.MaxHeight {
 		return errors.New("invalid size constraints")
 	}
-	if o.MinWidth > o.Width {
-		o.Width = o.MinWidth
-	}
-	if o.MinHeight > o.Height {
-		o.Height = o.MinHeight
-	}
-	if o.MaxWidth > 0 && o.Width > o.MaxWidth {
-		o.Width = o.MaxWidth
-	}
-	if o.MaxHeight > 0 && o.Height > o.MaxHeight {
-		o.Height = o.MaxHeight
-	}
+	o.Width, o.Height, _ = clampWindowSize(*o, o.Width, o.Height)
 	if o.Handler == nil {
 		if o.FS != nil {
 			o.Handler = fileHandler{http.FileServer(http.FS(o.FS))}
@@ -505,9 +521,12 @@ func validate(o *Options) error {
 	return nil
 }
 
-// Error 返回错误说明
+// Error 返回错误说明，nil接收者安全返回空字符串
 // 返回: string 错误信息
 func (e *BridgeError) Error() string {
+	if e == nil {
+		return ""
+	}
 	return e.Message
 }
 
@@ -649,53 +668,77 @@ func (w *Window) ResourceURL(path string) string {
 }
 
 // OpenFile 选择单个已有文件
-// 入参: o 对话框选项
-// 返回: string 文件路径, error 错误信息，用户取消返回ErrCanceled
-func (w *Window) OpenFile(o DialogOptions) (string, error) {
+// 入参: ctx 调用上下文, options 对话框选项
+// 返回: string 文件路径, error 错误信息，用户取消返回ErrCanceled，并发调用返回ErrDialogBusy
+func (w *Window) OpenFile(ctx context.Context, options DialogOptions) (string, error) {
+	if ctx == nil {
+		return "", errors.New("nil context")
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	if w == nil || w.native == nil {
 		return "", ErrClosed
 	}
-	if err := validateDialog(o); err != nil {
+	if err := validateDialog(options); err != nil {
 		return "", err
 	}
-	return w.native.dialog(o, 0)
+	return w.native.dialog(ctx, options, 0)
 }
 
 // OpenFiles 选择多个已有文件
-// 入参: o 对话框选项
-// 返回: []string 文件路径, error 错误信息，用户取消返回ErrCanceled
-func (w *Window) OpenFiles(o DialogOptions) ([]string, error) {
+// 入参: ctx 调用上下文, options 对话框选项
+// 返回: []string 文件路径, error 错误信息，用户取消返回ErrCanceled，并发调用返回ErrDialogBusy
+func (w *Window) OpenFiles(ctx context.Context, options DialogOptions) ([]string, error) {
+	if ctx == nil {
+		return nil, errors.New("nil context")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if w == nil || w.native == nil {
 		return nil, ErrClosed
 	}
-	if err := validateDialog(o); err != nil {
+	if err := validateDialog(options); err != nil {
 		return nil, err
 	}
-	return w.native.dialogs(o, 3)
+	return w.native.dialogs(ctx, options, 3)
 }
 
 // SaveFile 选择保存路径并提示覆盖已有文件
-// 入参: o 对话框选项
-// 返回: string 保存路径, error 错误信息，用户取消返回ErrCanceled
-func (w *Window) SaveFile(o DialogOptions) (string, error) {
+// 入参: ctx 调用上下文, options 对话框选项
+// 返回: string 保存路径, error 错误信息，用户取消返回ErrCanceled，并发调用返回ErrDialogBusy
+func (w *Window) SaveFile(ctx context.Context, options DialogOptions) (string, error) {
+	if ctx == nil {
+		return "", errors.New("nil context")
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	if w == nil || w.native == nil {
 		return "", ErrClosed
 	}
-	if err := validateDialog(o); err != nil {
+	if err := validateDialog(options); err != nil {
 		return "", err
 	}
-	return w.native.dialog(o, 1)
+	return w.native.dialog(ctx, options, 1)
 }
 
 // OpenDirectory 选择已有目录
-// 入参: o 对话框选项
-// 返回: string 目录路径, error 错误信息，用户取消返回ErrCanceled
-func (w *Window) OpenDirectory(o DialogOptions) (string, error) {
+// 入参: ctx 调用上下文, options 对话框选项
+// 返回: string 目录路径, error 错误信息，用户取消返回ErrCanceled，并发调用返回ErrDialogBusy
+func (w *Window) OpenDirectory(ctx context.Context, options DialogOptions) (string, error) {
+	if ctx == nil {
+		return "", errors.New("nil context")
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	if w == nil || w.native == nil {
 		return "", ErrClosed
 	}
-	if err := validateDialog(o); err != nil {
+	if err := validateDialog(options); err != nil {
 		return "", err
 	}
-	return w.native.dialog(o, 2)
+	return w.native.dialog(ctx, options, 2)
 }

@@ -311,7 +311,7 @@ func queryAssociation(root registry.Key, o AssociationOptions) (AssociationStatu
 	return status, nil
 }
 
-// registerFileAssociations 登记当前范围并通知系统刷新
+// registerFileAssociations 登记当前范围，仅成功后通知系统刷新
 // 入参: o 应用配置, scope 作用范围
 // 返回: error 登记错误
 func registerFileAssociations(o AssociationOptions, scope AssociationScope) error {
@@ -327,8 +327,11 @@ func registerFileAssociations(o AssociationOptions, scope AssociationScope) erro
 	if file.IsDir() {
 		return errors.New("association executable is a directory")
 	}
-	defer associationNotify.Call(0x08000000, 0, 0, 0)
-	return registerAssociation(associationRoot(scope), o)
+	if err := registerAssociation(associationRoot(scope), o); err != nil {
+		return err
+	}
+	associationNotify.Call(0x08000000, 0, 0, 0)
+	return nil
 }
 
 // registerAssociation 写入关联并在失败时恢复本次修改
@@ -372,7 +375,7 @@ func registerAssociation(root registry.Key, o AssociationOptions) (result error)
 	return nil
 }
 
-// unregisterFileAssociations 撤销当前范围并通知系统刷新
+// unregisterFileAssociations 撤销当前范围，仅成功后通知系统刷新
 // 入参: o 应用配置, scope 作用范围
 // 返回: error 撤销错误
 func unregisterFileAssociations(o AssociationOptions, scope AssociationScope) error {
@@ -381,11 +384,14 @@ func unregisterFileAssociations(o AssociationOptions, scope AssociationScope) er
 	if scope == AssociationMachine && !windows.GetCurrentProcessToken().IsElevated() {
 		return ErrAssociationElevationRequired
 	}
-	defer associationNotify.Call(0x08000000, 0, 0, 0)
-	return unregisterAssociation(associationRoot(scope), o)
+	if err := unregisterAssociation(associationRoot(scope), o); err != nil {
+		return err
+	}
+	associationNotify.Call(0x08000000, 0, 0, 0)
+	return nil
 }
 
-// unregisterAssociation 整树删除专用键，公共键只删除本应用的值
+// unregisterAssociation 整树删除专用键，公共键仅删除本应用的值并清理空的OpenWithProgids
 // 入参: root 注册表根, o 应用配置
 // 返回: error 撤销错误
 func unregisterAssociation(root registry.Key, o AssociationOptions) error {
@@ -394,7 +400,9 @@ func unregisterAssociation(root registry.Key, o AssociationOptions) error {
 	for _, kind := range o.Types {
 		id := o.AppID + "." + kind.ID
 		for _, extension := range kind.Extensions {
-			result = errors.Join(result, writeAssociationValue(root, associationValue{path: `Software\Classes\` + extension + `\OpenWithProgids`, name: id}))
+			openWith := `Software\Classes\` + extension + `\OpenWithProgids`
+			result = errors.Join(result, writeAssociationValue(root, associationValue{path: openWith, name: id}))
+			result = errors.Join(result, removeAssociationEmptyKey(root, openWith))
 		}
 		result = errors.Join(result, removeAssociationTree(root, `Software\Classes\`+id))
 	}

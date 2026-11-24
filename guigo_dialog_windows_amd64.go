@@ -15,7 +15,7 @@
 package guigo
 
 import (
-	"errors"
+	"context"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -72,23 +72,26 @@ func shellPath(item *comObject) (string, error) {
 }
 
 // dialog 运行单结果原生对话框
-// 入参: o 对话框选项, mode 对话框类型
+// 入参: ctx 调用上下文, o 对话框选项, mode 对话框类型
 // 返回: string 文件路径, error 对话框错误
-func (n *nativeWindow) dialog(o DialogOptions, mode int) (string, error) {
-	paths, err := n.dialogs(o, mode)
+func (n *nativeWindow) dialog(ctx context.Context, o DialogOptions, mode int) (string, error) {
+	paths, err := n.dialogs(ctx, o, mode)
 	if err != nil {
 		return "", err
 	}
 	return paths[0], nil
 }
 
-// dialogs 在宿主线程显示IFileDialog
-// 入参: o 对话框选项, mode 对话框类型
+// dialogs 在宿主线程显示IFileDialog并响应上下文取消
+// 入参: ctx 调用上下文, o 对话框选项, mode 对话框类型
 // 返回: []string 文件路径, error 对话框错误
-func (n *nativeWindow) dialogs(o DialogOptions, mode int) (paths []string, err error) {
+func (n *nativeWindow) dialogs(ctx context.Context, o DialogOptions, mode int) (paths []string, err error) {
 	err = n.invokeTop(func() error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if n.activeDialog != nil {
-			return errors.New("another file dialog is active")
+			return ErrDialogBusy
 		}
 		clsid := guid("{DC1C5A9C-E88A-4DDE-A5A1-60F82A20AEF7}")
 		iid := guid("{D57C7288-D4AD-4768-BE02-9D969532D960}")
@@ -150,16 +153,44 @@ func (n *nativeWindow) dialogs(o DialogOptions, mode int) (paths []string, err e
 			}
 		}
 		if err := n.ctx.Err(); err != nil {
+			return ErrClosed
+		}
+		if err := ctx.Err(); err != nil {
 			return err
 		}
 		n.activeDialog = dialog
-		defer func() { n.activeDialog = nil }()
+		n.modalActive++
+		stop := context.AfterFunc(ctx, func() {
+			_ = n.enqueue(func() {
+				if n.activeDialog == dialog {
+					com(dialog, 23, 0x800704c7)
+				}
+			})
+		})
+		defer func() {
+			stop()
+			n.activeDialog = nil
+			n.modalActive--
+			if n.modalActive == 0 && n.quitAfterModal {
+				n.quitAfterModal = false
+				user32.NewProc("PostQuitMessage").Call(0)
+			}
+		}()
 		hr = com(dialog, 3, n.hwnd)
 		runtime.KeepAlive(filters)
 		if uint32(hr) == 0x800704c7 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if n.ctx.Err() != nil {
+				return ErrClosed
+			}
 			return ErrCanceled
 		}
 		if err := hresult(hr); err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
 			return err
 		}
 		if mode == 3 {

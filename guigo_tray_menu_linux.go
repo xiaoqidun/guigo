@@ -19,6 +19,7 @@ package guigo
 import (
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 )
 
@@ -35,10 +36,40 @@ func trayNames(params uintptr, index uintptr) map[string]bool {
 	return names
 }
 
+// allocTrayID 分配非零且当前未占用的32位正整数菜单项标识，防止int32溢出
+// 入参: used 当前菜单树已占用的标识集合
+// 返回: int32 新分配的菜单项标识
+func (t *linuxTray) allocTrayID(used map[int32]bool) int32 {
+	for {
+		if t.nextID >= math.MaxInt32 {
+			t.nextID = 1
+		} else {
+			t.nextID++
+		}
+		if t.nextID > 0 && !used[t.nextID] {
+			used[t.nextID] = true
+			return t.nextID
+		}
+	}
+}
+
 // updateMenu 保留现有菜单项的原生标识，移除的标识不再复用，避免旧事件选择新项
 // 入参: options 完整新配置
 func (t *linuxTray) updateMenu(options TrayOptions) {
 	ids := make(map[string]int32, len(options.Items))
+	used := make(map[int32]bool, len(options.Items))
+	var collectUsed func([]TrayItem)
+	collectUsed = func(items []TrayItem) {
+		for _, item := range items {
+			if item.ID != "" {
+				if id, ok := t.ids[item.ID]; ok && id > 0 {
+					used[id] = true
+				}
+			}
+			collectUsed(item.Children)
+		}
+	}
+	collectUsed(options.Items)
 	t.items = make(map[int32]TrayItem, len(options.Items))
 	t.order = make([]int32, 0, len(options.Items))
 	t.children = make(map[int32][]int32)
@@ -47,9 +78,8 @@ func (t *linuxTray) updateMenu(options TrayOptions) {
 	visit = func(items []TrayItem, parent int32) {
 		for _, item := range items {
 			id, ok := t.ids[item.ID]
-			if !ok || item.ID == "" {
-				t.nextID++
-				id = t.nextID
+			if !ok || item.ID == "" || id <= 0 {
+				id = t.allocTrayID(used)
 			}
 			if item.ID != "" {
 				ids[item.ID] = id
@@ -140,7 +170,7 @@ func (t *linuxTray) menuLayout(id, depth int32, names map[string]bool) string {
 	return fmt.Sprintf("(int32 %d, %s, @av [%s])", id, t.itemProperties(id, names), strings.Join(children, ","))
 }
 
-// click 将菜单动作交给调用方的后台回调
+// click 将菜单动作交给调用方的后台回调并隔离异常
 // 入参: id 菜单标识, event 菜单事件
 // 返回: bool 菜单项是否存在
 func (t *linuxTray) click(id int32, event string) bool {
@@ -158,7 +188,9 @@ func (t *linuxTray) click(id int32, event string) bool {
 		}
 	}
 	if event == "clicked" && t.options.OnSelect != nil {
-		go t.options.OnSelect(item.ID)
+		onSelect := t.options.OnSelect
+		itemID := item.ID
+		t.runTrayCallback(func() { onSelect(itemID) })
 	}
 	return true
 }

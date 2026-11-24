@@ -16,9 +16,11 @@
 
 package guigo
 
+import "context"
+
 // newTray 返回未适配平台错误，托盘与窗口宿主的支持范围分别维护
-// 入参: options 托盘配置
+// 入参: ctx 调用上下文, options 托盘配置
 // 返回: *Tray 空句柄, error 平台错误
-func (n *nativeWindow) newTray(options TrayOptions) (*Tray, error) {
+func (n *nativeWindow) newTray(ctx context.Context, options TrayOptions) (*Tray, error) {
 	return nil, ErrUnsupportedPlatform
 }

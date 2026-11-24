@@ -30,8 +30,12 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-// instanceActiveProperty 保存窗口最近一次激活的系统时间
-const instanceActiveProperty = "GUIGo.Instance.Active"
+const (
+	// instanceActiveProperty 保存窗口最近一次激活的系统时间
+	instanceActiveProperty = "GUIGo.Instance.Active"
+	// maxWindowBindHold 限制创建入口后为等待窗口登记而持有跨进程互斥锁的最长时间
+	maxWindowBindHold = 1500 * time.Millisecond
+)
 
 // windowInstanceSequence 区分同一进程创建的不同窗口入口
 var windowInstanceSequence atomic.Uint32
@@ -40,8 +44,16 @@ var windowInstanceSequence atomic.Uint32
 var instanceWindowSearches sync.Map
 
 // enumInstanceWindows 接收同步窗口枚举回调并筛选当前桌面的同组窗口
-var enumInstanceWindows = syscall.NewCallback(func(hwnd, parameter uintptr) uintptr {
-	value, _ := instanceWindowSearches.Load(parameter)
+var enumInstanceWindows = syscall.NewCallback(func(hwnd, parameter uintptr) (result uintptr) {
+	defer func() {
+		if recover() != nil {
+			result = 1
+		}
+	}()
+	value, ok := instanceWindowSearches.Load(parameter)
+	if !ok {
+		return 1
+	}
 	search := value.(*instanceWindowSearch)
 	id, _, _ := user32.NewProc("GetPropW").Call(hwnd, uintptr(unsafe.Pointer(search.property)))
 	if id == 0 || !instanceOnCurrentDesktop(search.manager, hwnd) {
@@ -49,7 +61,7 @@ var enumInstanceWindows = syscall.NewCallback(func(hwnd, parameter uintptr) uint
 	}
 	var pid uint32
 	user32.NewProc("GetWindowThreadProcessId").Call(hwnd, uintptr(unsafe.Pointer(&pid)))
-	activated, _, _ := user32.NewProc("GetPropW").Call(hwnd, uintptr(unsafe.Pointer(wide(instanceActiveProperty))))
+	activated, _, _ := user32.NewProc("GetPropW").Call(hwnd, uintptr(unsafe.Pointer(search.activeProperty)))
 	search.windows = append(search.windows, instanceWindow{hwnd: hwnd, id: id, address: fmt.Sprintf("%s.%d.%d", search.address, pid, id), activated: activated})
 	return 1
 })
@@ -76,17 +88,18 @@ type instanceWindow struct {
 
 // instanceWindowSearch 保存一次窗口枚举的参数和结果
 type instanceWindowSearch struct {
-	property *uint16
-	address  string
-	manager  *comObject
-	windows  []instanceWindow
+	property       *uint16
+	activeProperty *uint16
+	address        string
+	manager        *comObject
+	windows        []instanceWindow
 }
 
-// openWindowInstance 串行选择当前桌面的接收端，新入口登记窗口后释放选择锁
-// 入参: ctx 生命周期上下文, key 调用方实例键, data 消息, receive 接收回调
+// openWindowInstance 串行选择当前桌面的接收端，新入口在有界时间窗内等待登记后释放选择锁
+// 入参: ctx 生命周期上下文, options 归一化实例配置, receive 接收回调
 // 返回: *Instance 新窗口入口或nil, error 创建或转交错误
-func openWindowInstance(ctx context.Context, key string, data []byte, receive func(context.Context, []byte) error) (*Instance, error) {
-	address, err := instanceAddress(key)
+func openWindowInstance(ctx context.Context, options InstanceOptions, receive func(context.Context, []byte) error) (*Instance, error) {
+	address, err := instanceAddress(options.AppID)
 	if err != nil {
 		return nil, err
 	}
@@ -99,7 +112,7 @@ func openWindowInstance(ctx context.Context, key string, data []byte, receive fu
 	go func() {
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
-		request, cancel := context.WithTimeout(ctx, 10*time.Second)
+		request, cancel := context.WithTimeout(ctx, options.Timeout)
 		defer cancel()
 		unlock, err := lockWindowInstances(request, address)
 		if err != nil {
@@ -107,11 +120,15 @@ func openWindowInstance(ctx context.Context, key string, data []byte, receive fu
 			return
 		}
 		defer unlock()
-		instance, err := selectWindowInstance(ctx, request, address, data, receive)
+		instance, err := selectWindowInstance(ctx, request, address, options, receive)
 		done <- result{instance: instance, err: err}
 		if instance != nil {
+			hold := min(options.Timeout, maxWindowBindHold)
+			timer := time.NewTimer(hold)
+			defer timer.Stop()
 			select {
 			case <-instance.listener.(*windowInstance).bound:
+			case <-timer.C:
 			case <-ctx.Done():
 			}
 		}
@@ -156,9 +173,9 @@ func lockWindowInstances(ctx context.Context, address string) (func(), error) {
 }
 
 // selectWindowInstance 按实际桌面和最近激活时间转交，接收端迁移后重新选择
-// 入参: ctx 生命周期上下文, request 转交上下文, address 同组入口前缀, data 消息, receive 接收回调
+// 入参: ctx 生命周期上下文, request 转交上下文, address 同组入口前缀, options 实例配置, receive 接收回调
 // 返回: *Instance 新入口或nil, error 创建或转交错误
-func selectWindowInstance(ctx, request context.Context, address string, data []byte, receive func(context.Context, []byte) error) (*Instance, error) {
+func selectWindowInstance(ctx, request context.Context, address string, options InstanceOptions, receive func(context.Context, []byte) error) (*Instance, error) {
 	hr, _, _ := ole32.NewProc("CoInitializeEx").Call(0, 2)
 	if err := hresult(hr); err != nil {
 		return nil, err
@@ -171,11 +188,12 @@ func selectWindowInstance(ctx, request context.Context, address string, data []b
 		if err := request.Err(); err != nil {
 			return nil, err
 		}
-		search := instanceWindowSearch{property: wide(property), address: address, manager: manager}
+		search := instanceWindowSearch{property: wide(property), activeProperty: wide(instanceActiveProperty), address: address, manager: manager}
 		parameter := uintptr(unsafe.Pointer(&search))
 		instanceWindowSearches.Store(parameter, &search)
 		user32.NewProc("EnumWindows").Call(enumInstanceWindows, parameter)
 		instanceWindowSearches.Delete(parameter)
+		runtime.KeepAlive(search)
 		slices.SortStableFunc(search.windows, func(a, b instanceWindow) int {
 			if a.activated > b.activated {
 				return -1
@@ -195,7 +213,7 @@ func selectWindowInstance(ctx, request context.Context, address string, data []b
 				retry = true
 				break
 			}
-			err = forwardInstance(request, conn, data)
+			err = forwardInstance(request, conn, options.Payload, options.MaxPayloadBytes)
 			if errors.Is(err, errInstanceWindow) {
 				retry = true
 				break
@@ -208,14 +226,14 @@ func selectWindowInstance(ctx, request context.Context, address string, data []b
 		if retry {
 			continue
 		}
-		return newWindowInstance(ctx, address, receive)
+		return newWindowInstance(ctx, address, options, receive)
 	}
 }
 
 // newWindowInstance 创建独立窗口入口，并在接收消息前复核窗口所属桌面
-// 入参: ctx 生命周期上下文, address 同组入口前缀, receive 接收回调
+// 入参: ctx 生命周期上下文, address 同组入口前缀, options 实例配置, receive 接收回调
 // 返回: *Instance 新入口, error 创建错误
-func newWindowInstance(ctx context.Context, address string, receive func(context.Context, []byte) error) (*Instance, error) {
+func newWindowInstance(ctx context.Context, address string, options InstanceOptions, receive func(context.Context, []byte) error) (*Instance, error) {
 	id := uintptr(windowInstanceSequence.Add(1))
 	listener, err := listenInstance(fmt.Sprintf("%s.%d.%d", address, windows.GetCurrentProcessId(), id))
 	if err != nil {
@@ -225,7 +243,7 @@ func newWindowInstance(ctx context.Context, address string, receive func(context
 		return nil, errors.New("instance window entry already exists")
 	}
 	entry := &windowInstance{instanceListener: listener, property: strings.TrimPrefix(address, `\\.\pipe\`), id: id, bound: make(chan struct{})}
-	return startInstance(ctx, entry, func(ctx context.Context, data []byte) error {
+	return startInstance(ctx, entry, options.Timeout, options.MaxPayloadBytes, func(ctx context.Context, data []byte) error {
 		entry.mu.Lock()
 		window, closed := entry.window, entry.closed
 		entry.mu.Unlock()
@@ -254,6 +272,7 @@ func newWindowInstance(ctx context.Context, address string, receive func(context
 func dialWindowInstance(ctx context.Context, candidate instanceWindow, property *uint16, manager *comObject) (instanceConn, error) {
 	for {
 		id, _, _ := user32.NewProc("GetPropW").Call(candidate.hwnd, uintptr(unsafe.Pointer(property)))
+		runtime.KeepAlive(property)
 		if id != candidate.id || !instanceOnCurrentDesktop(manager, candidate.hwnd) {
 			return nil, errInstanceWindow
 		}
@@ -293,9 +312,27 @@ func instanceOnCurrentDesktop(manager *comObject, hwnd uintptr) bool {
 	return hresult(com(manager, 3, hwnd, uintptr(unsafe.Pointer(&current)))) == nil && current != 0
 }
 
-// recordInstanceActivation 更新窗口最近激活时间，不改变窗口位置和桌面
+// removeWindowProps 在窗口所属STA线程移除登记属性
+// 入参: hwnd 窗口句柄, property 同组窗口属性, id 入口编号
+func removeWindowProps(hwnd uintptr, property string, id uintptr) {
+	prop := wide(property)
+	current, _, _ := user32.NewProc("GetPropW").Call(hwnd, uintptr(unsafe.Pointer(prop)))
+	if current == id {
+		user32.NewProc("RemovePropW").Call(hwnd, uintptr(unsafe.Pointer(prop)))
+		user32.NewProc("RemovePropW").Call(hwnd, uintptr(unsafe.Pointer(wide(instanceActiveProperty))))
+	}
+	runtime.KeepAlive(prop)
+}
+
+// recordActivation 在窗口STA线程更新最近激活时间，关闭后忽略
 // 入参: hwnd 窗口句柄
-func recordInstanceActivation(hwnd uintptr) {
+func (l *windowInstance) recordActivation(hwnd uintptr) {
+	l.mu.Lock()
+	active := !l.closed && l.window != nil && l.window.hwnd == hwnd
+	l.mu.Unlock()
+	if !active {
+		return
+	}
 	now, _, _ := kernel32.NewProc("GetTickCount64").Call()
 	user32.NewProc("SetPropW").Call(hwnd, uintptr(unsafe.Pointer(wide(instanceActiveProperty))), max(now, 1))
 }
@@ -317,28 +354,43 @@ func (l *windowInstance) attachWindow(window *nativeWindow) error {
 		return err
 	}
 	l.window = window
-	recordInstanceActivation(window.hwnd)
+	now, _, _ := kernel32.NewProc("GetTickCount64").Call()
+	user32.NewProc("SetPropW").Call(window.hwnd, uintptr(unsafe.Pointer(wide(instanceActiveProperty))), max(now, 1))
 	l.once.Do(func() { close(l.bound) })
 	return nil
 }
 
-// Close 移除窗口登记并关闭入口，释放尚未完成的启动等待
+// detachWindow 在窗口销毁前由STA线程安全移除窗口属性并解绑窗口
+// 入参: window 原生窗口
+func (l *windowInstance) detachWindow(window *nativeWindow) {
+	l.mu.Lock()
+	matched := l.window == window
+	if matched {
+		l.window = nil
+	}
+	l.mu.Unlock()
+	if matched {
+		removeWindowProps(window.hwnd, l.property, l.id)
+	}
+}
+
+// Close 通过窗口STA线程安全移除登记属性并关闭入口，释放尚未完成的启动等待
 // 返回: error 关闭错误
 func (l *windowInstance) Close() error {
 	l.mu.Lock()
+	var window *nativeWindow
 	if !l.closed {
 		l.closed = true
-		if l.window != nil {
-			hwnd := l.window.hwnd
-			property := wide(l.property)
-			id, _, _ := user32.NewProc("GetPropW").Call(hwnd, uintptr(unsafe.Pointer(property)))
-			if id == l.id {
-				user32.NewProc("RemovePropW").Call(hwnd, uintptr(unsafe.Pointer(property)))
-				user32.NewProc("RemovePropW").Call(hwnd, uintptr(unsafe.Pointer(wide(instanceActiveProperty))))
-			}
-		}
+		window = l.window
+		l.window = nil
 	}
 	l.mu.Unlock()
+	if window != nil {
+		_ = window.invoke(func() error {
+			removeWindowProps(window.hwnd, l.property, l.id)
+			return nil
+		})
+	}
 	l.once.Do(func() { close(l.bound) })
 	return l.instanceListener.Close()
 }

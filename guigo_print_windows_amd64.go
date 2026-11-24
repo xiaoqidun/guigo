@@ -78,7 +78,7 @@ func (n *nativeWindow) printCapabilities(ctx context.Context) (PrintCapabilities
 // showPrintUI 将模态请求交给最外层消息循环
 // 入参: ctx 调用上下文, kind 打印窗口类型
 // 返回: error 不支持、取消或窗口调用错误
-func (n *nativeWindow) showPrintUI(ctx context.Context, kind string) error {
+func (n *nativeWindow) showPrintUI(ctx context.Context, kind PrintDialogKind) error {
 	return n.invokeTop(func() error {
 		if n.printActive {
 			return ErrPrintBusy
@@ -92,7 +92,7 @@ func (n *nativeWindow) showPrintUI(ctx context.Context, kind string) error {
 		}
 		defer release(view)
 		value := uintptr(1)
-		if kind == "browser" {
+		if kind == PrintDialogBrowser {
 			value = 0
 		}
 		return hresult(com(view, 114, value))
@@ -123,6 +123,12 @@ func (n *nativeWindow) printSettings(o PrintOptions) (*comObject, error) {
 			failure = hresult(com(settings, index, value))
 		}
 	}
+	setWide := func(index int, value *uint16) {
+		if failure == nil {
+			failure = hresult(com(settings, index, uintptr(unsafe.Pointer(value))))
+			runtime.KeepAlive(value)
+		}
+	}
 	double := func(index int, value float64) {
 		if failure == nil {
 			failure = hresult(comFloat64(settings, index, value))
@@ -130,7 +136,7 @@ func (n *nativeWindow) printSettings(o PrintOptions) (*comObject, error) {
 	}
 	if o.Orientation != "" {
 		value := uintptr(0)
-		if o.Orientation == "landscape" {
+		if o.Orientation == PrintOrientationLandscape {
 			value = 1
 		}
 		set(4, value)
@@ -165,27 +171,27 @@ func (n *nativeWindow) printSettings(o PrintOptions) (*comObject, error) {
 		set(32, uintptr(o.PagesPerSide))
 	}
 	if o.PageRanges != "" {
-		set(30, uintptr(unsafe.Pointer(wide(o.PageRanges))))
+		setWide(30, wide(o.PageRanges))
 	}
 	if o.Printer != "" {
-		set(44, uintptr(unsafe.Pointer(wide(o.Printer))))
+		setWide(44, wide(o.Printer))
 	}
 	if o.Collation != "" {
 		value := uintptr(1)
-		if o.Collation == "uncollated" {
+		if o.Collation == PrintCollationUncollated {
 			value = 2
 		}
 		set(36, value)
 	}
 	if o.Color != "" {
 		value := uintptr(1)
-		if o.Color == "grayscale" {
+		if o.Color == PrintColorModeGrayscale {
 			value = 2
 		}
 		set(38, value)
 	}
 	if o.Duplex != "" {
-		value := map[string]uintptr{"simplex": 1, "longEdge": 2, "shortEdge": 3}[o.Duplex]
+		value := map[PrintDuplex]uintptr{PrintDuplexOneSided: 1, PrintDuplexLongEdge: 2, PrintDuplexShortEdge: 3}[o.Duplex]
 		set(40, value)
 	}
 	if failure != nil {
@@ -239,7 +245,7 @@ func (n *nativeWindow) print(ctx context.Context, o PrintOptions) (PrintResult, 
 			}
 			return 0
 		})
-		defer callbackRelease(cb)
+		defer releaseCallback(cb)
 		n.printActive = true
 		if err := hresult(com(view, 113, uintptr(unsafe.Pointer(settings)), callback)); err != nil {
 			n.printActive = false
