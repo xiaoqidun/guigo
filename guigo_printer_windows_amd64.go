@@ -369,7 +369,7 @@ func (n *nativeWindow) queryPrinter(ctx context.Context, o PrintOptions) (Printe
 // 返回: error 不支持、取消或属性窗口错误
 func (n *nativeWindow) showPrinterProperties(ctx context.Context, name string) error {
 	return n.invokeTop(ctx, func() error {
-		if n.closed || n.quitting || n.quitAfterModal || n.ctx.Err() != nil {
+		if n.closed || n.quitting || n.ctx.Err() != nil {
 			return ErrClosed
 		}
 		if err := ctx.Err(); err != nil {

@@ -94,7 +94,7 @@ func createTrayMenu(items []TrayItem, commands map[uint32]TrayItem, disabled boo
 // 返回: error 菜单创建错误
 func (t *windowsTray) showMenu(position uintptr) error {
 	n := t.owner
-	if n.trays[t.data.ID] != t || n.ctx.Err() != nil || n.closed || n.quitting || n.quitAfterModal || n.activeTrayMenu != nil {
+	if n.trays[t.data.ID] != t || n.ctx.Err() != nil || n.closed || n.quitting || n.activeTrayMenu != nil {
 		return nil
 	}
 	options, revision := t.options, t.revision
@@ -138,7 +138,7 @@ func (t *windowsTray) showMenu(position uintptr) error {
 	user32.NewProc("SetForegroundWindow").Call(n.hwnd)
 	selected, _, _ := user32.NewProc("TrackPopupMenu").Call(menu, flags, uintptr(cursor.X), uintptr(cursor.Y), 0, n.hwnd, 0)
 	user32.NewProc("PostMessageW").Call(n.hwnd, 0, 0, 0)
-	if n.trays[t.data.ID] == t && revision == t.revision && n.ctx.Err() == nil && !n.closed && !n.quitting && !n.quitAfterModal {
+	if n.trays[t.data.ID] == t && revision == t.revision && n.ctx.Err() == nil && !n.closed && !n.quitting {
 		if item, ok := commands[uint32(selected)]; ok && !item.Disabled && options.OnSelect != nil {
 			onSelect := options.OnSelect
 			id := item.ID

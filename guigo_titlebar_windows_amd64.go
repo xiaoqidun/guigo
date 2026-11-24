@@ -583,7 +583,7 @@ func (n *nativeWindow) titleBarProc(hwnd, msg, wparam, lparam uintptr) (uintptr,
 // showTitleBarMenu 在最外层消息循环显示拖动区域的原生窗口菜单并交回系统命令处理
 // 入参: position 屏幕坐标组成的消息参数
 func (n *nativeWindow) showTitleBarMenu(position uintptr) {
-	if n.closed || n.quitting || n.quitAfterModal || n.ctx.Err() != nil || n.activeTrayMenu != nil {
+	if n.closed || n.quitting || n.ctx.Err() != nil || n.activeTrayMenu != nil {
 		return
 	}
 	menu, _, _ := user32.NewProc("GetSystemMenu").Call(n.hwnd, 0)
@@ -614,7 +614,7 @@ func (n *nativeWindow) showTitleBarMenu(position uintptr) {
 	user32.NewProc("SetForegroundWindow").Call(n.hwnd)
 	command, _, _ := user32.NewProc("TrackPopupMenuEx").Call(menu, 0x102, uintptr(x), uintptr(y), n.hwnd, 0)
 	user32.NewProc("PostMessageW").Call(n.hwnd, 0, 0, 0)
-	if command != 0 && !n.closed && !n.quitting && !n.quitAfterModal {
+	if command != 0 && !n.closed && !n.quitting {
 		user32.NewProc("SendMessageW").Call(n.hwnd, 0x112, command, position)
 	}
 }

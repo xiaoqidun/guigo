@@ -1034,7 +1034,7 @@ func (n *nativeWindow) drainTop() {
 	n.topQueue = nil
 	n.mu.Unlock()
 	for _, fn := range queue {
-		if n.closed || n.quitting || n.quitAfterModal {
+		if n.closed || n.quitting {
 			return
 		}
 		fn()

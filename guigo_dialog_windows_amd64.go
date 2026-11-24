@@ -115,9 +115,6 @@ func (n *nativeWindow) dialogs(ctx context.Context, o DialogOptions, mode int) (
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if n.activeDialog != nil {
-			return ErrDialogBusy
-		}
 		clsid := guid("{DC1C5A9C-E88A-4DDE-A5A1-60F82A20AEF7}")
 		iid := guid("{D57C7288-D4AD-4768-BE02-9D969532D960}")
 		if mode == 1 {
@@ -193,7 +190,7 @@ func (n *nativeWindow) dialogs(ctx context.Context, o DialogOptions, mode int) (
 				release(item)
 			}
 		}
-		if n.ctx.Err() != nil || n.quitting || n.quitAfterModal || n.closed {
+		if n.ctx.Err() != nil || n.quitting || n.closed {
 			return ErrClosed
 		}
 		if err := ctx.Err(); err != nil {
@@ -219,7 +216,7 @@ func (n *nativeWindow) dialogs(ctx context.Context, o DialogOptions, mode int) (
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			if n.ctx.Err() != nil || n.quitAfterModal || n.closed {
+			if n.ctx.Err() != nil || n.quitting || n.closed {
 				return ErrClosed
 			}
 			return ErrCanceled
