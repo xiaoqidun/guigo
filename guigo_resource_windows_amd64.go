@@ -82,7 +82,7 @@ func formatHeaders(headers http.Header) string {
 	var header strings.Builder
 	for key, values := range headers {
 		for _, value := range values {
-			if !strings.ContainsAny(key+value, "\r\n\x00") {
+			if key != "" && !strings.ContainsAny(key, " \t\r\n:\x00") && !strings.ContainsAny(value, "\r\n\x00") {
 				fmt.Fprintf(&header, "%s: %s\r\n", key, value)
 			}
 		}

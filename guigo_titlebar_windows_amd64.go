@@ -23,12 +23,14 @@ import (
 	"strconv"
 	"syscall"
 	"unsafe"
+
+	"golang.org/x/sys/windows"
 )
 
 // DWM与GDI延迟加载库及内容标题栏子窗口回调
 var (
-	dwmapi           = syscall.NewLazyDLL("dwmapi.dll")
-	gdi32            = syscall.NewLazyDLL("gdi32.dll")
+	dwmapi           = windows.NewLazySystemDLL("dwmapi.dll")
+	gdi32            = windows.NewLazySystemDLL("gdi32.dll")
 	titleBarCallback = syscall.NewCallback(titleBarChildProc)
 )
 

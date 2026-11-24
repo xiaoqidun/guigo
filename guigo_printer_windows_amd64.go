@@ -29,7 +29,7 @@ import (
 )
 
 // winspool 按需加载Windows打印队列及驱动接口
-var winspool = syscall.NewLazyDLL("winspool.drv")
+var winspool = windows.NewLazySystemDLL("winspool.drv")
 
 // printerInfo4 对应快速枚举打印队列的PRINTER_INFO_4W
 type printerInfo4 struct {
@@ -160,7 +160,7 @@ func queryWindowsPrinter(o PrintOptions) (PrinterProfile, error) {
 	capability := func(code int, output unsafe.Pointer) int {
 		return int(int32(rawCapability(code, output)))
 	}
-	p := PrinterProfile{Printer: PrinterInfo{Name: name, Default: name == windowsDefaultPrinter()}, Papers: []PrintPaper{}, Color: capability(32, nil) == 1, Duplex: capability(7, nil) == 1, MaxCopies: max(1, capability(18, nil)), Properties: true}
+	p := PrinterProfile{Printer: PrinterInfo{Name: name, Default: name == windowsDefaultPrinter()}, Papers: []PrintPaper{}, Color: capability(32, nil) == 1, Duplex: capability(7, nil) == 1, MaxCopies: min(999, max(1, capability(18, nil))), Properties: true}
 	idCount, sizeCount, nameCount := capability(2, nil), capability(3, nil), capability(16, nil)
 	if idCount > 0 && idCount < 4096 && sizeCount > 0 && sizeCount < 4096 && nameCount > 0 && nameCount < 4096 && idCount == sizeCount && idCount == nameCount {
 		ids := make([]uint16, idCount)

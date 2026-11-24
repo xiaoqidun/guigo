@@ -225,7 +225,7 @@ func dialInstance(ctx context.Context, address string) (instanceConn, error) {
 		windows.CloseHandle(pipe)
 		return nil, err
 	}
-	windows.NewLazySystemDLL("user32.dll").NewProc("AllowSetForegroundWindow").Call(uintptr(pid))
+	user32.NewProc("AllowSetForegroundWindow").Call(uintptr(pid))
 	return os.NewFile(uintptr(pipe), address), nil
 }
 

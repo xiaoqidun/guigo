@@ -152,7 +152,7 @@ const bridgeScriptCore = `(() => {
 						const cleanup = () => signal?.removeEventListener("abort", abort);
 						const upload = async () => {
 							try {
-								const response = await fetch("/__guigo/call?id=" + id, {method:"POST", body:transport.body ? await transport.body(body) : body, signal, headers:{"X-Guigo-Length":String(data.size), "X-Guigo-Token":bridgeToken}});
+								const response = await transport.fetch("/__guigo/call?id=" + id, {method:"POST", body:transport.body ? await transport.body(body) : body, signal, headers:{"X-Guigo-Length":String(data.size), "X-Guigo-Token":bridgeToken}});
 								if (!response.ok) throw new Error("binary call failed");
 								settle(await response.json());
 							} catch (error) {

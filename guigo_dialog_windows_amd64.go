@@ -237,6 +237,9 @@ func (n *nativeWindow) dialogs(ctx context.Context, o DialogOptions, mode int) (
 			if err := hresult(com(array, 7, uintptr(unsafe.Pointer(&count)))); err != nil {
 				return err
 			}
+			if count == 0 {
+				return ErrCanceled
+			}
 			for i := uint32(0); i < count; i++ {
 				var item *comObject
 				if err := hresult(com(array, 8, uintptr(i), uintptr(unsafe.Pointer(&item)))); err != nil {

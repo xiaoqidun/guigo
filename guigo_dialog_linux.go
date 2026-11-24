@@ -158,9 +158,6 @@ func (n *nativeWindow) dialog(ctx context.Context, o DialogOptions, mode int) (s
 	if err != nil {
 		return "", err
 	}
-	if len(paths) == 0 {
-		return "", ErrCanceled
-	}
 	return paths[0], nil
 }
 
@@ -244,7 +241,7 @@ func (n *nativeWindow) dialogs(ctx context.Context, o DialogOptions, mode int) (
 					if pattern = strings.TrimSpace(pattern); pattern == "" {
 						continue
 					}
-					if suffix, ok := linuxFilterSuffix(pattern); ok && gtk.FilterSuffix != nil {
+					if suffix, ok := linuxFilterSuffix(pattern); ok {
 						gtk.FilterSuffix(filter, suffix)
 					} else {
 						gtk.FilterPattern(filter, pattern)
@@ -266,9 +263,7 @@ func (n *nativeWindow) dialogs(ctx context.Context, o DialogOptions, mode int) (
 			}
 			if firstFilter != 0 {
 				gtk.DialogFilters(dialog.object, list)
-				if gtk.DialogDefaultFilter != nil {
-					gtk.DialogDefaultFilter(dialog.object, firstFilter)
-				}
+				gtk.DialogDefaultFilter(dialog.object, firstFilter)
 				gtk.Unref(firstFilter)
 			}
 			gtk.Unref(list)

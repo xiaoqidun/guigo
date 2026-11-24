@@ -19,6 +19,7 @@ package guigo
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -38,7 +39,7 @@ import (
 // 内部资源来源、外网拦截规则与页面未就绪时的待发事件上限
 const (
 	resourceOrigin          = "guigo://localhost"
-	linuxBlockExternalRules = `[{"trigger":{"url-filter":"^(https?|wss?|ftp)://"},"action":{"type":"block"}}]`
+	linuxBlockExternalRules = `[{"trigger":{"url-filter":"^http://"},"action":{"type":"block"}},{"trigger":{"url-filter":"^https://"},"action":{"type":"block"}},{"trigger":{"url-filter":"^ws://"},"action":{"type":"block"}},{"trigger":{"url-filter":"^wss://"},"action":{"type":"block"}},{"trigger":{"url-filter":"^ftp://"},"action":{"type":"block"}}]`
 	maxPendingEvents        = 1024
 )
 
@@ -516,15 +517,20 @@ func linuxBridgeScript(bridgeToken, receiveToken string) string {
 		`window.fetch = async (input, options) => {`,
 		`const url = new URL(input instanceof Request ? input.url : input, location.href);`,
 		`if (url.protocol === "guigo:" && url.host === "localhost") {`,
-		`if (options?.body instanceof Blob) options = {...options, body:await options.body.arrayBuffer()};`,
-		`else if (input instanceof Request && options?.body === undefined && input.method !== "GET" && input.method !== "HEAD") {`,
-		`options = {...options, body:await input.clone().arrayBuffer()};`,
+		`if (options?.body instanceof Blob) {`,
+		`const headers = new Headers(options.headers ?? (input instanceof Request ? input.headers : undefined));`,
+		`if (options.body.type && !headers.has("Content-Type")) headers.set("Content-Type", options.body.type);`,
+		`options = {...options, headers, body:await options.body.arrayBuffer()};`,
+		`} else if (input instanceof Request && options?.body === undefined && input.method !== "GET" && input.method !== "HEAD") {`,
+		`const body = await input.clone().arrayBuffer();`,
+		`if (body.byteLength) options = {...options, body};`,
 		`}`,
 		`}`,
 		`return nativeFetch(input, options);`,
 		`};`,
 		`let receive;`,
 		`const transport = {`,
+		`fetch: nativeFetch,`,
 		`postMessage: message => window.webkit.messageHandlers.guigo.postMessage(JSON.stringify({...message, token: bridgeToken})),`,
 		`addEventListener: (name, listener) => { receive = listener; },`,
 		`body: blob => blob.arrayBuffer()`,
@@ -617,7 +623,7 @@ func linuxMessage(manager, value, data uintptr) {
 		n.reportError(err)
 		return
 	}
-	if received.Token != n.bridgeToken {
+	if subtle.ConstantTimeCompare([]byte(received.Token), []byte(n.bridgeToken)) != 1 {
 		return
 	}
 	message := received.envelope

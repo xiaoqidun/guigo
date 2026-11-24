@@ -18,6 +18,7 @@ package guigo
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"io"
@@ -137,7 +138,7 @@ func linuxResource(request, data uintptr) {
 			return
 		}
 		if req.URL.Path == "/__guigo/call" {
-			if req.Header.Get("X-Guigo-Token") != n.bridgeToken {
+			if subtle.ConstantTimeCompare([]byte(req.Header.Get("X-Guigo-Token")), []byte(n.bridgeToken)) != 1 {
 				http.Error(w, "Forbidden", 403)
 				return
 			}
@@ -382,7 +383,7 @@ func (n *nativeWindow) sendResponse(request, stream uintptr, size int64, status 
 	nativeHeaders := gtk.HeadersNew(1)
 	for key, values := range headers {
 		for _, value := range values {
-			if !strings.ContainsAny(key+value, "\r\n\x00") {
+			if key != "" && !strings.ContainsAny(key, " \t\r\n:\x00") && !strings.ContainsAny(value, "\r\n\x00") {
 				gtk.HeadersAppend(nativeHeaders, key, value)
 			}
 		}

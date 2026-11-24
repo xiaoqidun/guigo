@@ -200,7 +200,7 @@ type linuxAPI struct {
 	DialogFile          func(uintptr, uintptr)                                                    `symbol:"gtk_file_dialog_set_initial_file"`
 	DialogName          func(uintptr, string)                                                     `symbol:"gtk_file_dialog_set_initial_name"`
 	DialogFilters       func(uintptr, uintptr)                                                    `symbol:"gtk_file_dialog_set_filters"`
-	DialogDefaultFilter func(uintptr, uintptr)                                                    `symbol:"gtk_file_dialog_set_default_filter" optional:"true"`
+	DialogDefaultFilter func(uintptr, uintptr)                                                    `symbol:"gtk_file_dialog_set_default_filter"`
 	DialogOpen          func(uintptr, uintptr, uintptr, uintptr, uintptr)                         `symbol:"gtk_file_dialog_open"`
 	DialogSave          func(uintptr, uintptr, uintptr, uintptr, uintptr)                         `symbol:"gtk_file_dialog_save"`
 	DialogDirectory     func(uintptr, uintptr, uintptr, uintptr, uintptr)                         `symbol:"gtk_file_dialog_select_folder"`
@@ -213,7 +213,7 @@ type linuxAPI struct {
 	FilterNew           func() uintptr                                                            `symbol:"gtk_file_filter_new"`
 	FilterName          func(uintptr, string)                                                     `symbol:"gtk_file_filter_set_name"`
 	FilterPattern       func(uintptr, string)                                                     `symbol:"gtk_file_filter_add_pattern"`
-	FilterSuffix        func(uintptr, string)                                                     `symbol:"gtk_file_filter_add_suffix" optional:"true"`
+	FilterSuffix        func(uintptr, string)                                                     `symbol:"gtk_file_filter_add_suffix"`
 	ListNew             func(uintptr) uintptr                                                     `symbol:"g_list_store_new"`
 	ListAppend          func(uintptr, uintptr)                                                    `symbol:"g_list_store_append"`
 	ListCount           func(uintptr) uint32                                                      `symbol:"g_list_model_get_n_items"`
@@ -344,9 +344,6 @@ func loadLinux(path string) error {
 			}
 		}
 		if address == 0 {
-			if field.Tag.Get("optional") == "true" {
-				continue
-			}
 			return fmt.Errorf("%w: GTK >= 4.10 and WebKitGTK 6.0 required: missing %s", ErrRuntimeUnavailable, name)
 		}
 		purego.RegisterFunc(value.Field(i).Addr().Interface(), address)

@@ -36,15 +36,15 @@ const (
 	temporaryFileFlags  = 0x100 | 0x04000000
 )
 
-// 原生IStream根表、虚函数表、缓存接口标识与常驻MTA调度状态
+// 原生IStream根表、虚函数表、标准COM接口标识与常驻MTA调度状态
 var (
 	streamRoots         sync.Map
 	streamTable         [14]uintptr
-	iidUnknown          syscall.GUID
-	iidMarshal          syscall.GUID
-	iidStream           syscall.GUID
-	iidSequentialStream syscall.GUID
-	iidAgileObject      syscall.GUID
+	iidUnknown          = syscall.GUID{Data1: 0x00000000, Data2: 0x0000, Data3: 0x0000, Data4: [8]byte{0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}}
+	iidMarshal          = syscall.GUID{Data1: 0x00000003, Data2: 0x0000, Data3: 0x0000, Data4: [8]byte{0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}}
+	iidStream           = syscall.GUID{Data1: 0x0000000C, Data2: 0x0000, Data3: 0x0000, Data4: [8]byte{0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}}
+	iidSequentialStream = syscall.GUID{Data1: 0x0C733A30, Data2: 0x2A1C, Data3: 0x11CE, Data4: [8]byte{0xAD, 0xE5, 0x00, 0xAA, 0x00, 0x44, 0x77, 0x3D}}
+	iidAgileObject      = syscall.GUID{Data1: 0x94EA2B94, Data2: 0xE9CC, Data3: 0x49E0, Data4: [8]byte{0xC0, 0xFF, 0xEE, 0x64, 0xCA, 0x8F, 0x5B, 0x90}}
 	mtaMu               sync.Mutex
 	mtaQueue            chan mtaTask
 )
@@ -105,7 +105,7 @@ type streamStat struct {
 	Reserved uint32
 }
 
-// init 固定原生流回调入口并缓存常用COM接口标识
+// init 固定原生流回调入口
 func init() {
 	streamTable = [14]uintptr{
 		syscall.NewCallback(streamQuery),
@@ -123,11 +123,6 @@ func init() {
 		syscall.NewCallback(streamGetStat),
 		syscall.NewCallback(streamClone),
 	}
-	iidUnknown = guid("{00000000-0000-0000-C000-000000000046}")
-	iidMarshal = guid("{00000003-0000-0000-C000-000000000046}")
-	iidStream = guid("{0000000C-0000-0000-C000-000000000046}")
-	iidSequentialStream = guid("{0C733A30-2A1C-11CE-ADE5-00AA0044773D}")
-	iidAgileObject = guid("{94EA2B94-E9CC-49E0-C0FF-EE64CA8F5B90}")
 }
 
 // runOnMTA 在进程常驻MTA线程执行操作并隔离异常，遇到被污染的STA线程时销毁重试

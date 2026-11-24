@@ -42,10 +42,10 @@ const (
 
 // Win32与COM延迟加载库、当前宿主状态及原生回调入口
 var (
-	user32        = syscall.NewLazyDLL("user32.dll")
-	ole32         = syscall.NewLazyDLL("ole32.dll")
-	shell32       = syscall.NewLazyDLL("shell32.dll")
-	kernel32      = syscall.NewLazyDLL("kernel32.dll")
+	user32        = windows.NewLazySystemDLL("user32.dll")
+	ole32         = windows.NewLazySystemDLL("ole32.dll")
+	shell32       = windows.NewLazySystemDLL("shell32.dll")
+	kernel32      = windows.NewLazySystemDLL("kernel32.dll")
 	active        atomic.Pointer[nativeWindow]
 	wndCallback   = syscall.NewCallback(windowProc)
 	callbackTable = [4]uintptr{
@@ -444,7 +444,9 @@ func buildWindowsBridgeScript(token string, dropEnabled bool) string {
 		`const bridgeToken = ` + encoded + `;`,
 		`const dropEnabled = ` + drop + `;`,
 		`const webview = chrome.webview;`,
+		`const nativeFetch = window.fetch.bind(window);`,
 		`const transport = {`,
+		`fetch: nativeFetch,`,
 		`postMessage: message => webview.postMessage({...message, token: bridgeToken}),`,
 		`addEventListener: (name, listener) => webview.addEventListener(name, listener),`,
 		`postMessageWithAdditionalObjects: webview.postMessageWithAdditionalObjects ? (message, files) => webview.postMessageWithAdditionalObjects({...message, token: bridgeToken}, files) : null`,
