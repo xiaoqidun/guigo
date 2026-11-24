@@ -17,11 +17,20 @@ package guigo
 import (
 	"net/http"
 	"net/url"
+	"path"
 	"strings"
 )
 
 // fileHandler 标识由宿主选项自动创建的静态文件处理器
 type fileHandler struct{ http.Handler }
+
+// isReservedPath 判断请求路径是否命中宿主保留前缀/__guigo/
+// 入参: raw 原始路径
+// 返回: bool 是否属于保留前缀
+func isReservedPath(raw string) bool {
+	clean := path.Clean("/" + strings.TrimPrefix(raw, "/"))
+	return clean == "/__guigo" || strings.HasPrefix(clean, "/__guigo/")
+}
 
 // normalizedPort 归一化常见协议的默认端口，便于精确比较同源地址
 // 入参: scheme 协议名称, port 原始端口字符串

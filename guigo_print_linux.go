@@ -19,6 +19,8 @@ package guigo
 import (
 	"context"
 	"fmt"
+	"math"
+	"runtime"
 	"strconv"
 	"sync"
 	"unsafe"
@@ -26,14 +28,34 @@ import (
 	"github.com/ebitengine/purego"
 )
 
-// linuxPrintOperations 保存尚未结束消费内容的原生打印对象
-var linuxPrintOperations sync.Map
+// 原生打印作业表与GTK打印信号回调地址
+var (
+	linuxPrintOperations       sync.Map
+	linuxPrintFinishedCallback = purego.NewCallback(linuxPrintFinished)
+	linuxPrintFailedCallback   = purego.NewCallback(linuxPrintFailed)
+)
 
-// linuxPrintFinishedCallback 保存GTK打印完成回调地址
-var linuxPrintFinishedCallback = purego.NewCallback(linuxPrintFinished)
+// linuxStandardPaper 描述GTK支持的标准纸张名称与未旋转毫米尺寸
+type linuxStandardPaper struct {
+	name          string
+	width, height float64
+}
 
-// linuxPrintFailedCallback 保存GTK打印失败回调地址
-var linuxPrintFailedCallback = purego.NewCallback(linuxPrintFailed)
+// linuxStandardPapers 保存常见ISO、JIS与北美标准纸张规格表
+var linuxStandardPapers = []linuxStandardPaper{
+	{name: "iso_a3", width: 297, height: 420},
+	{name: "iso_a4", width: 210, height: 297},
+	{name: "iso_a5", width: 148, height: 210},
+	{name: "iso_a6", width: 105, height: 148},
+	{name: "iso_b4", width: 250, height: 353},
+	{name: "iso_b5", width: 176, height: 250},
+	{name: "jis_b4", width: 257, height: 364},
+	{name: "jis_b5", width: 182, height: 257},
+	{name: "na_letter", width: 215.9, height: 279.4},
+	{name: "na_legal", width: 215.9, height: 355.6},
+	{name: "na_executive", width: 184.15, height: 266.7},
+	{name: "na_ledger", width: 279.4, height: 431.8},
+}
 
 // linuxPrintOperation 持有底层消费内容期间的打印对象
 type linuxPrintOperation struct {
@@ -82,17 +104,25 @@ func linuxEndPrint(operation uintptr, failure error) {
 	}
 }
 
+// linuxPaperSize 优先匹配GTK标准纸张规格，未命中时回退为自定义纸张
+// 入参: width 纸张毫米宽度, height 纸张毫米高度
+// 返回: uintptr 原生纸张对象
+func linuxPaperSize(width, height float64) uintptr {
+	for _, spec := range linuxStandardPapers {
+		if math.Abs(width-spec.width) <= 0.5 && math.Abs(height-spec.height) <= 0.5 {
+			if paper := gtk.PaperStandard(spec.name); paper != 0 {
+				return paper
+			}
+		}
+	}
+	return gtk.PaperNew("guigo-custom", "Custom", width, height, 3)
+}
+
 // printCapabilities 返回WebKitGTK支持的通用打印机制
 // 入参: ctx 查询上下文
 // 返回: PrintCapabilities 打印机制能力, error 查询或取消错误
 func (n *nativeWindow) printCapabilities(ctx context.Context) (PrintCapabilities, error) {
-	if err := ctx.Err(); err != nil {
-		return PrintCapabilities{}, err
-	}
-	n.mu.Lock()
-	closed := n.closed
-	n.mu.Unlock()
-	if closed {
+	if n.isClosed() {
 		return PrintCapabilities{}, ErrClosed
 	}
 	return PrintCapabilities{SystemDialog: true, DialogCompletion: true, Direct: true, PageRanges: true, DeviceSettings: true}, nil
@@ -102,6 +132,9 @@ func (n *nativeWindow) printCapabilities(ctx context.Context) (PrintCapabilities
 // 入参: ctx 调用上下文, kind 打印窗口类型
 // 返回: error 不支持、取消或窗口调用错误
 func (n *nativeWindow) showPrintUI(ctx context.Context, kind PrintDialogKind) error {
+	if n.isClosed() {
+		return ErrClosed
+	}
 	if kind != PrintDialogSystem {
 		return ErrPrintUnsupported
 	}
@@ -116,10 +149,13 @@ func (n *nativeWindow) print(ctx context.Context, o PrintOptions) (PrintResult, 
 	return n.runPrint(ctx, o, false)
 }
 
-// runPrint 在GTK线程配置、调起并跟踪一次打印，持额外引用防止模态期间释放引发UAF
+// runPrint 在GTK线程配置、调起并跟踪一次打印，模态结束时与关闭流程协同退出主循环
 // 入参: ctx 调用上下文, o 设备打印选项, dialog 是否显示系统窗口
 // 返回: PrintResult 提交结果, error 配置、提交或取消错误
 func (n *nativeWindow) runPrint(ctx context.Context, o PrintOptions, dialog bool) (PrintResult, error) {
+	if n.isClosed() {
+		return PrintResult{}, ErrClosed
+	}
 	if o.HeadersFooters != nil && *o.HeadersFooters || o.Backgrounds != nil {
 		return PrintResult{}, ErrPrintUnsupported
 	}
@@ -147,9 +183,7 @@ func (n *nativeWindow) runPrint(ctx context.Context, o PrintOptions, dialog bool
 			return
 		}
 		settings := gtk.PrintSettingsNew()
-		setup := gtk.PageSetupNew()
 		defer gtk.Unref(settings)
-		defer gtk.Unref(setup)
 		set := func(key, value string) {
 			if value != "" {
 				gtk.PrintSet(settings, key, value)
@@ -187,27 +221,32 @@ func (n *nativeWindow) runPrint(ctx context.Context, o PrintOptions, dialog bool
 			}
 			set("print-pages", "ranges")
 			gtk.PrintRanges(settings, unsafe.Pointer(&ranges[0]), int32(len(ranges)))
-		}
-		if o.Width > 0 {
-			paper := gtk.PaperNew("guigo-custom", "Custom", o.Width, o.Height, 3)
-			gtk.PagePaper(setup, paper)
-			gtk.PaperFree(paper)
-		}
-		if o.Orientation != "" {
-			orientation := int32(0)
-			if o.Orientation == PrintOrientationLandscape {
-				orientation = 1
-			}
-			gtk.PageOrientation(setup, orientation)
-		}
-		if o.Margins != nil {
-			gtk.PageTop(setup, o.Margins.Top, 3)
-			gtk.PageBottom(setup, o.Margins.Bottom, 3)
-			gtk.PageLeft(setup, o.Margins.Left, 3)
-			gtk.PageRight(setup, o.Margins.Right, 3)
+			runtime.KeepAlive(ranges)
 		}
 		gtk.PrintSettings(operation, settings)
-		gtk.PrintPageSetup(operation, setup)
+		if o.Width > 0 || o.Orientation != "" || o.Margins != nil {
+			setup := gtk.PageSetupNew()
+			defer gtk.Unref(setup)
+			if o.Width > 0 {
+				paper := linuxPaperSize(o.Width, o.Height)
+				gtk.PagePaper(setup, paper)
+				gtk.PaperFree(paper)
+			}
+			if o.Orientation != "" {
+				orientation := int32(0)
+				if o.Orientation == PrintOrientationLandscape {
+					orientation = 1
+				}
+				gtk.PageOrientation(setup, orientation)
+			}
+			if o.Margins != nil {
+				gtk.PageTop(setup, o.Margins.Top, 3)
+				gtk.PageBottom(setup, o.Margins.Bottom, 3)
+				gtk.PageLeft(setup, o.Margins.Left, 3)
+				gtk.PageRight(setup, o.Margins.Right, 3)
+			}
+			gtk.PrintPageSetup(operation, setup)
+		}
 		job := &linuxPrintOperation{owner: n, result: result}
 		job.failed = gtk.Connect(operation, "failed", linuxPrintFailedCallback, 0, 0, 0)
 		job.finished = gtk.Connect(operation, "finished", linuxPrintFinishedCallback, 0, 0, 0)
@@ -218,9 +257,9 @@ func (n *nativeWindow) runPrint(ctx context.Context, o PrintOptions, dialog bool
 			n.printModalDepth++
 			defer func() {
 				n.printModalDepth--
-				if n.printModalDepth == 0 && n.quitPending && len(n.dialogsPending) == 0 {
+				if n.printModalDepth == 0 && n.quitPending {
 					n.quitPending = false
-					gtk.LoopQuit(n.loop)
+					n.shutdown()
 				}
 			}()
 			if gtk.PrintDialog(operation, n.window) != 0 {

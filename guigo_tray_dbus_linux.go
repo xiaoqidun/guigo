@@ -19,6 +19,7 @@ package guigo
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"sync"
@@ -27,14 +28,12 @@ import (
 	"github.com/ebitengine/purego"
 )
 
-// gdbus 保存托盘总线入口
-var gdbus gdbusAPI
-
-// gdbusOnce 保证托盘总线入口和回调只初始化一次
-var gdbusOnce sync.Once
-
-// gdbusError 保存托盘总线加载错误
-var gdbusError error
+// 托盘总线原生入口与按需初始化状态
+var (
+	gdbus      gdbusAPI
+	gdbusOnce  sync.Once
+	gdbusError error
+)
 
 // gdbusAPI 保存系统GIO和GLib的定长参数入口，避免C可变参数调用
 type gdbusAPI struct {
@@ -59,6 +58,8 @@ type gdbusAPI struct {
 	Parse           func(uintptr, string, uintptr, uintptr, **linuxError) uintptr                                                 `symbol:"g_variant_parse"`
 	VariantRef      func(uintptr) uintptr                                                                                         `symbol:"g_variant_ref"`
 	Unref           func(uintptr)                                                                                                 `symbol:"g_variant_unref"`
+	TypeString      func(uintptr) *byte                                                                                           `symbol:"g_variant_get_type_string"`
+	IsContainer     func(uintptr) int32                                                                                           `symbol:"g_variant_is_container"`
 	Child           func(uintptr, uintptr) uintptr                                                                                `symbol:"g_variant_get_child_value"`
 	Count           func(uintptr) uintptr                                                                                         `symbol:"g_variant_n_children"`
 	Int             func(uintptr) int32                                                                                           `symbol:"g_variant_get_int32"`
@@ -67,7 +68,7 @@ type gdbusAPI struct {
 	String          func(uintptr, uintptr) *byte                                                                                  `symbol:"g_variant_get_string"`
 }
 
-// loadGDBus 按需绑定GTK运行时已有的GIO和GLib，不引入额外Go模块或系统组件
+// loadGDBus 按需加载系统GIO与GLib动态库并绑定托盘总线符号及原生回调
 // 返回: error 动态库或符号加载错误
 func loadGDBus() error {
 	gdbusOnce.Do(func() {
@@ -137,7 +138,7 @@ func trayVariant(text string) (uintptr, error) {
 // 入参: ctx 调用上下文
 // 返回: uintptr 原生取消对象, func() 释放清理函数
 func trayCancellable(ctx context.Context) (uintptr, func()) {
-	if ctx == nil || ctx.Done() == nil {
+	if ctx.Done() == nil {
 		return 0, func() {}
 	}
 	cancel := gtk.CancelNew()
@@ -166,10 +167,11 @@ func trayCancellable(ctx context.Context) (uintptr, func()) {
 // 入参: ctx 调用上下文, connection 总线连接, destination 总线名, path 对象路径, iface 接口, method 方法, args 参数文本
 // 返回: uintptr 响应, error 远端或通信错误
 func trayCall(ctx context.Context, connection uintptr, destination, path, iface, method, args string) (uintptr, error) {
-	if ctx != nil {
-		if err := ctx.Err(); err != nil {
-			return 0, err
-		}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if connection == 0 {
+		return 0, errors.New("invalid DBus connection")
 	}
 	params, err := trayVariant(args)
 	if err != nil {
@@ -181,11 +183,14 @@ func trayCall(ctx context.Context, connection uintptr, destination, path, iface,
 	var failure *linuxError
 	value := gdbus.Call(connection, destination, path, iface, method, params, 0, 0, 3000, cancel, &failure)
 	if value == 0 {
-		if ctx != nil && ctx.Err() != nil {
+		if ctx.Err() != nil {
 			_ = nativeError(failure)
 			return 0, ctx.Err()
 		}
-		return 0, nativeError(failure)
+		if err := nativeError(failure); err != nil {
+			return 0, err
+		}
+		return 0, errors.New("empty DBus reply")
 	}
 	return value, nil
 }
@@ -206,39 +211,71 @@ func trayEmit(connection uintptr, path, iface, signal, args string) error {
 	return nil
 }
 
-// trayString 复制元组中的字符串并释放临时子值
-// 入参: value 元组, index 子值位置
-// 返回: string 字符串内容
-func trayString(value uintptr, index uintptr) string {
-	child := gdbus.Child(value, index)
-	defer gdbus.Unref(child)
-	return nativeString(gdbus.String(child, 0))
+// trayType 读取非零GVariant的类型签名字符串
+// 入参: value 原生GVariant指针
+// 返回: string 类型签名
+func trayType(value uintptr) string {
+	if value == 0 {
+		return ""
+	}
+	return nativeString(gdbus.TypeString(value))
 }
 
-// trayInt 读取元组中的32位整数并释放临时子值
-// 入参: value 元组, index 子值位置
-// 返回: int32 整数值
-func trayInt(value uintptr, index uintptr) int32 {
-	child := gdbus.Child(value, index)
+// trayChild 在校验非零、容器类型与索引越界后读取子值，调用者释放返回值
+// 入参: value 容器GVariant, index 子值位置
+// 返回: uintptr 子值指针，无效时返回0
+func trayChild(value, index uintptr) uintptr {
+	if value == 0 || gdbus.IsContainer(value) == 0 || index >= gdbus.Count(value) {
+		return 0
+	}
+	return gdbus.Child(value, index)
+}
+
+// trayString 安全读取容器中的字符串子值并校验类型
+// 入参: value 容器GVariant, index 子值位置
+// 返回: string 字符串内容, bool 是否成功读取
+func trayString(value, index uintptr) (string, bool) {
+	child := trayChild(value, index)
+	if child == 0 {
+		return "", false
+	}
 	defer gdbus.Unref(child)
-	return gdbus.Int(child)
+	switch trayType(child) {
+	case "s", "o", "g":
+		return nativeString(gdbus.String(child, 0)), true
+	default:
+		return "", false
+	}
+}
+
+// trayInt 安全读取容器中的32位整数子值并校验类型
+// 入参: value 容器GVariant, index 子值位置
+// 返回: int32 整数值, bool 是否成功读取
+func trayInt(value, index uintptr) (int32, bool) {
+	child := trayChild(value, index)
+	if child == 0 {
+		return 0, false
+	}
+	defer gdbus.Unref(child)
+	if trayType(child) != "i" {
+		return 0, false
+	}
+	return gdbus.Int(child), true
 }
 
 // trayConnection 创建独立会话总线连接，关闭托盘不会影响GTK共享连接
 // 入参: ctx 调用上下文
 // 返回: uintptr 调用方拥有的连接引用, error 连接错误
 func trayConnection(ctx context.Context) (uintptr, error) {
-	if ctx != nil {
-		if err := ctx.Err(); err != nil {
-			return 0, err
-		}
+	if err := ctx.Err(); err != nil {
+		return 0, err
 	}
 	cancel, cleanup := trayCancellable(ctx)
 	defer cleanup()
 	var failure *linuxError
 	address := gdbus.Address(2, cancel, &failure)
 	if address == nil {
-		if ctx != nil && ctx.Err() != nil {
+		if ctx.Err() != nil {
 			_ = nativeError(failure)
 			return 0, ctx.Err()
 		}
@@ -247,7 +284,7 @@ func trayConnection(ctx context.Context) (uintptr, error) {
 	defer gtk.Free(unsafe.Pointer(address))
 	connection := gdbus.Connect(nativeString(address), 9, 0, cancel, &failure)
 	if connection == 0 {
-		if ctx != nil && ctx.Err() != nil {
+		if ctx.Err() != nil {
 			_ = nativeError(failure)
 			return 0, ctx.Err()
 		}
@@ -266,16 +303,31 @@ func trayHost(ctx context.Context, connection uintptr) (string, error) {
 		return "", err
 	}
 	defer gdbus.Unref(reply)
-	owner := trayString(reply, 0)
+	owner, ok := trayString(reply, 0)
+	if !ok || owner == "" {
+		return "", errors.New("invalid DBus name owner reply")
+	}
 	property, err := trayCall(ctx, connection, owner, "/StatusNotifierWatcher", "org.freedesktop.DBus.Properties", "Get", `("org.kde.StatusNotifierWatcher", "IsStatusNotifierHostRegistered")`)
 	if err != nil {
 		return "", err
 	}
 	defer gdbus.Unref(property)
-	child := gdbus.Child(property, 0)
+	child := trayChild(property, 0)
+	if child == 0 {
+		return "", errors.New("invalid DBus property reply")
+	}
 	defer gdbus.Unref(child)
+	if trayType(child) != "v" {
+		return "", errors.New("unexpected DBus property type")
+	}
 	value := gdbus.Variant(child)
+	if value == 0 {
+		return "", errors.New("empty DBus variant value")
+	}
 	defer gdbus.Unref(value)
+	if trayType(value) != "b" {
+		return "", errors.New("unexpected tray host state type")
+	}
 	if gdbus.Boolean(value) == 0 {
 		return "", ErrTrayUnavailable
 	}

@@ -21,10 +21,10 @@ import "context"
 // nativeWindow 提供未适配平台的宿主占位类型
 type nativeWindow struct{}
 
-// SupportsWindowMaterial 查询当前平台是否提供指定窗口材质
+// supportsWindowMaterial 查询当前平台是否提供指定窗口材质
 // 入参: material 窗口材质
 // 返回: bool 未适配平台返回false
-func SupportsWindowMaterial(material WindowMaterial) bool {
+func supportsWindowMaterial(material WindowMaterial) bool {
 	return false
 }
 
@@ -175,4 +175,11 @@ func (n *nativeWindow) setTitleBarColors(colors TitleBarColors) error {
 // 返回: error 平台错误
 func (n *nativeWindow) setWindowMaterial(material WindowMaterial) error {
 	return ErrUnsupportedPlatform
+}
+
+// newTray 返回未适配平台错误
+// 入参: ctx 调用上下文, options 托盘配置
+// 返回: *Tray 空句柄, error 平台错误
+func (n *nativeWindow) newTray(ctx context.Context, options TrayOptions) (*Tray, error) {
+	return nil, ErrUnsupportedPlatform
 }

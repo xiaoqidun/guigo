@@ -33,46 +33,32 @@ var ErrAssociationElevationRequired = errors.New("administrator privileges requi
 // AssociationScope 指定独立管理的文件关联范围
 type AssociationScope string
 
-// FileAssociation 定义应用支持的文件类型
+// FileAssociation 定义应用支持的文件类型，ID在应用内唯一，Extensions为不重复的小写带点扩展名
 type FileAssociation struct {
-	// ID 指定应用内唯一类型标识，最终ProgID由AppID和ID以点连接
-	ID string
-	// Name 指定文件类型的显示名称
-	Name string
-	// Extensions 指定带点的扩展名，同一配置内不重复
+	ID         string
+	Name       string
 	Extensions []string
 }
 
-// AssociationOptions 定义应用专用注册表资源，由调用方保持标识和类型集合稳定
-// 应用能力保存在Software\<AppID>.FileAssociations，文件类型保存在Software\Classes\<AppID>.<ID>
-// 撤销会整树删除专用键，不保留其中自行添加或修改的内容
+// AssociationOptions 定义应用专用文件关联资源，由调用方保持标识和类型集合稳定
+// Executable为程序绝对路径，Arguments为文件路径前的固定参数，撤销会整树删除专用键
 type AssociationOptions struct {
-	// AppID 指定应用标识及专用注册表键名
-	AppID string
-	// Name 指定系统显示的应用名称
-	Name string
-	// Description 指定系统默认应用设置中的说明
+	AppID       string
+	Name        string
 	Description string
-	// Executable 指定现有程序的绝对路径，不复制程序
-	Executable string
-	// Arguments 指定文件路径之前的固定启动参数
-	Arguments []string
-	// IconIndex 指定可执行文件内的图标索引
-	IconIndex int
-	// Types 指定需要登记的完整文件类型集合
-	Types []FileAssociation
+	Executable  string
+	Arguments   []string
+	IconIndex   int
+	Types       []FileAssociation
 }
 
 // AssociationStatus 描述指定范围内的登记状态，不代表用户已选择为默认应用
+// Supported表示平台支持，Registered表示存在登记，Complete表示与当前配置一致，Writable表示当前权限可写
 type AssociationStatus struct {
-	// Supported 表示当前平台实现了文件关联
-	Supported bool `json:"supported"`
-	// Registered 表示该范围仍有本应用的登记资源
+	Supported  bool `json:"supported"`
 	Registered bool `json:"registered"`
-	// Complete 表示类型和打开命令与当前配置完全一致
-	Complete bool `json:"complete"`
-	// Writable 表示当前进程权限允许操作该范围，实际写入仍可能失败
-	Writable bool `json:"writable"`
+	Complete   bool `json:"complete"`
+	Writable   bool `json:"writable"`
 }
 
 // QueryFileAssociations 查询指定范围的登记状态，不修改注册表
@@ -112,12 +98,17 @@ func validateAssociation(o AssociationOptions, scope AssociationScope) error {
 	if scope != AssociationUser && scope != AssociationMachine {
 		return errors.New("invalid association scope")
 	}
-	if validateAppID(o.AppID) != nil || !filepath.IsAbs(o.Executable) || strings.ContainsAny(o.Executable, "\x00\r\n\"") || o.Name == "" || o.Description == "" || len(o.Types) == 0 {
+	if validateAppID(o.AppID) != nil || !filepath.IsAbs(o.Executable) || strings.ContainsAny(o.Executable, "\x00\r\n\"%") || strings.HasSuffix(o.Executable, `\`) || o.Name == "" || o.Description == "" || len(o.Types) == 0 {
 		return errors.New("invalid association options")
 	}
-	for _, value := range append([]string{o.Name, o.Description}, o.Arguments...) {
+	for _, value := range []string{o.Name, o.Description} {
 		if strings.ContainsAny(value, "\x00\r\n") {
 			return errors.New("association text contains invalid control characters")
+		}
+	}
+	for _, value := range o.Arguments {
+		if strings.ContainsAny(value, "\x00\r\n%") {
+			return errors.New("association argument contains invalid characters")
 		}
 	}
 	ids, extensions := make(map[string]bool), make(map[string]bool)

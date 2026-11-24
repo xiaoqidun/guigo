@@ -34,25 +34,24 @@ const (
 	// TitleBarSystem 使用系统标题栏，为默认值
 	TitleBarSystem TitleBarMode = iota
 	// TitleBarContent 将内容延伸到标题栏，保留系统窗口按钮
-	// Windows下禁用浏览器缩放和捏合缩放，避免内容与系统按钮错位
 	TitleBarContent
 )
 
 const (
 	// WindowSolid 使用纯色窗口材质，为默认值
 	WindowSolid WindowMaterial = iota
-	// WindowMicaAlt 使用云母Alt窗口材质，对应Windows的DWMSBT_TABBEDWINDOW
+	// WindowMicaAlt 使用云母Alt窗口材质
 	WindowMicaAlt
-	// WindowAcrylic 使用亚克力窗口材质，对应Windows的DWMSBT_TRANSIENTWINDOW
+	// WindowAcrylic 使用亚克力窗口材质
 	WindowAcrylic
 )
 
 var (
 	// ErrUnsupportedPlatform 表示当前平台没有可用宿主实现
 	ErrUnsupportedPlatform = errors.New("unsupported platform")
-	// ErrCanceled 表示用户取消对话框
+	// ErrCanceled 表示用户取消操作
 	ErrCanceled = errors.New("dialog canceled")
-	// ErrClosed 表示窗口已经关闭
+	// ErrClosed 表示窗口、托盘或实例已经关闭
 	ErrClosed = errors.New("window closed")
 	// ErrAlreadyRunning 表示当前进程已有活动窗口循环
 	ErrAlreadyRunning = errors.New("another Run is active")
@@ -68,11 +67,9 @@ var (
 // 返回: any 可JSON编码的值或Result, error 错误信息
 type HandlerFunc func(context.Context, any) (any, error)
 
-// Result 保存调用结果及页面未接收时的资源释放操作
+// Result 保存调用结果，Discard在结果未交付时异步释放资源，页面确认接收后不再调用
 type Result struct {
-	// Value 指定可JSON编码的结果
-	Value any
-	// Discard 在结果未交付时异步释放资源，页面确认接收后不再调用
+	Value   any
 	Discard func()
 }
 
@@ -82,160 +79,100 @@ type TitleBarMode uint8
 // WindowMaterial 定义窗口的背景材质
 type WindowMaterial uint8
 
-// TitleBarColors 定义内容标题栏的激活及失焦配色，颜色使用#RRGGBB格式
+// TitleBarColors 定义内容标题栏激活与失焦的前景色及背景色，颜色使用#RRGGBB格式
 type TitleBarColors struct {
-	// Background 指定激活时的背景色
-	Background string `json:"background"`
-	// Foreground 指定激活时的前景色
-	Foreground string `json:"foreground"`
-	// InactiveBackground 指定失焦时的背景色
+	Background         string `json:"background"`
+	Foreground         string `json:"foreground"`
 	InactiveBackground string `json:"inactiveBackground"`
-	// InactiveForeground 指定失焦时的前景色
 	InactiveForeground string `json:"inactiveForeground"`
 }
 
-// Rect 定义相对客户区左上角的逻辑像素矩形，不随页面缩放变化
+// Rect 定义相对客户区左上角的逻辑像素矩形，不随页面缩放变化，零宽高表示空矩形
 type Rect struct {
-	// X 指定矩形左边位置
-	X float64 `json:"x"`
-	// Y 指定矩形上边位置
-	Y float64 `json:"y"`
-	// Width 指定非负矩形宽度，零值表示空矩形
-	Width float64 `json:"width"`
-	// Height 指定非负矩形高度，零值表示空矩形
+	X      float64 `json:"x"`
+	Y      float64 `json:"y"`
+	Width  float64 `json:"width"`
 	Height float64 `json:"height"`
 }
 
 // TitleBarInfo 保存逻辑像素标题栏布局和窗口状态
+// Height在系统模式下为零，Left/Right为系统窗口按钮保留宽度，非纯色Material需页面使用透明背景
 type TitleBarInfo struct {
-	// Height 指定内容标题栏的可见高度，系统模式为零，同一DPI下不随最大化状态变化
-	Height float64 `json:"height"`
-	// Left 指定标题栏左侧系统窗口按钮的保留宽度
-	Left float64 `json:"left"`
-	// Right 指定标题栏右侧系统窗口按钮的保留宽度
-	Right float64 `json:"right"`
-	// Active 表示窗口处于激活状态
-	Active bool `json:"active"`
-	// Maximized 表示窗口已经最大化
-	Maximized bool `json:"maximized"`
-	// Colors 提供与系统按钮区域共用的内容标题栏配色，零值使用系统外观
-	Colors TitleBarColors `json:"colors"`
-	// Material 提供窗口材质，非纯色材质需要页面使用透明背景
-	Material WindowMaterial `json:"material"`
+	Height    float64        `json:"height"`
+	Left      float64        `json:"left"`
+	Right     float64        `json:"right"`
+	Active    bool           `json:"active"`
+	Maximized bool           `json:"maximized"`
+	Colors    TitleBarColors `json:"colors"`
+	Material  WindowMaterial `json:"material"`
 }
 
-// Options 定义窗口、资源和生命周期配置，客户区尺寸单位为逻辑像素
-// 路径前缀/__guigo/由宿主保留用于内部桥接传输，应用资源路径不得占用
+// Options 定义窗口、资源和生命周期配置，客户区尺寸单位为逻辑像素，路径前缀/__guigo/由宿主保留
+// Instance传入OpenInstance返回的窗口入口并由调用方关闭；AppID与UserDataDir至少设置其一
+// TitleBarColors非零时需启用TitleBarContent并提供全部四种颜色；WindowMaterial非纯色需系统支持
+// Icon与IconPath互斥，均要求边长不超过2048像素且不超过16MiB的正方形PNG
+// Width/Height零值默认1024x768，Min/Max零值不限，FixedSize生效时忽略Maximized
+// Handler非空时忽略FS，ResourceHandler返回nil, nil时回退到Handler或FS
+// OnReady在首次导航前于后台调用，OnTitleBarChanged在其后串行通知，OnClose在宿主完全退出后执行
 type Options struct {
-	// Instance 指定OpenInstance在Window为true时返回的入口，创建窗口时自动登记，调用方负责关闭入口
-	Instance *Instance
-	// AppID 指定稳定的应用标识，长度不超过128字节，以英文字母开头，不以点结尾
-	// 允许英文字母、数字、点和连字符，保留大小写，不随程序版本或位置变化
-	// Windows用于窗口身份，Linux用于程序名称
-	AppID string
-	// Title 指定窗口标题
-	Title string
-	// TitleBar 指定标题栏模式，零值使用系统标题栏
-	TitleBar TitleBarMode
-	// TitleBarColors 指定内容标题栏配色，零值保留系统外观，非零值需完整提供四种颜色
-	TitleBarColors TitleBarColors
-	// WindowMaterial 指定窗口材质，零值保持纯色，仅Windows11版本22621及以上支持云母Alt和亚克力
-	// 页面根元素及需要显示材质的区域使用透明背景，其余区域保留自身底色
-	// 材质背景由系统绘制，TitleBarColors用于决定明暗及文字颜色，不支持材质时返回错误
-	WindowMaterial WindowMaterial
-	// Icon 指定正方形PNG窗口图标数据，边长不超过2048像素，数据不超过16MiB，与IconPath互斥
-	Icon []byte
-	// IconPath 指定外置PNG图标路径，格式及尺寸限制与Icon一致，两者互斥
-	IconPath string
-	// Width 指定初始客户区宽度，零值使用1024逻辑像素
-	Width int
-	// Height 指定初始客户区高度，零值使用768逻辑像素
-	Height int
-	// MinWidth 指定最小客户区宽度，零值表示不限制
-	MinWidth int
-	// MinHeight 指定最小客户区高度，零值表示不限制
-	MinHeight int
-	// MaxWidth 指定最大客户区宽度，零值表示不限制，Linux仅约束初始尺寸及SetSize
-	MaxWidth int
-	// MaxHeight 指定最大客户区高度，零值表示不限制，Linux仅约束初始尺寸及SetSize
-	MaxHeight int
-	// FixedSize 禁止用户调整窗口大小，程序仍可调用SetSize
-	FixedSize bool
-	// Center 在首次显示前将可见边框按所在屏幕工作区居中，可调整窗口同时限制初始尺寸
-	// Linux由窗口管理器决定窗口位置，GTK4不支持强制居中
-	Center bool
-	// Maximized 指定首次显示时最大化，FixedSize启用时忽略
-	Maximized bool
-	// UserDataDir 指定持久数据目录，优先于AppID，两者至少设置一个，目录由调用方清理
-	// 相对路径基于当前工作目录，便携程序可传入可执行文件所在目录下的绝对路径
-	UserDataDir string
-	// LibraryPath 指定原生运行时动态库路径，空值查找系统已安装运行时
-	// Windows指向EmbeddedBrowserWebView.dll，Linux指向libwebkitgtk-6.0.so.4且同进程首次加载后固定
-	LibraryPath string
-	// EntryPath 指定资源入口路径，空值使用根路径，不得使用/__guigo/保留前缀
-	EntryPath string
-	// FS 提供内嵌或外置静态资源，Handler非空时不使用，/__guigo/路径由宿主保留
-	FS fs.FS
-	// Handler 并发处理本地资源请求，不启动网络服务，/__guigo/路径由宿主保留
-	Handler http.Handler
-	// ResourceHandler 优先提供可寻址资源，返回nil, nil时使用Handler，/__guigo/路径由宿主保留
-	ResourceHandler func(*http.Request) (*Resource, error)
-	// Bindings 注册页面可调用的方法，处理器可能并发执行
-	Bindings map[string]HandlerFunc
-	// OnReady 在宿主就绪且首次导航前于后台Goroutine调用，回调返回后才加载页面
-	OnReady func(*Window)
-	// OnTitleBarChanged 在OnReady返回后于后台串行接收初始布局及布局、激活、最大化或DPI变化，可调用Window方法
-	// 快速变化可合并为最新状态，回调不应阻塞，关闭时未交付的通知可丢弃
+	Instance          *Instance
+	AppID             string
+	Title             string
+	TitleBar          TitleBarMode
+	TitleBarColors    TitleBarColors
+	WindowMaterial    WindowMaterial
+	Icon              []byte
+	IconPath          string
+	Width             int
+	Height            int
+	MinWidth          int
+	MinHeight         int
+	MaxWidth          int
+	MaxHeight         int
+	FixedSize         bool
+	Center            bool
+	Maximized         bool
+	UserDataDir       string
+	LibraryPath       string
+	EntryPath         string
+	FS                fs.FS
+	Handler           http.Handler
+	ResourceHandler   func(*http.Request) (*Resource, error)
+	Bindings          map[string]HandlerFunc
+	OnReady           func(*Window)
 	OnTitleBarChanged func(TitleBarInfo)
-	// OnClosing 返回是否允许用户关闭窗口，上下文取消时直接关闭
-	OnClosing func(context.Context) bool
-	// OnClose 在宿主完全退出并释放运行锁后于Run调用方Goroutine执行，启动失败时不调用，返回后Run返回
-	OnClose func()
-	// OnDrop 在后台Goroutine接收系统文件拖放的路径，多次回调可能并发执行
-	OnDrop func([]string)
-	// OnError 接收异步操作错误，多次回调可能并发执行
-	OnError func(error)
+	OnClosing         func(context.Context) bool
+	OnClose           func()
+	OnDrop            func([]string)
+	OnError           func(error)
 }
 
-// Resource 提供已就绪的可寻址响应流，Body所有权交给宿主并由宿主关闭
-// ResourceHandler返回nil, nil时回退到Handler或FS
-// 状态码默认200，范围请求需由处理器提供正确状态和范围内容
+// Resource 提供已就绪的可寻址响应流，StatusCode零值默认200，Body所有权交给宿主并由宿主关闭
+// ResourceHandler返回nil, nil时回退到Handler或FS，范围请求需由处理器提供对应状态与区间内容
 type Resource struct {
-	// StatusCode 指定HTTP响应状态码，零值使用200
 	StatusCode int
-	// Header 指定响应头，nil表示不附加响应头
-	Header http.Header
-	// Body 提供可寻址响应流，返回资源后由宿主负责关闭
-	Body io.ReadSeekCloser
+	Header     http.Header
+	Body       io.ReadSeekCloser
 }
 
-// FileFilter 定义文件类型，Pattern使用*.txt;*.md格式
+// FileFilter 定义文件类型显示名及分号分隔的通配符模式，如*.txt;*.md
 type FileFilter struct {
-	// Name 指定文件类型的显示名称
-	Name string
-	// Pattern 指定通配符，多个模式使用分号分隔
+	Name    string
 	Pattern string
 }
 
-// DialogOptions 定义原生文件对话框
+// DialogOptions 定义原生文件对话框标题、初始路径、默认文件名及文件类型过滤
 type DialogOptions struct {
-	// Title 指定对话框标题
-	Title string
-	// DefaultPath 指定初始目录或文件路径
+	Title       string
 	DefaultPath string
-	// DefaultName 指定初始文件名，目录选择时不使用
 	DefaultName string
-	// Filters 指定可选文件类型，目录选择时不使用
-	Filters []FileFilter
+	Filters     []FileFilter
 }
 
-// BridgeError 定义传递给JavaScript的结构化错误
+// BridgeError 定义传递给JavaScript的结构化错误，Name为空时默认Error，Code为空时不传递
 type BridgeError struct {
-	// Name 指定JavaScript错误名称，空值使用Error
-	Name string
-	// Code 指定业务错误代码，空值不传递
-	Code string
-	// Message 指定错误说明
+	Name    string
+	Code    string
 	Message string
 }
 
@@ -255,6 +192,13 @@ type envelope struct {
 	Error     string `json:"error,omitempty"`
 	ErrorName string `json:"errorName,omitempty"`
 	Code      string `json:"code,omitempty"`
+}
+
+// SupportsWindowMaterial 查询当前平台是否提供指定窗口材质
+// 入参: material 窗口材质
+// 返回: bool 是否支持
+func SupportsWindowMaterial(material WindowMaterial) bool {
+	return supportsWindowMaterial(material)
 }
 
 // SystemDark 返回系统当前是否偏好深色外观，未适配平台或查询失败时返回false
@@ -478,6 +422,9 @@ func validate(o *Options) error {
 			return errors.New("option contains NUL")
 		}
 	}
+	if o.EntryPath != "" && isReservedPath(strings.SplitN(strings.SplitN(o.EntryPath, "?", 2)[0], "#", 2)[0]) {
+		return errors.New("entry path uses reserved prefix")
+	}
 	if len(o.Icon) > 0 && o.IconPath != "" {
 		return errors.New("icon data and path are mutually exclusive")
 	}
@@ -505,7 +452,7 @@ func validate(o *Options) error {
 	o.Width, o.Height, _ = clampWindowSize(*o, o.Width, o.Height)
 	if o.Handler == nil {
 		if o.FS != nil {
-			o.Handler = fileHandler{http.FileServer(http.FS(o.FS))}
+			o.Handler = fileHandler{http.FileServerFS(o.FS)}
 		} else {
 			o.Handler = http.NotFoundHandler()
 		}

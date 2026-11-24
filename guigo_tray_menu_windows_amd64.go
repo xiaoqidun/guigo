@@ -65,7 +65,7 @@ func createTrayMenu(items []TrayItem, commands map[uint32]TrayItem, disabled boo
 				return 0, subErr
 			}
 			count, _, _ := user32.NewProc("GetMenuItemCount").Call(subMenu)
-			if count == 0 {
+			if int32(count) <= 0 {
 				user32.NewProc("DestroyMenu").Call(subMenu)
 				info.State |= 3
 			} else {
@@ -94,7 +94,7 @@ func createTrayMenu(items []TrayItem, commands map[uint32]TrayItem, disabled boo
 // 返回: error 菜单创建错误
 func (t *windowsTray) showMenu(position uintptr) error {
 	n := t.owner
-	if n.trays[t.data.ID] != t || n.ctx.Err() != nil || n.activeTrayMenu != nil {
+	if n.trays[t.data.ID] != t || n.ctx.Err() != nil || n.closed || n.quitAfterModal || n.activeTrayMenu != nil {
 		return nil
 	}
 	options, revision := t.options, t.revision
@@ -105,7 +105,7 @@ func (t *windowsTray) showMenu(position uintptr) error {
 	}
 	defer user32.NewProc("DestroyMenu").Call(menu)
 	count, _, _ := user32.NewProc("GetMenuItemCount").Call(menu)
-	if count == 0 {
+	if int32(count) <= 0 {
 		return nil
 	}
 	cursor := point{X: int32(int16(position)), Y: int32(int16(position >> 16))}
@@ -126,7 +126,11 @@ func (t *windowsTray) showMenu(position uintptr) error {
 		}
 	}
 	n.activeTrayMenu = t
-	defer func() { n.activeTrayMenu = nil }()
+	n.modalActive++
+	defer func() {
+		n.activeTrayMenu = nil
+		n.leaveModal()
+	}()
 	flags := uintptr(0x182)
 	if alignment, _, _ := user32.NewProc("GetSystemMetrics").Call(40); alignment != 0 {
 		flags |= 8
@@ -134,7 +138,7 @@ func (t *windowsTray) showMenu(position uintptr) error {
 	user32.NewProc("SetForegroundWindow").Call(n.hwnd)
 	selected, _, _ := user32.NewProc("TrackPopupMenu").Call(menu, flags, uintptr(cursor.X), uintptr(cursor.Y), 0, n.hwnd, 0)
 	user32.NewProc("PostMessageW").Call(n.hwnd, 0, 0, 0)
-	if n.trays[t.data.ID] == t && revision == t.revision && n.ctx.Err() == nil {
+	if n.trays[t.data.ID] == t && revision == t.revision && n.ctx.Err() == nil && !n.closed && !n.quitAfterModal {
 		if item, ok := commands[uint32(selected)]; ok && !item.Disabled && options.OnSelect != nil {
 			onSelect := options.OnSelect
 			id := item.ID

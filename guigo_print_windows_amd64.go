@@ -50,7 +50,7 @@ func printInterface(object *comObject, id string) (*comObject, error) {
 	iid := guid(id)
 	var result *comObject
 	if err := hresult(com(object, 0, uintptr(unsafe.Pointer(&iid)), uintptr(unsafe.Pointer(&result)))); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrPrintUnsupported, err)
+		return nil, fmt.Errorf("%w: %w", ErrPrintUnsupported, err)
 	}
 	return result, nil
 }
@@ -75,7 +75,7 @@ func (n *nativeWindow) printCapabilities(ctx context.Context) (PrintCapabilities
 	return result, err
 }
 
-// showPrintUI 将模态请求交给最外层消息循环
+// showPrintUI 在最外层消息循环发起WebView2打印对话框请求
 // 入参: ctx 调用上下文, kind 打印窗口类型
 // 返回: error 不支持、取消或窗口调用错误
 func (n *nativeWindow) showPrintUI(ctx context.Context, kind PrintDialogKind) error {
@@ -234,7 +234,7 @@ func (n *nativeWindow) print(ctx context.Context, o PrintOptions) (PrintResult, 
 				switch uint32(status) {
 				case 0:
 				case 1:
-					failure = fmt.Errorf("printer unavailable")
+					failure = fmt.Errorf("%w: printer unavailable", ErrPrinterNotFound)
 				default:
 					failure = fmt.Errorf("print submission failed")
 				}

@@ -27,11 +27,19 @@ import (
 // 入参: params 请求参数, index 列表所在位置
 // 返回: map[string]bool 属性名集合
 func trayNames(params uintptr, index uintptr) map[string]bool {
-	values := gdbus.Child(params, index)
+	values := trayChild(params, index)
+	if values == 0 {
+		return map[string]bool{}
+	}
 	defer gdbus.Unref(values)
 	names := map[string]bool{}
+	if gdbus.IsContainer(values) == 0 {
+		return names
+	}
 	for i := uintptr(0); i < gdbus.Count(values); i++ {
-		names[trayString(values, i)] = true
+		if name, ok := trayString(values, i); ok {
+			names[name] = true
+		}
 	}
 	return names
 }
@@ -117,7 +125,10 @@ func (t *linuxTray) itemProperties(id int32, names map[string]bool) string {
 // 返回: string GVariant值, bool 属性是否存在
 func (t *linuxTray) itemProperty(id int32, name string) (string, bool) {
 	if id == 0 && name == "children-display" {
-		return `"submenu"`, true
+		if len(t.children[0]) != 0 {
+			return `"submenu"`, true
+		}
+		return `""`, true
 	}
 	item, ok := t.items[id]
 	if !ok {
@@ -163,8 +174,12 @@ func (t *linuxTray) itemProperty(id int32, name string) (string, bool) {
 func (t *linuxTray) menuLayout(id, depth int32, names map[string]bool) string {
 	children := []string{}
 	if depth != 0 {
+		nextDepth := depth - 1
+		if depth < 0 {
+			nextDepth = -1
+		}
 		for _, child := range t.children[id] {
-			children = append(children, "<"+t.menuLayout(child, depth-1, names)+">")
+			children = append(children, "<"+t.menuLayout(child, nextDepth, names)+">")
 		}
 	}
 	return fmt.Sprintf("(int32 %d, %s, @av [%s])", id, t.itemProperties(id, names), strings.Join(children, ","))
@@ -201,20 +216,32 @@ func (t *linuxTray) click(id int32, event string) bool {
 func (t *linuxTray) menuReply(method string, params uintptr) (string, error) {
 	switch method {
 	case "GetLayout":
-		id, depth := trayInt(params, 0), trayInt(params, 1)
+		id, okID := trayInt(params, 0)
+		depth, okDepth := trayInt(params, 1)
+		if !okID || !okDepth {
+			return "", errors.New("invalid layout parameters")
+		}
 		if _, ok := t.items[id]; id != 0 && !ok {
 			return "", errors.New("unknown menu item")
 		}
 		names := trayNames(params, 2)
 		return fmt.Sprintf("(uint32 %d, %s)", t.revision, t.menuLayout(id, depth, names)), nil
 	case "GetGroupProperties":
-		ids := gdbus.Child(params, 0)
+		ids := trayChild(params, 0)
+		if ids == 0 || gdbus.IsContainer(ids) == 0 {
+			if ids != 0 {
+				gdbus.Unref(ids)
+			}
+			return "", errors.New("invalid group parameters")
+		}
 		defer gdbus.Unref(ids)
 		names := trayNames(params, 1)
 		items := []string{}
 		requested := []int32{}
 		for i := uintptr(0); i < gdbus.Count(ids); i++ {
-			requested = append(requested, trayInt(ids, i))
+			if id, ok := trayInt(ids, i); ok {
+				requested = append(requested, id)
+			}
 		}
 		if len(requested) == 0 {
 			requested = append([]int32{0}, t.order...)
@@ -226,43 +253,72 @@ func (t *linuxTray) menuReply(method string, params uintptr) (string, error) {
 		}
 		return "(@a(ia{sv}) [" + strings.Join(items, ",") + "],)", nil
 	case "GetProperty":
-		id, name := trayInt(params, 0), trayString(params, 1)
+		id, okID := trayInt(params, 0)
+		name, okName := trayString(params, 1)
+		if !okID || !okName {
+			return "", errors.New("invalid property parameters")
+		}
 		if value, ok := t.itemProperty(id, name); ok {
 			return "(<" + value + ">,)", nil
 		}
 		return "", errors.New("unknown menu property")
 	case "Event":
-		if !t.click(trayInt(params, 0), trayString(params, 1)) {
+		id, okID := trayInt(params, 0)
+		event, okEvent := trayString(params, 1)
+		if !okID || !okEvent {
+			return "", errors.New("invalid event parameters")
+		}
+		if !t.click(id, event) {
 			return "", errors.New("unknown menu item")
 		}
 		return "()", nil
 	case "EventGroup":
-		events := gdbus.Child(params, 0)
+		events := trayChild(params, 0)
+		if events == 0 || gdbus.IsContainer(events) == 0 {
+			if events != 0 {
+				gdbus.Unref(events)
+			}
+			return "", errors.New("invalid event group parameters")
+		}
 		defer gdbus.Unref(events)
 		rejected := []string{}
 		for i := uintptr(0); i < gdbus.Count(events); i++ {
-			event := gdbus.Child(events, i)
-			id := trayInt(event, 0)
-			if !t.click(id, trayString(event, 1)) {
+			event := trayChild(events, i)
+			if event == 0 {
+				continue
+			}
+			id, okID := trayInt(event, 0)
+			name, okName := trayString(event, 1)
+			if okID && okName && !t.click(id, name) {
 				rejected = append(rejected, fmt.Sprint(id))
 			}
 			gdbus.Unref(event)
 		}
 		return "(@ai [" + strings.Join(rejected, ",") + "],)", nil
 	case "AboutToShow":
-		id := trayInt(params, 0)
-		if _, ok := t.items[id]; id != 0 && !ok {
+		id, ok := trayInt(params, 0)
+		if !ok {
+			return "", errors.New("invalid menu parameters")
+		}
+		if _, exists := t.items[id]; id != 0 && !exists {
 			return "", errors.New("unknown menu item")
 		}
 		return "(false,)", nil
 	case "AboutToShowGroup":
-		ids := gdbus.Child(params, 0)
+		ids := trayChild(params, 0)
+		if ids == 0 || gdbus.IsContainer(ids) == 0 {
+			if ids != 0 {
+				gdbus.Unref(ids)
+			}
+			return "", errors.New("invalid group parameters")
+		}
 		defer gdbus.Unref(ids)
 		rejected := []string{}
 		for i := uintptr(0); i < gdbus.Count(ids); i++ {
-			id := trayInt(ids, i)
-			if _, ok := t.items[id]; id != 0 && !ok {
-				rejected = append(rejected, fmt.Sprint(id))
+			if id, ok := trayInt(ids, i); ok {
+				if _, exists := t.items[id]; id != 0 && !exists {
+					rejected = append(rejected, fmt.Sprint(id))
+				}
 			}
 		}
 		return "(@ai [], @ai [" + strings.Join(rejected, ",") + "])", nil

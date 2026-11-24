@@ -26,17 +26,33 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+// firstPipeInstanceFlag 确保首实例独占创建首个命名管道实例
+const firstPipeInstanceFlag = 0x00080000
+
 // pipeInstance 持有当前会话的互斥入口和命名管道配置
 type pipeInstance struct {
 	address  string
 	identity string
 	security *windows.SECURITY_DESCRIPTOR
 	mutex    windows.Handle
+	first    windows.Handle
 	ctx      context.Context
 	cancel   context.CancelFunc
 	acceptMu sync.Mutex
 	once     sync.Once
 	err      error
+}
+
+// instanceSecurityDescriptor 构造仅允许当前用户访问的安全描述符，提权进程附加高完整性标签
+// 入参: identity 实例身份字符串
+// 返回: *windows.SECURITY_DESCRIPTOR 安全描述符, error 构造错误
+func instanceSecurityDescriptor(identity string) (*windows.SECURITY_DESCRIPTOR, error) {
+	sid, _, _ := strings.Cut(identity, ":")
+	sddl := "D:P(A;;GA;;;" + sid + ")"
+	if strings.HasSuffix(identity, ":true") {
+		sddl += "S:(ML;;NW;;;HI)"
+	}
+	return windows.SecurityDescriptorFromString(sddl)
 }
 
 // windowsInstanceIdentity 返回进程所属用户、登录会话及提升状态
@@ -83,8 +99,7 @@ func listenInstance(address string) (instanceListener, error) {
 	if err != nil {
 		return nil, err
 	}
-	sid, _, _ := strings.Cut(identity, ":")
-	security, err := windows.SecurityDescriptorFromString("D:P(A;;GA;;;" + sid + ")")
+	security, err := instanceSecurityDescriptor(identity)
 	if err != nil {
 		return nil, err
 	}
@@ -101,8 +116,18 @@ func listenInstance(address string) (instanceListener, error) {
 	if err != nil {
 		return nil, err
 	}
+	pipeName, err := windows.UTF16PtrFromString(address)
+	if err != nil {
+		windows.CloseHandle(mutex)
+		return nil, err
+	}
+	first, err := windows.CreateNamedPipe(pipeName, windows.PIPE_ACCESS_DUPLEX|windows.FILE_FLAG_OVERLAPPED|firstPipeInstanceFlag, windows.PIPE_TYPE_BYTE|windows.PIPE_REJECT_REMOTE_CLIENTS, 255, 4096, 4096, 0, &attributes)
+	if err != nil {
+		windows.CloseHandle(mutex)
+		return nil, err
+	}
 	ctx, cancel := context.WithCancel(context.Background())
-	return &pipeInstance{address: address, identity: identity, security: security, mutex: mutex, ctx: ctx, cancel: cancel}, nil
+	return &pipeInstance{address: address, identity: identity, security: security, mutex: mutex, first: first, ctx: ctx, cancel: cancel}, nil
 }
 
 // connectInstancePipe 等待可取消的重叠管道连接
@@ -183,18 +208,25 @@ func (l *pipeInstance) Accept() (instanceConn, error) {
 		if err := l.ctx.Err(); err != nil {
 			return nil, err
 		}
-		name, _ := windows.UTF16PtrFromString(l.address)
-		attributes := windows.SecurityAttributes{Length: uint32(unsafe.Sizeof(windows.SecurityAttributes{})), SecurityDescriptor: l.security}
-		pipe, err := windows.CreateNamedPipe(name, windows.PIPE_ACCESS_DUPLEX|windows.FILE_FLAG_OVERLAPPED, windows.PIPE_TYPE_BYTE|windows.PIPE_REJECT_REMOTE_CLIENTS, 255, 4096, 4096, 0, &attributes)
-		if err != nil {
-			return nil, err
+		var pipe windows.Handle
+		if l.first != 0 {
+			pipe = l.first
+			l.first = 0
+		} else {
+			name, _ := windows.UTF16PtrFromString(l.address)
+			attributes := windows.SecurityAttributes{Length: uint32(unsafe.Sizeof(windows.SecurityAttributes{})), SecurityDescriptor: l.security}
+			var err error
+			pipe, err = windows.CreateNamedPipe(name, windows.PIPE_ACCESS_DUPLEX|windows.FILE_FLAG_OVERLAPPED, windows.PIPE_TYPE_BYTE|windows.PIPE_REJECT_REMOTE_CLIENTS, 255, 4096, 4096, 0, &attributes)
+			if err != nil {
+				return nil, err
+			}
 		}
 		if err := connectInstancePipe(l.ctx, pipe); err != nil {
 			windows.CloseHandle(pipe)
 			return nil, err
 		}
 		var pid uint32
-		err = windows.GetNamedPipeClientProcessId(pipe, &pid)
+		err := windows.GetNamedPipeClientProcessId(pipe, &pid)
 		if err == nil {
 			var identity string
 			identity, err = windowsInstanceIdentity(pid)
@@ -209,13 +241,17 @@ func (l *pipeInstance) Accept() (instanceConn, error) {
 	}
 }
 
-// Close 停止等待并释放互斥入口
+// Close 停止等待并释放互斥入口与未使用的首管道句柄
 // 返回: error 关闭错误
 func (l *pipeInstance) Close() error {
 	l.once.Do(func() {
 		l.cancel()
 		l.acceptMu.Lock()
 		defer l.acceptMu.Unlock()
+		if l.first != 0 {
+			windows.CloseHandle(l.first)
+			l.first = 0
+		}
 		l.err = windows.CloseHandle(l.mutex)
 	})
 	return l.err

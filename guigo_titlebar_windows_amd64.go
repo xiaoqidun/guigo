@@ -18,18 +18,17 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"runtime"
 	"slices"
 	"strconv"
 	"syscall"
 	"unsafe"
 )
 
+// DWM与GDI延迟加载库及内容标题栏子窗口回调
 var (
-	// dwmapi 延迟加载桌面窗口管理器动态库
-	dwmapi = syscall.NewLazyDLL("dwmapi.dll")
-	// gdi32 延迟加载图形设备接口动态库
-	gdi32 = syscall.NewLazyDLL("gdi32.dll")
-	// titleBarCallback 缓存内容标题栏子窗口过程回调地址
+	dwmapi           = syscall.NewLazyDLL("dwmapi.dll")
+	gdi32            = syscall.NewLazyDLL("gdi32.dll")
 	titleBarCallback = syscall.NewCallback(titleBarChildProc)
 )
 
@@ -235,7 +234,8 @@ func (n *nativeWindow) titleBarBounds() (int32, rect) {
 	var client rect
 	user32.NewProc("GetClientRect").Call(n.hwnd, uintptr(unsafe.Pointer(&client)))
 	offset := n.titleBarOffset()
-	client.Bottom -= offset
+	client.Right = max(0, client.Right)
+	client.Bottom = max(0, client.Bottom-offset)
 	height := n.titleBarMetric(4) + n.titleBarBorder()
 	width := 3 * max(n.pixels(46), n.titleBarMetric(30))
 	origin := point{}
@@ -294,8 +294,8 @@ func (n *nativeWindow) initializeTitleBar() error {
 	if composition == 0 {
 		return errors.New("content title bar requires desktop composition")
 	}
-	if SupportsWindowMaterial(WindowMicaAlt) {
-		if err := n.applyWindowBackdrop(); err != nil {
+	if supportsWindowMaterial(WindowMicaAlt) {
+		if err := n.applyWindowBackdrop(); err != nil && n.options.WindowMaterial != WindowSolid {
 			return err
 		}
 	}
@@ -305,17 +305,20 @@ func (n *nativeWindow) initializeTitleBar() error {
 	instance, _, _ := kernel32.NewProc("GetModuleHandleW").Call(0)
 	cursor, _, _ := user32.NewProc("LoadCursorW").Call(0, 32512)
 	background, _, _ := gdi32.NewProc("GetStockObject").Call(5)
-	class := windowClass{Style: 8, Proc: titleBarCallback, Instance: instance, Cursor: cursor, Background: background, Name: wide("GUIGo.Native.Content")}
+	className := wide("GUIGo.Native.Content")
+	class := windowClass{Style: 8, Proc: titleBarCallback, Instance: instance, Cursor: cursor, Background: background, Name: className}
 	class.Size = uint32(unsafe.Sizeof(class))
 	atom, _, err := user32.NewProc("RegisterClassExW").Call(uintptr(unsafe.Pointer(&class)))
 	if atom == 0 && err != syscall.Errno(1410) {
 		return err
 	}
-	n.contentWindow, _, err = user32.NewProc("CreateWindowExW").Call(0, uintptr(unsafe.Pointer(class.Name)), 0, 0x52000000, 0, 0, 1, 1, n.hwnd, 0, instance, 0)
+	n.contentWindow, _, err = user32.NewProc("CreateWindowExW").Call(0, uintptr(unsafe.Pointer(className)), 0, 0x52000000, 0, 0, 1, 1, n.hwnd, 0, instance, 0)
 	if n.contentWindow == 0 {
+		runtime.KeepAlive(className)
 		return err
 	}
-	n.dragWindow, _, err = user32.NewProc("CreateWindowExW").Call(0x08080000, uintptr(unsafe.Pointer(class.Name)), 0, 0x54000000, 0, 0, 1, 1, n.hwnd, 0, instance, 0)
+	n.dragWindow, _, err = user32.NewProc("CreateWindowExW").Call(0x08080000, uintptr(unsafe.Pointer(className)), 0, 0x54000000, 0, 0, 1, 1, n.hwnd, 0, instance, 0)
+	runtime.KeepAlive(className)
 	if n.dragWindow == 0 {
 		return err
 	}
@@ -387,10 +390,15 @@ func (n *nativeWindow) layoutTitleBar() error {
 	}
 	n.titleBarLayout = true
 	defer func() { n.titleBarLayout = false }()
+	iconic, _, _ := user32.NewProc("IsIconic").Call(n.hwnd)
+	if iconic != 0 {
+		return nil
+	}
 	var bounds rect
 	user32.NewProc("GetClientRect").Call(n.hwnd, uintptr(unsafe.Pointer(&bounds)))
 	offset := n.titleBarOffset()
-	bounds.Bottom -= offset
+	bounds.Right = max(0, bounds.Right)
+	bounds.Bottom = max(0, bounds.Bottom-offset)
 	_, buttons := n.titleBarBounds()
 	if err := n.extendWindowFrame(); err != nil {
 		return err
@@ -476,7 +484,7 @@ func (n *nativeWindow) titleBarProc(hwnd, msg, wparam, lparam uintptr) (uintptr,
 	if msg == 0x8003 {
 		n.titleBarPending = false
 		if err := n.layoutTitleBar(); err != nil {
-			n.fail(err)
+			n.reportError(err)
 		}
 		n.publishTitleBarChange(false)
 		return 0, true
@@ -484,9 +492,16 @@ func (n *nativeWindow) titleBarProc(hwnd, msg, wparam, lparam uintptr) (uintptr,
 	if msg == 6 || msg == 0x18 || msg == 0x31a || msg == 0x1a || msg == 0x31e {
 		n.scheduleTitleBarChange()
 	}
-	if msg == 0x31e && n.options.WindowMaterial != WindowSolid {
-		if err := n.extendWindowFrame(); err != nil {
-			n.fail(err)
+	if n.hwnd != 0 && n.options.WindowMaterial != WindowSolid {
+		if msg == 0x31e {
+			if err := n.extendWindowFrame(); err != nil {
+				n.reportError(err)
+			}
+		}
+		if n.options.TitleBar == TitleBarSystem && (msg == 0x1a || msg == 0x31a || msg == 0x31e) {
+			if err := n.applyTitleBarColors(n.currentTitleBarInfo().Active); err != nil {
+				n.reportError(err)
+			}
 		}
 	}
 	if n.options.TitleBar != TitleBarContent {
@@ -499,16 +514,21 @@ func (n *nativeWindow) titleBarProc(hwnd, msg, wparam, lparam uintptr) (uintptr,
 				focused = wparam != 0
 			}
 			if err := n.applyTitleBarColors(focused); err != nil {
-				n.fail(err)
+				n.reportError(err)
 			}
 		} else if n.options.TitleBarColors == (TitleBarColors{}) && (msg == 0x1a || msg == 0x31a || msg == 0x31e) {
 			if err := n.applyTitleBarColors(n.currentTitleBarInfo().Active); err != nil {
-				n.fail(err)
+				n.reportError(err)
 			}
 		}
 	}
 	if msg == 0xa5 && wparam == 2 {
-		n.showTitleBarMenu(lparam)
+		go func() {
+			_ = n.invokeTop(func() error {
+				n.showTitleBarMenu(lparam)
+				return nil
+			})
+		}()
 		return 0, true
 	}
 	if msg == 0x83 && lparam != 0 {
@@ -557,9 +577,12 @@ func (n *nativeWindow) titleBarProc(hwnd, msg, wparam, lparam uintptr) (uintptr,
 	return 0, false
 }
 
-// showTitleBarMenu 在拖动区域显示原生窗口菜单并交回系统命令处理
+// showTitleBarMenu 在最外层消息循环显示拖动区域的原生窗口菜单并交回系统命令处理
 // 入参: position 屏幕坐标组成的消息参数
 func (n *nativeWindow) showTitleBarMenu(position uintptr) {
+	if n.closed || n.quitAfterModal || n.ctx.Err() != nil {
+		return
+	}
 	menu, _, _ := user32.NewProc("GetSystemMenu").Call(n.hwnd, 0)
 	if menu == 0 {
 		return
@@ -582,9 +605,11 @@ func (n *nativeWindow) showTitleBarMenu(position uintptr) {
 		}
 		user32.NewProc("EnableMenuItem").Call(menu, item.command, flags)
 	}
+	n.modalActive++
+	defer n.leaveModal()
 	x, y := int32(int16(position)), int32(int16(position>>16))
 	command, _, _ := user32.NewProc("TrackPopupMenuEx").Call(menu, 0x102, uintptr(x), uintptr(y), n.hwnd, 0)
-	if command != 0 {
+	if command != 0 && !n.closed && !n.quitAfterModal {
 		user32.NewProc("SendMessageW").Call(n.hwnd, 0x112, command, position)
 	}
 }

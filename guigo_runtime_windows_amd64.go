@@ -26,13 +26,11 @@ import (
 	"unsafe"
 )
 
+// WebView2最低支持版本与运行时加载类型标识
 const (
-	// minimumRuntime 对应正式发布的原生文件拖放接口版本
-	minimumRuntime = "113.0.1774.30"
-	// installedRuntimeType 表示系统安装的运行时
+	minimumRuntime               = "113.0.1774.30"
 	installedRuntimeType uintptr = 0
-	// unknownRuntimeType 表示由模块判断运行时类型
-	unknownRuntimeType uintptr = 0xffffffff
+	unknownRuntimeType   uintptr = 0xffffffff
 )
 
 // runtimeLibraries 保存尚未允许卸载的运行时模块
@@ -142,8 +140,8 @@ func runtimeRegistryClient(key syscall.Handle, branch string) (runtimeClient, er
 		}
 		location = filepath.Join(value, version)
 	}
-	if !filepath.IsAbs(location) {
-		return runtimeClient{}, errors.New("runtime location must be absolute")
+	if !filepath.IsAbs(location) || strings.HasPrefix(location, `\\`) {
+		return runtimeClient{}, errors.New("runtime location must be local absolute path")
 	}
 	if err := checkRuntimeVersion(version); err != nil {
 		return runtimeClient{}, err
@@ -246,7 +244,8 @@ func loadRuntimeModule(path string) (*syscall.DLL, error) {
 	if err != nil {
 		return nil, err
 	}
-	if dll := runtimeLibraries[path]; dll != nil {
+	key := strings.ToLower(path)
+	if dll := runtimeLibraries[key]; dll != nil {
 		return dll, nil
 	}
 	handle, _, err := kernel32.NewProc("LoadLibraryExW").Call(uintptr(unsafe.Pointer(wide(path))), 0, 0x1100)
@@ -264,7 +263,7 @@ func loadRuntimeModule(path string) (*syscall.DLL, error) {
 			return existing, nil
 		}
 	}
-	runtimeLibraries[path] = dll
+	runtimeLibraries[key] = dll
 	return dll, nil
 }
 
@@ -284,6 +283,6 @@ func releaseRuntime(dll *syscall.DLL) {
 	}
 	result, _, _ := proc.Call()
 	if result == 0 && dll.Release() == nil {
-		delete(runtimeLibraries, dll.Name)
+		delete(runtimeLibraries, strings.ToLower(dll.Name))
 	}
 }

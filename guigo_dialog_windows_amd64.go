@@ -21,6 +21,8 @@ import (
 	"runtime"
 	"syscall"
 	"unsafe"
+
+	"golang.org/x/sys/windows"
 )
 
 // guid 解析系统接口标识
@@ -68,7 +70,7 @@ func shellPath(item *comObject) (string, error) {
 		return "", err
 	}
 	defer ole32.NewProc("CoTaskMemFree").Call(uintptr(unsafe.Pointer(value)))
-	return utf16String(value), nil
+	return windows.UTF16PtrToString(value), nil
 }
 
 // dialog 运行单结果原生对话框
@@ -152,7 +154,7 @@ func (n *nativeWindow) dialogs(ctx context.Context, o DialogOptions, mode int) (
 				release(item)
 			}
 		}
-		if err := n.ctx.Err(); err != nil {
+		if n.ctx.Err() != nil || n.quitAfterModal || n.closed {
 			return ErrClosed
 		}
 		if err := ctx.Err(); err != nil {
@@ -170,11 +172,7 @@ func (n *nativeWindow) dialogs(ctx context.Context, o DialogOptions, mode int) (
 		defer func() {
 			stop()
 			n.activeDialog = nil
-			n.modalActive--
-			if n.modalActive == 0 && n.quitAfterModal {
-				n.quitAfterModal = false
-				user32.NewProc("PostQuitMessage").Call(0)
-			}
+			n.leaveModal()
 		}()
 		hr = com(dialog, 3, n.hwnd)
 		runtime.KeepAlive(filters)
@@ -182,7 +180,7 @@ func (n *nativeWindow) dialogs(ctx context.Context, o DialogOptions, mode int) (
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			if n.ctx.Err() != nil {
+			if n.ctx.Err() != nil || n.quitAfterModal || n.closed {
 				return ErrClosed
 			}
 			return ErrCanceled

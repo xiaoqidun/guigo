@@ -24,13 +24,12 @@ import (
 	"strconv"
 	"syscall"
 	"unsafe"
+
+	"golang.org/x/sys/windows"
 )
 
 // winspool 按需加载Windows打印队列及驱动接口
 var winspool = syscall.NewLazyDLL("winspool.drv")
-
-// printGDI 按需加载设备纸面及可打印区域查询接口
-var printGDI = syscall.NewLazyDLL("gdi32.dll")
 
 // printerInfo4 对应快速枚举打印队列的PRINTER_INFO_4W
 type printerInfo4 struct {
@@ -51,24 +50,6 @@ func windowsDefaultPrinter() string {
 	ok, _, _ := proc.Call(uintptr(unsafe.Pointer(&buffer[0])), uintptr(unsafe.Pointer(&size)))
 	if ok == 0 {
 		return ""
-	}
-	return syscall.UTF16ToString(buffer)
-}
-
-// windowsWideString 复制系统提供的UTF16字符串
-// 入参: value 系统UTF16字符串指针
-// 返回: string 字符串副本
-func windowsWideString(value *uint16) string {
-	if value == nil {
-		return ""
-	}
-	var buffer []uint16
-	for i := 0; i < 32768; i++ {
-		v := *(*uint16)(unsafe.Add(unsafe.Pointer(value), i*2))
-		if v == 0 {
-			break
-		}
-		buffer = append(buffer, v)
 	}
 	return syscall.UTF16ToString(buffer)
 }
@@ -120,9 +101,9 @@ func enumWindowsPrinters() ([]PrinterInfo, error) {
 		if size > 64<<20 {
 			return nil, fmt.Errorf("printer list too large")
 		}
-		buffer := make([]byte, size)
+		buffer := make([]uint64, (size+7)/8)
 		var needed uint32
-		ok, _, err := proc.Call(6, 0, 4, uintptr(unsafe.Pointer(&buffer[0])), uintptr(size), uintptr(unsafe.Pointer(&needed)), uintptr(unsafe.Pointer(&count)))
+		ok, _, err := proc.Call(6, 0, 4, uintptr(unsafe.Pointer(&buffer[0])), uintptr(len(buffer)*8), uintptr(unsafe.Pointer(&needed)), uintptr(unsafe.Pointer(&count)))
 		if ok == 0 {
 			if errors.Is(err, syscall.Errno(122)) && needed > 0 {
 				size = needed
@@ -130,13 +111,16 @@ func enumWindowsPrinters() ([]PrinterInfo, error) {
 			}
 			return nil, err
 		}
-		if uint64(count)*uint64(unsafe.Sizeof(printerInfo4{})) > uint64(len(buffer)) {
+		if count == 0 {
+			return []PrinterInfo{}, nil
+		}
+		if uint64(count)*uint64(unsafe.Sizeof(printerInfo4{})) > uint64(len(buffer)*8) {
 			return nil, fmt.Errorf("invalid printer list")
 		}
 		defaultName := windowsDefaultPrinter()
 		result := make([]PrinterInfo, 0, count)
 		for _, item := range unsafe.Slice((*printerInfo4)(unsafe.Pointer(&buffer[0])), count) {
-			name := windowsWideString(item.Name)
+			name := windows.UTF16PtrToString(item.Name)
 			result = append(result, PrinterInfo{Name: name, Default: name == defaultName})
 		}
 		runtime.KeepAlive(buffer)
@@ -163,9 +147,12 @@ func queryWindowsPrinter(o PrintOptions) (PrinterProfile, error) {
 	defer winspool.NewProc("ClosePrinter").Call(printer)
 	get := func(offset int) int { return int(int16(binary.LittleEndian.Uint16(data[offset:]))) }
 	set := func(offset, value int) { binary.LittleEndian.PutUint16(data[offset:], uint16(value)) }
-	capability := func(code int, output unsafe.Pointer) int {
+	rawCapability := func(code int, output unsafe.Pointer) uint32 {
 		value, _, _ := winspool.NewProc("DeviceCapabilitiesW").Call(uintptr(unsafe.Pointer(wide(name))), 0, uintptr(code), uintptr(output), uintptr(unsafe.Pointer(&data[0])))
-		return int(int32(value))
+		return uint32(value)
+	}
+	capability := func(code int, output unsafe.Pointer) int {
+		return int(int32(rawCapability(code, output)))
 	}
 	p := PrinterProfile{Printer: PrinterInfo{Name: name, Default: name == windowsDefaultPrinter()}, Papers: []PrintPaper{}, Color: capability(32, nil) == 1, Duplex: capability(7, nil) == 1, MaxCopies: max(1, capability(18, nil)), Properties: true}
 	idCount, sizeCount, nameCount := capability(2, nil), capability(3, nil), capability(16, nil)
@@ -182,8 +169,8 @@ func queryWindowsPrinter(o PrintOptions) (PrinterProfile, error) {
 			}
 		}
 	}
-	minimum, maximum := capability(4, nil), capability(5, nil)
-	p.CustomPaper = minimum > 0 && maximum > 0 && minimum != maximum
+	minimum, maximum := rawCapability(4, nil), rawCapability(5, nil)
+	p.CustomPaper = minimum != 0 && minimum != 0xffffffff && maximum != 0 && maximum != 0xffffffff && minimum != maximum
 	if o.Width == 0 {
 		for _, paper := range p.Papers {
 			if paper.ID == strconv.Itoa(get(78)) {
@@ -209,7 +196,7 @@ func queryWindowsPrinter(o PrintOptions) (PrinterProfile, error) {
 		if !p.CustomPaper || o.Width > 3276 || o.Height > 3276 {
 			return p, fmt.Errorf("%w: paper size", ErrPrintUnsupported)
 		}
-		if o.Width < float64(uint32(minimum)&65535)/10 || o.Height < float64(uint32(minimum)>>16)/10 || o.Width > float64(uint32(maximum)&65535)/10 || o.Height > float64(uint32(maximum)>>16)/10 {
+		if o.Width < float64(minimum&65535)/10 || o.Height < float64(minimum>>16)/10 || o.Width > float64(maximum&65535)/10 || o.Height > float64(maximum>>16)/10 {
 			return p, fmt.Errorf("%w: custom paper size", ErrPrintUnsupported)
 		}
 	}
@@ -248,7 +235,7 @@ func queryWindowsPrinter(o PrintOptions) (PrinterProfile, error) {
 	fields := (binary.LittleEndian.Uint32(data[72:]) | 1 | 2 | 0x10 | 0x100 | 0x800 | 0x8000) &^ 0x10000
 	set(78, paperID)
 	if paperID == 0 {
-		fields |= 4 | 8
+		fields = (fields &^ 2) | 4 | 8
 		set(80, int(math.Round(o.Height*10)))
 		set(82, int(math.Round(o.Width*10)))
 	} else {
@@ -288,13 +275,13 @@ func queryWindowsPrinter(o PrintOptions) (PrinterProfile, error) {
 	if get(76) != (map[PrintOrientation]int{PrintOrientationPortrait: 1, PrintOrientationLandscape: 2}[o.Orientation]) || setDuplex && get(94) != (map[PrintDuplex]int{PrintDuplexOneSided: 1, PrintDuplexLongEdge: 2, PrintDuplexShortEdge: 3}[o.Duplex]) {
 		return p, fmt.Errorf("%w: driver changed device settings", ErrPrintUnsupported)
 	}
-	dc, _, err := printGDI.NewProc("CreateICW").Call(uintptr(unsafe.Pointer(wide("WINSPOOL"))), uintptr(unsafe.Pointer(wide(name))), 0, uintptr(unsafe.Pointer(&data[0])))
+	dc, _, err := gdi32.NewProc("CreateICW").Call(uintptr(unsafe.Pointer(wide("WINSPOOL"))), uintptr(unsafe.Pointer(wide(name))), 0, uintptr(unsafe.Pointer(&data[0])))
 	if dc == 0 {
 		return p, err
 	}
-	defer printGDI.NewProc("DeleteDC").Call(dc)
+	defer gdi32.NewProc("DeleteDC").Call(dc)
 	device := func(index int) float64 {
-		value, _, _ := printGDI.NewProc("GetDeviceCaps").Call(dc, uintptr(index))
+		value, _, _ := gdi32.NewProc("GetDeviceCaps").Call(dc, uintptr(index))
 		return float64(int32(value))
 	}
 	dx, dy := device(88), device(90)
@@ -316,9 +303,6 @@ func (n *nativeWindow) listPrinters(ctx context.Context) ([]PrinterInfo, error) 
 	n.mu.Unlock()
 	if closed {
 		return nil, ErrClosed
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
 	}
 	type response struct {
 		printers []PrinterInfo
@@ -351,9 +335,6 @@ func (n *nativeWindow) queryPrinter(ctx context.Context, o PrintOptions) (Printe
 	n.mu.Unlock()
 	if closed {
 		return PrinterProfile{}, ErrClosed
-	}
-	if err := ctx.Err(); err != nil {
-		return PrinterProfile{}, err
 	}
 	type response struct {
 		profile PrinterProfile
@@ -392,13 +373,7 @@ func (n *nativeWindow) showPrinterProperties(ctx context.Context, name string) e
 		}
 		defer winspool.NewProc("ClosePrinter").Call(printer)
 		n.modalActive++
-		defer func() {
-			n.modalActive--
-			if n.modalActive == 0 && n.quitAfterModal {
-				n.quitAfterModal = false
-				user32.NewProc("PostQuitMessage").Call(0)
-			}
-		}()
+		defer n.leaveModal()
 		ok, _, err = winspool.NewProc("PrinterProperties").Call(n.hwnd, printer)
 		if ok == 0 {
 			if errors.Is(err, syscall.Errno(0)) || errors.Is(err, syscall.Errno(1223)) {

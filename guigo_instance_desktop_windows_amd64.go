@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"runtime"
 	"slices"
 	"strings"
@@ -30,41 +31,38 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+// 窗口单实例激活属性名与绑定等待上限
 const (
-	// instanceActiveProperty 保存窗口最近一次激活的系统时间
 	instanceActiveProperty = "GUIGo.Instance.Active"
-	// maxWindowBindHold 限制创建入口后为等待窗口登记而持有跨进程互斥锁的最长时间
-	maxWindowBindHold = 1500 * time.Millisecond
+	maxWindowBindHold      = 1500 * time.Millisecond
 )
 
-// windowInstanceSequence 区分同一进程创建的不同窗口入口
-var windowInstanceSequence atomic.Uint32
-
-// instanceWindowSearches 保持同步枚举期间的查询对象，避免回调转换Go指针
-var instanceWindowSearches sync.Map
-
-// enumInstanceWindows 接收同步窗口枚举回调并筛选当前桌面的同组窗口
-var enumInstanceWindows = syscall.NewCallback(func(hwnd, parameter uintptr) (result uintptr) {
-	defer func() {
-		if recover() != nil {
-			result = 1
+// 窗口单实例序列号、枚举上下文表及原生枚举回调
+var (
+	windowInstanceSequence atomic.Uint32
+	instanceWindowSearches sync.Map
+	enumInstanceWindows    = syscall.NewCallback(func(hwnd, parameter uintptr) (result uintptr) {
+		defer func() {
+			if recover() != nil {
+				result = 1
+			}
+		}()
+		value, ok := instanceWindowSearches.Load(parameter)
+		if !ok {
+			return 1
 		}
-	}()
-	value, ok := instanceWindowSearches.Load(parameter)
-	if !ok {
+		search := value.(*instanceWindowSearch)
+		id, _, _ := user32.NewProc("GetPropW").Call(hwnd, uintptr(unsafe.Pointer(search.property)))
+		if id == 0 || !instanceOnCurrentDesktop(search.manager, hwnd) {
+			return 1
+		}
+		var pid uint32
+		user32.NewProc("GetWindowThreadProcessId").Call(hwnd, uintptr(unsafe.Pointer(&pid)))
+		activated, _, _ := user32.NewProc("GetPropW").Call(hwnd, uintptr(unsafe.Pointer(search.activeProperty)))
+		search.windows = append(search.windows, instanceWindow{hwnd: hwnd, id: id, address: fmt.Sprintf("%s.%d.%d", search.address, pid, id), activated: activated})
 		return 1
-	}
-	search := value.(*instanceWindowSearch)
-	id, _, _ := user32.NewProc("GetPropW").Call(hwnd, uintptr(unsafe.Pointer(search.property)))
-	if id == 0 || !instanceOnCurrentDesktop(search.manager, hwnd) {
-		return 1
-	}
-	var pid uint32
-	user32.NewProc("GetWindowThreadProcessId").Call(hwnd, uintptr(unsafe.Pointer(&pid)))
-	activated, _, _ := user32.NewProc("GetPropW").Call(hwnd, uintptr(unsafe.Pointer(search.activeProperty)))
-	search.windows = append(search.windows, instanceWindow{hwnd: hwnd, id: id, address: fmt.Sprintf("%s.%d.%d", search.address, pid, id), activated: activated})
-	return 1
-})
+	})
+)
 
 // windowInstance 将管道入口与实时窗口绑定，不保存启动时的虚拟桌面编号
 type windowInstance struct {
@@ -145,8 +143,7 @@ func lockWindowInstances(ctx context.Context, address string) (func(), error) {
 	if err != nil {
 		return nil, err
 	}
-	sid, _, _ := strings.Cut(identity, ":")
-	security, err := windows.SecurityDescriptorFromString("D:P(A;;GA;;;" + sid + ")")
+	security, err := instanceSecurityDescriptor(identity)
 	if err != nil {
 		return nil, err
 	}
@@ -193,7 +190,6 @@ func selectWindowInstance(ctx, request context.Context, address string, options 
 		instanceWindowSearches.Store(parameter, &search)
 		user32.NewProc("EnumWindows").Call(enumInstanceWindows, parameter)
 		instanceWindowSearches.Delete(parameter)
-		runtime.KeepAlive(search)
 		slices.SortStableFunc(search.windows, func(a, b instanceWindow) int {
 			if a.activated > b.activated {
 				return -1
@@ -205,13 +201,18 @@ func selectWindowInstance(ctx, request context.Context, address string, options 
 		})
 		retry := false
 		for _, candidate := range search.windows {
-			conn, err := dialWindowInstance(request, candidate, search.property, manager)
+			dialCtx, cancelDial := context.WithTimeout(request, 300*time.Millisecond)
+			conn, err := dialWindowInstance(dialCtx, candidate, search.property, manager)
+			cancelDial()
 			if err != nil {
-				if !errors.Is(err, errInstanceWindow) {
-					return nil, err
+				if errors.Is(err, errInstanceWindow) {
+					retry = true
+					break
 				}
-				retry = true
-				break
+				if errors.Is(err, os.ErrPermission) || errors.Is(err, windows.ERROR_ACCESS_DENIED) || errors.Is(err, context.DeadlineExceeded) && request.Err() == nil {
+					continue
+				}
+				return nil, err
 			}
 			err = forwardInstance(request, conn, options.Payload, options.MaxPayloadBytes)
 			if errors.Is(err, errInstanceWindow) {
@@ -301,15 +302,23 @@ func instanceDesktopManager() *comObject {
 	return manager
 }
 
-// instanceOnCurrentDesktop 查询窗口是否实际属于当前虚拟桌面，无法确认时不复用
+// instanceOnCurrentDesktop 查询窗口是否属于当前虚拟桌面，隐藏或未登记桌面状态的窗口允许匹配
 // 入参: manager 查询接口, hwnd 窗口句柄
-// 返回: bool 是否属于当前桌面
+// 返回: bool 是否允许按当前桌面匹配
 func instanceOnCurrentDesktop(manager *comObject, hwnd uintptr) bool {
 	if manager == nil {
 		return false
 	}
+	visible, _, _ := user32.NewProc("IsWindowVisible").Call(hwnd)
+	if visible == 0 {
+		return true
+	}
 	var current int32
-	return hresult(com(manager, 3, hwnd, uintptr(unsafe.Pointer(&current)))) == nil && current != 0
+	hr := com(manager, 3, hwnd, uintptr(unsafe.Pointer(&current)))
+	if uint32(hr) == 0x8002802b {
+		return true
+	}
+	return hresult(hr) == nil && current != 0
 }
 
 // removeWindowProps 在窗口所属STA线程移除登记属性
@@ -374,7 +383,7 @@ func (l *windowInstance) detachWindow(window *nativeWindow) {
 	}
 }
 
-// Close 通过窗口STA线程安全移除登记属性并关闭入口，释放尚未完成的启动等待
+// Close 移除窗口登记属性并关闭入口，释放尚未完成的启动等待
 // 返回: error 关闭错误
 func (l *windowInstance) Close() error {
 	l.mu.Lock()
@@ -386,10 +395,15 @@ func (l *windowInstance) Close() error {
 	}
 	l.mu.Unlock()
 	if window != nil {
-		_ = window.invoke(func() error {
+		tid, _, _ := kernel32.NewProc("GetCurrentThreadId").Call()
+		if uint32(tid) == window.threadID {
 			removeWindowProps(window.hwnd, l.property, l.id)
-			return nil
-		})
+		} else {
+			_ = window.invoke(func() error {
+				removeWindowProps(window.hwnd, l.property, l.id)
+				return nil
+			})
+		}
 	}
 	l.once.Do(func() { close(l.bound) })
 	return l.instanceListener.Close()

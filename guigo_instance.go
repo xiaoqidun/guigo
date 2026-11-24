@@ -28,32 +28,26 @@ import (
 	"unicode/utf8"
 )
 
+// 单实例消息体积、错误文本与默认超时上限
 const (
-	// defaultInstanceLimit 限制单次实例消息的默认字节数
-	defaultInstanceLimit = 1 << 20
-	// maxInstanceLimit 限制单次实例消息可配置的最大字节数
-	maxInstanceLimit = 16 << 20
-	// defaultInstanceTimeout 指定实例竞争及转交的默认超时时间
+	defaultInstanceLimit   = 1 << 20
+	maxInstanceLimit       = 16 << 20
 	defaultInstanceTimeout = 10 * time.Second
-	// maxInstanceErrorBytes 限制经实例通道返回的错误文本最大字节数
-	maxInstanceErrorBytes = 4096
+	maxInstanceErrorBytes  = 4096
 )
 
 // errInstanceWindow 表示窗口已不属于当前桌面，需要重新选择接收端
 var errInstanceWindow = errors.New("instance window is not on current desktop")
 
 // InstanceOptions 定义单实例入口的标识、转交消息及匹配策略
+// AppID为非空隔离键；Payload长度不得超过MaxPayloadBytes(默认1MiB，最大16MiB)
+// Window在windows/amd64上按当前虚拟桌面最近激活的同组窗口优先转交，其他平台沿用会话单实例
+// Timeout非正值默认10秒
 type InstanceOptions struct {
-	// AppID 指定调用方实例键，非空且不得包含NUL字符，用于隔离不同应用的单实例入口
-	AppID string
-	// Payload 指定转交给已有实例的初始消息，长度不得超过MaxPayloadBytes
-	Payload []byte
-	// Window 启用桌面窗口单实例策略，Windows按当前虚拟桌面最近激活的同组窗口优先转交
-	// 返回入口后应传入Options.Instance启动窗口并在退出后关闭，其他平台沿用当前会话单实例策略
-	Window bool
-	// Timeout 指定发现、转交及单次消息接收的超时时间，非正值默认使用10秒
-	Timeout time.Duration
-	// MaxPayloadBytes 指定单次收发消息的字节上限，非正值默认使用1MiB，最大允许16MiB
+	AppID           string
+	Payload         []byte
+	Window          bool
+	Timeout         time.Duration
 	MaxPayloadBytes int
 }
 
@@ -272,10 +266,10 @@ func writeInstanceMessage(writer io.Writer, data []byte, limit int) error {
 // 入参: text 原始文本, maxBytes 最大字节数
 // 返回: string 截断后的合法UTF-8字符串
 func truncateUTF8(text string, maxBytes int) string {
-	if maxBytes <= 0 || len(text) <= maxBytes {
-		if maxBytes <= 0 {
-			return ""
-		}
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(text) <= maxBytes {
 		return text
 	}
 	end := maxBytes
@@ -325,15 +319,7 @@ func (i *Instance) serve(ctx context.Context, receive func(context.Context, []by
 // 入参: ctx 生命周期上下文, conn 本机连接, receive 接收回调
 func (i *Instance) receive(ctx context.Context, conn instanceConn, receive func(context.Context, []byte) error) {
 	defer conn.Close()
-	timeout := i.timeout
-	if timeout <= 0 {
-		timeout = defaultInstanceTimeout
-	}
-	limit := i.limit
-	if limit <= 0 {
-		limit = defaultInstanceLimit
-	}
-	request, cancel := context.WithTimeout(ctx, timeout)
+	request, cancel := context.WithTimeout(ctx, i.timeout)
 	defer cancel()
 	stop := context.AfterFunc(request, func() { conn.Close() })
 	defer stop()
@@ -344,7 +330,7 @@ func (i *Instance) receive(ctx context.Context, conn instanceConn, receive func(
 	if _, err := conn.Write([]byte{1}); err != nil {
 		return
 	}
-	data, err := readInstanceMessage(conn, limit)
+	data, err := readInstanceMessage(conn, i.limit)
 	if err != nil || request.Err() != nil {
 		return
 	}
@@ -364,11 +350,11 @@ func (i *Instance) receive(ctx context.Context, conn instanceConn, receive func(
 		} else if errors.Is(receiveErr, errInstanceWindow) {
 			reply[0] = 3
 		} else {
-			maxErr := min(maxInstanceErrorBytes, max(0, limit-1))
+			maxErr := min(maxInstanceErrorBytes, max(0, i.limit-1))
 			reply = append([]byte{1}, []byte(truncateUTF8(receiveErr.Error(), maxErr))...)
 		}
 	}
-	if writeInstanceMessage(conn, reply, limit) == nil {
+	if writeInstanceMessage(conn, reply, i.limit) == nil {
 		var accepted [1]byte
 		_, _ = io.ReadFull(conn, accepted[:])
 	}

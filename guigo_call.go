@@ -59,7 +59,7 @@ type binaryPart struct {
 // pageContextKey 标识调用所属页面的生命周期
 type pageContextKey struct{}
 
-// PageContext 从处理器调用上下文中提取所属页面的生命周期上下文，非异步操作
+// PageContext 从处理器调用上下文中提取所属页面的生命周期上下文
 // 当页面发生导航或窗口关闭时，返回的上下文取消；非宿主上下文原样返回
 // 入参: ctx 处理器收到的调用上下文
 // 返回: context.Context 页面上下文
@@ -302,6 +302,7 @@ func (q *callQueue) run(call *pendingCall, bindings map[string]HandlerFunc, body
 		reply.Value = nil
 		reply.Error = err.Error()
 		reply.ErrorName = "AbortError"
+		reply.Code = "canceled"
 	}
 	return reply
 }

@@ -16,10 +16,7 @@
 
 package guigo
 
-import (
-	"encoding/json"
-	"strings"
-)
+import "encoding/json"
 
 // bridgeScriptCore 为双平台共用的Promise调用桥与事件订阅主体，依赖外层提供transport与bridgeToken
 const bridgeScriptCore = `(() => {
@@ -134,7 +131,7 @@ const bridgeScriptCore = `(() => {
 			async call(name, args = null, options = {}) {
 				if (closed) throw new Error("document closed");
 				if (typeof name !== "string" || !name) throw new TypeError("method must be a non-empty string");
-				const signal = options.signal;
+				const signal = options?.signal;
 				signal?.throwIfAborted();
 				if (pending.size + uploads.length >= 128) throw new Error("too many pending calls");
 				const data = packet(args);
@@ -217,26 +214,6 @@ const bridgeScriptCore = `(() => {
 func bridgeScriptQuoted(token string) string {
 	data, _ := json.Marshal(token)
 	return string(data)
-}
-
-// buildWindowsBridgeScript 构造带随机凭据隔离的Windows文档初始化脚本
-// 入参: token 仅向顶层宿主页面注入的随机凭据
-// 返回: string 文档初始化脚本
-func buildWindowsBridgeScript(token string) string {
-	encoded := bridgeScriptQuoted(token)
-	return strings.Join([]string{
-		`(() => {`,
-		`if (location.origin !== "` + resourceOrigin + `" || window !== window.top) return;`,
-		`const bridgeToken = ` + encoded + `;`,
-		`const webview = chrome.webview;`,
-		`const transport = {`,
-		`postMessage: message => webview.postMessage({...message, token: bridgeToken}),`,
-		`addEventListener: (name, listener) => webview.addEventListener(name, listener),`,
-		`postMessageWithAdditionalObjects: webview.postMessageWithAdditionalObjects ? (message, files) => webview.postMessageWithAdditionalObjects({...message, token: bridgeToken}, files) : null`,
-		`};`,
-		bridgeScriptCore,
-		`})();`,
-	}, "\n")
 }
 
 // localURL 判断请求是否属于宿主来源

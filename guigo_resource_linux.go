@@ -27,17 +27,13 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
 
-// linuxHeaderID 为临时请求头回调分配递增标识
-var linuxHeaderID atomic.Uint64
-
-// linuxHeaderTargets 保存请求头遍历期间的目标头映射
-var linuxHeaderTargets sync.Map
+// linuxHeaderTarget 保存GTK线程同步遍历请求头时的目标头映射
+var linuxHeaderTarget http.Header
 
 // linuxInput 持有原生请求流及取消标识
 type linuxInput struct {
@@ -68,10 +64,10 @@ func isLinuxPeerCanceled(err error) bool {
 }
 
 // linuxHeaders 复制请求头到Go对象
-// 入参: key 字段名, value 字段值, data 注册标识
+// 入参: key 字段名, value 字段值, data 用户数据
 func linuxHeaders(key, value *byte, data uintptr) {
-	if target, ok := linuxHeaderTargets.Load(uint64(data)); ok {
-		target.(http.Header).Add(nativeString(key), nativeString(value))
+	if linuxHeaderTarget != nil {
+		linuxHeaderTarget.Add(nativeString(key), nativeString(value))
 	}
 }
 
@@ -82,22 +78,22 @@ func linuxResource(request, data uintptr) {
 	if n == nil || gtk.RequestView(request) != n.view {
 		return
 	}
-	uri := gtk.RequestURI(request)
-	requestContext := n.pageCtx
-	if requestContext == nil {
-		requestContext = n.ctx
+	if n.closed {
+		n.finishEmpty(request, 499, nil)
+		return
 	}
-	req, err := http.NewRequestWithContext(requestContext, gtk.RequestMethod(request), uri, nil)
+	uri := gtk.RequestURI(request)
+	req, err := http.NewRequestWithContext(n.pageCtx, gtk.RequestMethod(request), uri, nil)
 	if err != nil {
 		n.reportError(err)
+		n.finishEmpty(request, 400, nil)
 		return
 	}
 	req.RequestURI = req.URL.RequestURI()
 	headers := gtk.RequestHeaders(request)
-	id := linuxHeaderID.Add(1)
-	linuxHeaderTargets.Store(id, req.Header)
-	gtk.HeadersEach(headers, linuxCallbacks.headers, uintptr(id))
-	linuxHeaderTargets.Delete(id)
+	linuxHeaderTarget = req.Header
+	gtk.HeadersEach(headers, linuxCallbacks.headers, 0)
+	linuxHeaderTarget = nil
 	body := gtk.RequestBody(request)
 	if body != 0 {
 		input := &linuxInput{stream: body, cancel: gtk.CancelNew()}
@@ -174,6 +170,10 @@ func linuxResource(request, data uintptr) {
 			_, _ = w.Write(marshalReply(reply))
 			return
 		}
+		if isReservedPath(req.URL.Path) {
+			http.Error(w, "Not Found", 404)
+			return
+		}
 		if n.options.ResourceHandler != nil {
 			resource, err := n.options.ResourceHandler(req)
 			if resource != nil && resource.Body != nil {
@@ -202,11 +202,8 @@ func linuxResource(request, data uintptr) {
 					http.Error(w, "Invalid resource stream", 500)
 					return
 				}
-				w.header = make(http.Header, len(resource.Header))
-				for k, vs := range resource.Header {
-					for _, v := range vs {
-						w.header.Add(k, v)
-					}
+				if resource.Header != nil {
+					w.header = resource.Header.Clone()
 				}
 				if w.header.Get("Content-Length") == "" {
 					w.header.Set("Content-Length", strconv.FormatInt(size, 10))
@@ -363,14 +360,9 @@ func (w *linuxWriter) Write(data []byte) (int, error) {
 	return n, err
 }
 
-// respondStream 将原生流交给WebKit并释放请求引用
+// sendResponse 向WebKit提交原生流响应
 // 入参: request 请求对象, stream 原生流, size 响应长度, status 状态码, headers 响应头
-func (n *nativeWindow) respondStream(request, stream uintptr, size int64, status int, headers http.Header) {
-	if !n.resources[request] {
-		return
-	}
-	delete(n.resources, request)
-	defer gtk.Unref(request)
+func (n *nativeWindow) sendResponse(request, stream uintptr, size int64, status int, headers http.Header) {
 	response := gtk.ResponseNew(stream, size)
 	defer gtk.Unref(response)
 	gtk.ResponseStatus(response, uint32(status), http.StatusText(status))
@@ -391,22 +383,32 @@ func (n *nativeWindow) respondStream(request, stream uintptr, size int64, status
 	gtk.FinishResponse(request, response)
 }
 
-// finishResponse 关闭尚未完成的请求
+// finishEmpty 使用空内存流直接结束尚未登记的原生请求
+// 入参: request 请求对象, status 状态码, headers 响应头
+func (n *nativeWindow) finishEmpty(request uintptr, status int, headers http.Header) {
+	stream := gtk.MemoryInput()
+	defer gtk.Unref(stream)
+	n.sendResponse(request, stream, 0, status, headers)
+}
+
+// respondStream 将原生流交给WebKit并释放请求引用
+// 入参: request 请求对象, stream 原生流, size 响应长度, status 状态码, headers 响应头
+func (n *nativeWindow) respondStream(request, stream uintptr, size int64, status int, headers http.Header) {
+	if !n.resources[request] {
+		return
+	}
+	delete(n.resources, request)
+	defer gtk.Unref(request)
+	n.sendResponse(request, stream, size, status, headers)
+}
+
+// finishResponse 使用空内存流关闭尚未完成的请求
 // 入参: request 请求对象, status 状态码, headers 响应头
 func (n *nativeWindow) finishResponse(request uintptr, status int, headers http.Header) {
 	if !n.resources[request] {
 		return
 	}
-	file := gtk.FileNew("/dev/null")
-	defer gtk.Unref(file)
-	var nativeErr *linuxError
-	stream := gtk.FileRead(file, 0, &nativeErr)
-	if stream == 0 {
-		n.reportError(nativeError(nativeErr))
-		delete(n.resources, request)
-		gtk.Unref(request)
-		return
-	}
+	stream := gtk.MemoryInput()
 	defer gtk.Unref(stream)
 	n.respondStream(request, stream, 0, status, headers)
 }

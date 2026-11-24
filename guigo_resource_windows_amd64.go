@@ -17,6 +17,7 @@ package guigo
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"io"
@@ -27,6 +28,8 @@ import (
 	"strings"
 	"sync"
 	"unsafe"
+
+	"golang.org/x/sys/windows"
 )
 
 // resourceRequest 保存异步资源请求及所属线程的请求流
@@ -95,7 +98,7 @@ func (r *memoryResource) Close() error { return nil }
 // 入参: calls 页面调用队列, r 资源请求
 // 返回: *Resource 调用响应, error 请求错误
 func (n *nativeWindow) callResource(calls *callQueue, r *http.Request) (*Resource, error) {
-	if r.Header.Get("X-Guigo-Token") != n.bridgeToken {
+	if subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Guigo-Token")), []byte(n.bridgeToken)) != 1 {
 		return &Resource{StatusCode: 403, Body: &memoryResource{bytes.NewReader(nil)}}, nil
 	}
 	if calls == nil || r.Method != http.MethodPost {
@@ -276,16 +279,20 @@ func (n *nativeWindow) resource(args *comObject) {
 	if hresult(com(request, 9, uintptr(unsafe.Pointer(&headers)))) == nil && headers != nil {
 		if hresult(com(headers, 8, uintptr(unsafe.Pointer(&iterator)))) == nil && iterator != nil {
 			var has int32
-			com(iterator, 4, uintptr(unsafe.Pointer(&has)))
-			for has != 0 {
-				var key, value *uint16
-				if hresult(com(iterator, 3, uintptr(unsafe.Pointer(&key)), uintptr(unsafe.Pointer(&value)))) != nil {
-					break
+			if hresult(com(iterator, 4, uintptr(unsafe.Pointer(&has)))) == nil {
+				for has != 0 {
+					var key, value *uint16
+					if hresult(com(iterator, 3, uintptr(unsafe.Pointer(&key)), uintptr(unsafe.Pointer(&value)))) != nil {
+						break
+					}
+					req.Header.Add(windows.UTF16PtrToString(key), windows.UTF16PtrToString(value))
+					ole32.NewProc("CoTaskMemFree").Call(uintptr(unsafe.Pointer(key)))
+					ole32.NewProc("CoTaskMemFree").Call(uintptr(unsafe.Pointer(value)))
+					has = 0
+					if hresult(com(iterator, 5, uintptr(unsafe.Pointer(&has)))) != nil {
+						break
+					}
 				}
-				req.Header.Add(utf16String(key), utf16String(value))
-				ole32.NewProc("CoTaskMemFree").Call(uintptr(unsafe.Pointer(key)))
-				ole32.NewProc("CoTaskMemFree").Call(uintptr(unsafe.Pointer(value)))
-				com(iterator, 5, uintptr(unsafe.Pointer(&has)))
 			}
 			release(iterator)
 		}
@@ -308,6 +315,13 @@ func (n *nativeWindow) resource(args *comObject) {
 	go func() {
 		if body != nil {
 			defer body.Close()
+		}
+		if localURL(uri) && isReservedPath(req.URL.Path) && req.URL.Path != "/__guigo/call" {
+			_ = n.enqueue(func() {
+				n.respond(args, nil, 404, "")
+				n.finishResource(args)
+			})
+			return
 		}
 		if localURL(uri) && (n.options.ResourceHandler != nil || req.URL.Path == "/__guigo/call") {
 			var resource *Resource
@@ -338,7 +352,16 @@ func (n *nativeWindow) resource(args *comObject) {
 				return
 			}
 			if resource != nil {
+				status := normalizeHTTPStatus(resource.StatusCode)
 				if resource.Body == nil {
+					if status == http.StatusNoContent || status == http.StatusNotModified {
+						headerText := formatHeaders(resource.Header.Clone())
+						_ = n.enqueue(func() {
+							n.respond(args, nil, status, headerText)
+							n.finishResource(args)
+						})
+						return
+					}
 					if req.Context().Err() == nil {
 						n.reportError(errors.New("missing resource body"))
 					}
@@ -371,7 +394,6 @@ func (n *nativeWindow) resource(args *comObject) {
 				if cloned.Get("Content-Length") == "" {
 					cloned.Set("Content-Length", strconv.FormatInt(size, 10))
 				}
-				status := normalizeHTTPStatus(resource.StatusCode)
 				if req.Method == http.MethodHead {
 					resource.Body.Close()
 					headerText := formatHeaders(cloned)

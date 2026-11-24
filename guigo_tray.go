@@ -28,44 +28,30 @@ import (
 var ErrTrayUnavailable = errors.New("system tray is unavailable")
 
 // TrayItem 定义托盘菜单项，支持子菜单、分隔线及由调用方维护的选中状态
+// ID在菜单树内唯一(分隔线可省略)，Label按原文显示，Separator不可带文本、选中态或子菜单
+// Radio须配合Checked使用；含Children的父项仅用于展开子菜单，不触发OnSelect且不带选中态
 type TrayItem struct {
-	// ID 指定菜单项标识，在整个菜单树内唯一，由OnSelect接收，分隔线可省略
-	ID string
-	// Label 指定菜单项显示文字，按原文显示，不解释为助记键标记
-	Label string
-	// Disabled 禁止选择当前菜单项
-	Disabled bool
-	// Hidden 隐藏当前菜单项及其子菜单
-	Hidden bool
-	// Separator 将当前项显示为分隔线，不设置文字、选中状态及子菜单
+	ID        string
+	Label     string
+	Disabled  bool
+	Hidden    bool
 	Separator bool
-	// Checked 指定选中状态，nil表示普通菜单项，点击后由调用方通过SetOptions更新
-	Checked *bool
-	// Radio 将选中标记显示为单选圆点，需要同时设置Checked，分组互斥由调用方维护
-	Radio bool
-	// Children 指定子菜单，非空时当前项仅打开子菜单，不触发OnSelect
-	Children []TrayItem
+	Checked   *bool
+	Radio     bool
+	Children  []TrayItem
 }
 
 // TrayOptions 定义托盘图标、菜单和交互回调
+// Title为空沿用窗口标题；Icon与IconPath互斥且约束同Options.Icon，均为空沿用窗口或系统默认图标
+// MenuOnActivate使主激活优先打开菜单；OnSelect、OnActivate、OnSecondaryActivate均在后台并发回调
 type TrayOptions struct {
-	// Title 指定托盘标题和提示文字，空值使用创建窗口时的标题，Windows提示最多127个UTF16编码单元
-	Title string
-	// Icon 指定PNG图标数据，与IconPath互斥，格式及尺寸限制与Options.Icon一致
-	// Icon和IconPath均为空时使用创建窗口时的图标，窗口也未指定时使用系统默认图标
-	Icon []byte
-	// IconPath 指定外置PNG图标路径，调用时读取，之后不依赖该文件
-	IconPath string
-	// Items 指定菜单树，空值表示没有菜单
-	Items []TrayItem
-	// MenuOnActivate 在主激活时打开菜单而不调用OnActivate，桌面也可能将所有点击统一为菜单操作
-	MenuOnActivate bool
-	// OnSelect 在后台Goroutine接收启用菜单项的ID，多次回调可能并发执行
-	OnSelect func(string)
-	// OnActivate 在后台Goroutine接收系统激活操作，多次回调可能并发执行
-	OnActivate func()
-	// OnSecondaryActivate 接收次要激活操作，如鼠标中键，具体手势由桌面决定
-	// 回调在后台Goroutine执行，多次回调可能并发执行
+	Title               string
+	Icon                []byte
+	IconPath            string
+	Items               []TrayItem
+	MenuOnActivate      bool
+	OnSelect            func(string)
+	OnActivate          func()
 	OnSecondaryActivate func()
 }
 
@@ -91,7 +77,7 @@ func prepareTray(options TrayOptions, title string, icon []byte) (TrayOptions, e
 		return TrayOptions{}, errors.New("invalid tray title")
 	}
 	if len(options.Icon) != 0 && options.IconPath != "" {
-		return TrayOptions{}, errors.New("Icon and IconPath are mutually exclusive")
+		return TrayOptions{}, errors.New("icon data and path are mutually exclusive")
 	}
 	if len(options.Icon) == 0 && options.IconPath == "" {
 		options.Icon = icon
@@ -113,6 +99,9 @@ func prepareTrayItems(items []TrayItem, seen map[string]bool) ([]TrayItem, error
 	result := make([]TrayItem, len(items))
 	for i, item := range items {
 		if item.ID != "" {
+			if !utf8.ValidString(item.ID) || strings.ContainsRune(item.ID, 0) {
+				return nil, fmt.Errorf("invalid tray item ID: %q", item.ID)
+			}
 			if seen[item.ID] {
 				return nil, fmt.Errorf("duplicate tray item ID: %q", item.ID)
 			}
@@ -122,7 +111,7 @@ func prepareTrayItems(items []TrayItem, seen map[string]bool) ([]TrayItem, error
 			if item.Label != "" || item.Checked != nil || item.Radio || len(item.Children) != 0 {
 				return nil, errors.New("tray separator cannot have text, selection or children")
 			}
-		} else if item.ID == "" || item.Label == "" || !utf8.ValidString(item.Label) || strings.ContainsRune(item.Label, 0) || item.Radio && item.Checked == nil {
+		} else if item.ID == "" || item.Label == "" || !utf8.ValidString(item.Label) || strings.ContainsRune(item.Label, 0) || item.Radio && item.Checked == nil || len(item.Children) != 0 && (item.Checked != nil || item.Radio) {
 			return nil, fmt.Errorf("invalid tray item: %q", item.ID)
 		}
 		if item.Checked != nil {

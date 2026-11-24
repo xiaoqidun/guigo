@@ -22,8 +22,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"unsafe"
 )
+
+// linuxDialogIDs 为原生异步对话框分配进程级递增标识
+var linuxDialogIDs atomic.Uint64
 
 // linuxDialog 保存异步对话框状态
 type linuxDialog struct {
@@ -102,7 +106,7 @@ func linuxDialogFinished(object, result, id uintptr) {
 	}
 	if dialog.mode == 3 {
 		count := gtk.ListCount(value)
-		for i := uint32(0); i < count; i++ {
+		for i := uint32(0); i < count && err == nil; i++ {
 			file := gtk.ListItem(value, i)
 			appendFile(file)
 			gtk.Unref(file)
@@ -110,10 +114,40 @@ func linuxDialogFinished(object, result, id uintptr) {
 	} else {
 		appendFile(value)
 	}
-	if len(paths) == 0 && err == nil {
+	if err != nil {
+		paths = nil
+	} else if len(paths) == 0 {
 		err = ErrCanceled
 	}
 	n.finishDialog(id, paths, err)
+}
+
+// linuxExistingDir 沿路径向上查找首个存在的目录
+// 入参: path 起始绝对路径
+// 返回: string 已存在的目录路径，未找到返回空字符串
+func linuxExistingDir(path string) string {
+	current := filepath.Clean(path)
+	for {
+		if info, err := os.Stat(current); err == nil && info.IsDir() {
+			return current
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return ""
+		}
+		current = parent
+	}
+}
+
+// linuxFilterSuffix 提取简单通配符模式中的文件扩展名后缀
+// 入参: pattern 单个通配符模式
+// 返回: string 扩展名后缀, bool 是否为简单扩展名模式
+func linuxFilterSuffix(pattern string) (string, bool) {
+	suffix, ok := strings.CutPrefix(pattern, "*.")
+	if !ok || suffix == "" || strings.ContainsAny(suffix, "*?[]/\\.") {
+		return "", false
+	}
+	return suffix, true
 }
 
 // dialog 选择单个文件或目录
@@ -134,10 +168,7 @@ func (n *nativeWindow) dialog(ctx context.Context, o DialogOptions, mode int) (s
 // 入参: ctx 调用上下文, o 对话框选项, mode 对话框类型
 // 返回: []string 文件路径, error 对话框错误
 func (n *nativeWindow) dialogs(ctx context.Context, o DialogOptions, mode int) ([]string, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if n.ctx.Err() != nil {
+	if n.isClosed() || n.ctx.Err() != nil {
 		return nil, ErrClosed
 	}
 	result := make(chan linuxDialogResult, 1)
@@ -154,8 +185,7 @@ func (n *nativeWindow) dialogs(ctx context.Context, o DialogOptions, mode int) (
 			result <- linuxDialogResult{err: ErrDialogBusy}
 			return
 		}
-		n.nextDialog++
-		id := n.nextDialog
+		id := uintptr(linuxDialogIDs.Add(1))
 		dialog := &linuxDialog{object: gtk.DialogNew(), cancel: gtk.CancelNew(), mode: mode, ctx: ctx, result: result}
 		dialog.stop = context.AfterFunc(ctx, func() {
 			_ = n.enqueue(func() {
@@ -175,39 +205,72 @@ func (n *nativeWindow) dialogs(ctx context.Context, o DialogOptions, mode int) (
 				n.finishDialog(id, nil, err)
 				return
 			}
-			file := gtk.FileNew(path)
-			info, err := os.Stat(path)
-			if err == nil && info.IsDir() {
-				gtk.DialogFolder(dialog.object, file)
+			info, statErr := os.Stat(path)
+			if mode == 2 {
+				if dir := linuxExistingDir(path); dir != "" {
+					folder := gtk.FileNew(dir)
+					gtk.DialogFolder(dialog.object, folder)
+					gtk.Unref(folder)
+				}
+			} else if statErr == nil && info.IsDir() {
+				folder := gtk.FileNew(path)
+				gtk.DialogFolder(dialog.object, folder)
+				gtk.Unref(folder)
 			} else if mode == 1 {
-				parent := gtk.FileNew(filepath.Dir(path))
-				gtk.DialogFolder(dialog.object, parent)
-				gtk.Unref(parent)
+				if dir := linuxExistingDir(filepath.Dir(path)); dir != "" {
+					parent := gtk.FileNew(dir)
+					gtk.DialogFolder(dialog.object, parent)
+					gtk.Unref(parent)
+				}
 				if o.DefaultName == "" {
 					gtk.DialogName(dialog.object, filepath.Base(path))
 				}
 			} else {
+				file := gtk.FileNew(path)
 				gtk.DialogFile(dialog.object, file)
+				gtk.Unref(file)
 			}
-			gtk.Unref(file)
 		}
 		if o.DefaultName != "" && mode != 2 {
 			gtk.DialogName(dialog.object, o.DefaultName)
 		}
 		if len(o.Filters) > 0 && mode != 2 {
 			list := gtk.ListNew(gtk.FilterType())
+			var firstFilter uintptr
 			for _, f := range o.Filters {
 				filter := gtk.FilterNew()
-				gtk.FilterName(filter, f.Name)
+				added := 0
 				for _, pattern := range strings.Split(f.Pattern, ";") {
-					if pattern = strings.TrimSpace(pattern); pattern != "" {
+					if pattern = strings.TrimSpace(pattern); pattern == "" {
+						continue
+					}
+					if suffix, ok := linuxFilterSuffix(pattern); ok && gtk.FilterSuffix != nil {
+						gtk.FilterSuffix(filter, suffix)
+					} else {
 						gtk.FilterPattern(filter, pattern)
 					}
+					added++
+				}
+				if added == 0 {
+					gtk.Unref(filter)
+					continue
+				}
+				if f.Name != "" {
+					gtk.FilterName(filter, f.Name)
 				}
 				gtk.ListAppend(list, filter)
+				if firstFilter == 0 {
+					firstFilter = gtk.Ref(filter)
+				}
 				gtk.Unref(filter)
 			}
-			gtk.DialogFilters(dialog.object, list)
+			if firstFilter != 0 {
+				gtk.DialogFilters(dialog.object, list)
+				if gtk.DialogDefaultFilter != nil {
+					gtk.DialogDefaultFilter(dialog.object, firstFilter)
+				}
+				gtk.Unref(firstFilter)
+			}
 			gtk.Unref(list)
 		}
 		launch := gtk.DialogOpen

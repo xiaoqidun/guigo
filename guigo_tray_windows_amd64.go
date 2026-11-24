@@ -27,7 +27,7 @@ import (
 // trayMessage 接收通知区域图标消息
 const trayMessage = 0x8031
 
-// taskbarCreated 接收任务栏重建与显示配置变化通知
+// taskbarCreated 保存系统任务栏重建通知消息编号
 var taskbarCreated, _, _ = user32.NewProc("RegisterWindowMessageW").Call(uintptr(unsafe.Pointer(wide("TaskbarCreated"))))
 
 // notifyIconData 对应Windows通知区域图标结构
@@ -60,9 +60,6 @@ type windowsTray struct {
 // 入参: ctx 调用上下文, options 托盘配置
 // 返回: *Tray 托盘句柄, error 创建错误
 func (n *nativeWindow) newTray(ctx context.Context, options TrayOptions) (*Tray, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
 	if taskbarCreated == 0 {
 		return nil, errors.New("cannot register taskbar notification")
 	}
@@ -188,9 +185,6 @@ func (t *windowsTray) register() bool {
 // 入参: ctx 调用上下文, options 完整新配置
 // 返回: error 配置或系统错误
 func (t *windowsTray) setOptions(ctx context.Context, options TrayOptions) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
 	options, err := prepareTray(options, t.owner.options.Title, t.owner.iconData)
 	if err != nil {
 		return err
@@ -264,7 +258,7 @@ func (t *windowsTray) runTrayCallback(fn func()) {
 // 入参: msg 窗口消息, wparam 坐标参数, lparam 通知数据
 // 返回: bool 是否已处理
 func (n *nativeWindow) trayProc(msg, wparam, lparam uintptr) bool {
-	if msg == taskbarCreated {
+	if taskbarCreated != 0 && msg == taskbarCreated {
 		for _, t := range n.trays {
 			available := t.register()
 			t.handle.available.Store(available)

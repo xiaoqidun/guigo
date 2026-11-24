@@ -19,68 +19,49 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 )
 
-// PrinterInfo 标识系统打印队列，不表示设备一定在线
+// PrinterInfo 标识系统打印队列名及是否为默认设备，不表示设备一定在线
 type PrinterInfo struct {
-	// Name 指定系统队列名称
-	Name string `json:"name"`
-	// Default 表示当前系统默认队列
-	Default bool `json:"default"`
+	Name    string `json:"name"`
+	Default bool   `json:"default"`
 }
 
-// PrintPaper 保存设备支持的纸张，宽高按未旋转方向以毫米表示
+// PrintPaper 保存设备支持的纸张标识、名称及未旋转方向毫米尺寸
 type PrintPaper struct {
-	// ID 保存驱动或打印服务的纸张标识
-	ID string `json:"id"`
-	// Name 保存纸张显示名称
-	Name string `json:"name"`
-	// Width 保存未旋转纸张宽度，单位为毫米
-	Width float64 `json:"width"`
-	// Height 保存未旋转纸张高度，单位为毫米
+	ID     string  `json:"id"`
+	Name   string  `json:"name"`
+	Width  float64 `json:"width"`
 	Height float64 `json:"height"`
 }
 
 // PrintRectangle 保存以物理纸张左上角为原点的毫米区域
 type PrintRectangle struct {
-	// X 指定区域左边位置，单位为毫米
-	X float64 `json:"x"`
-	// Y 指定区域上边位置，单位为毫米
-	Y float64 `json:"y"`
-	// Width 指定区域宽度，单位为毫米
-	Width float64 `json:"width"`
-	// Height 指定区域高度，单位为毫米
+	X      float64 `json:"x"`
+	Y      float64 `json:"y"`
+	Width  float64 `json:"width"`
 	Height float64 `json:"height"`
 }
 
 // PrinterProfile 是一次设备设置查询的独立结果，不缓存为永久设备能力
+// Width/Height为应用方向后的物理纸面毫米尺寸，PrintableArea为硬件可打印区域
+// Fingerprint标识当前设置与设备几何信息，供提交前复查
 type PrinterProfile struct {
-	// Printer 保存实际查询的系统队列
-	Printer PrinterInfo `json:"printer"`
-	// Options 保存已解析默认值的设备选项，纸张宽高仍为未旋转尺寸
-	Options PrintOptions `json:"options"`
-	// Papers 保存设备声明支持的纸张
-	Papers []PrintPaper `json:"papers"`
-	// Width 保存应用方向后的物理纸面宽度，单位为毫米
-	Width float64 `json:"width"`
-	// Height 保存应用方向后的物理纸面高度，单位为毫米
-	Height float64 `json:"height"`
-	// PrintableArea 保存当前纸面坐标下的硬件可打印区域
+	Printer       PrinterInfo    `json:"printer"`
+	Options       PrintOptions   `json:"options"`
+	Papers        []PrintPaper   `json:"papers"`
+	Width         float64        `json:"width"`
+	Height        float64        `json:"height"`
 	PrintableArea PrintRectangle `json:"printableArea"`
-	// Color 表示设备支持彩色打印
-	Color bool `json:"color"`
-	// Duplex 表示设备支持自动双面，具体翻转方式仍需逐项查询
-	Duplex bool `json:"duplex"`
-	// MaxCopies 保存设备单次作业的份数上限
-	MaxCopies int `json:"maxCopies"`
-	// CustomPaper 表示设备支持自定义纸张，具体尺寸仍需查询校验
-	CustomPaper bool `json:"customPaper"`
-	// Properties 表示平台支持系统设备属性窗口
-	Properties bool `json:"properties"`
-	// Fingerprint 标识当前设置及设备几何信息，供提交前重新查询比较
-	Fingerprint string `json:"fingerprint"`
+	Color         bool           `json:"color"`
+	Duplex        bool           `json:"duplex"`
+	MaxCopies     int            `json:"maxCopies"`
+	CustomPaper   bool           `json:"customPaper"`
+	Properties    bool           `json:"properties"`
+	Fingerprint   string         `json:"fingerprint"`
 }
 
 // validatePrinterProfile 统一检查返回区域及作业能力，并计算可复查的设备指纹
@@ -93,11 +74,11 @@ func validatePrinterProfile(p *PrinterProfile) error {
 	r := p.PrintableArea
 	for _, v := range []float64{p.Width, p.Height, r.X, r.Y, r.Width, r.Height} {
 		if math.IsNaN(v) || math.IsInf(v, 0) || v < 0 {
-			return fmt.Errorf("invalid printer geometry")
+			return errors.New("invalid printer geometry")
 		}
 	}
 	if p.Printer.Name == "" || p.Width <= 0 || p.Height <= 0 || r.Width <= 0 || r.Height <= 0 || r.X+r.Width > p.Width+0.1 || r.Y+r.Height > p.Height+0.1 {
-		return fmt.Errorf("invalid printer printable area")
+		return errors.New("invalid printer printable area")
 	}
 	if p.Options.Color == PrintColorModeColor && !p.Color || p.Options.Duplex != "" && p.Options.Duplex != PrintDuplexOneSided && !p.Duplex || p.MaxCopies > 0 && p.Options.Copies > p.MaxCopies {
 		return fmt.Errorf("%w: device settings", ErrPrintUnsupported)
@@ -123,7 +104,7 @@ func validatePrinterProfile(p *PrinterProfile) error {
 // 返回: []PrinterInfo 系统打印队列, error 查询或取消错误
 func (w *Window) ListPrinters(ctx context.Context) ([]PrinterInfo, error) {
 	if ctx == nil {
-		return nil, fmt.Errorf("nil print context")
+		return nil, errors.New("nil context")
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -140,7 +121,7 @@ func (w *Window) ListPrinters(ctx context.Context) ([]PrinterInfo, error) {
 // 返回: PrinterProfile 设备能力及当前纸面, error 配置、查询或取消错误
 func (w *Window) QueryPrinter(ctx context.Context, options PrintOptions) (PrinterProfile, error) {
 	if ctx == nil {
-		return PrinterProfile{}, fmt.Errorf("nil print context")
+		return PrinterProfile{}, errors.New("nil context")
 	}
 	if err := ctx.Err(); err != nil {
 		return PrinterProfile{}, err
@@ -167,7 +148,7 @@ func (w *Window) QueryPrinter(ctx context.Context, options PrintOptions) (Printe
 // 返回: error 不支持、取消或窗口调用错误
 func (w *Window) ShowPrinterProperties(ctx context.Context, printer string) error {
 	if ctx == nil {
-		return fmt.Errorf("nil print context")
+		return errors.New("nil context")
 	}
 	if err := ctx.Err(); err != nil {
 		return err

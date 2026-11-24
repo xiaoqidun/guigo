@@ -74,20 +74,14 @@ const linuxTrayXML = `<node>
 </interface>
 </node>`
 
-// linuxTrays 按数字标识保存原生回调对应的托盘
-var linuxTrays sync.Map
-
-// linuxTrayIDs 分配独立托盘标识
-var linuxTrayIDs atomic.Uint64
-
-// linuxTrayVTable 保存总线对象回调表
-var linuxTrayVTable [11]uintptr
-
-// linuxTraySignal 接收宿主变更通知
-var linuxTraySignal uintptr
-
-// linuxTrayClosedSignal 接收连接关闭通知
-var linuxTrayClosedSignal uintptr
+// 托盘注册表、递增标识与GDBus原生信号回调表
+var (
+	linuxTrays            sync.Map
+	linuxTrayIDs          atomic.Uint64
+	linuxTrayVTable       [11]uintptr
+	linuxTraySignal       uintptr
+	linuxTrayClosedSignal uintptr
+)
 
 // linuxTray 的配置与原生字段仅由GTK线程访问
 type linuxTray struct {
@@ -102,6 +96,7 @@ type linuxTray struct {
 	closedSignal          uint64
 	closed                bool
 	reregistering         atomic.Bool
+	reregisterPending     atomic.Bool
 	pixmapVariant         uintptr
 	tooltipVariant        uintptr
 	ids                   map[string]int32
@@ -136,6 +131,7 @@ func trayPixmap(data []byte) (string, error) {
 	}
 	bounds := img.Bounds()
 	var text strings.Builder
+	text.Grow((32*32+64*64)*20 + 64)
 	text.WriteString("@a(iiay) [")
 	for i, size := range []int{32, 64} {
 		if i != 0 {
@@ -187,7 +183,10 @@ func linuxTrayHostChanged(connection uintptr, sender, path, iface, signal *byte,
 	}
 	switch nativeString(signal) {
 	case "NameOwnerChanged":
-		newOwner := trayString(params, 2)
+		newOwner, ok := trayString(params, 2)
+		if !ok {
+			return
+		}
 		if newOwner == "" {
 			t.handle.available.Store(false)
 			_ = t.owner.activate()
@@ -195,8 +194,7 @@ func linuxTrayHostChanged(connection uintptr, sender, path, iface, signal *byte,
 			t.reregister()
 		}
 	case "StatusNotifierHostUnregistered":
-		t.handle.available.Store(false)
-		_ = t.owner.activate()
+		t.checkHostOffline()
 	case "StatusNotifierHostRegistered":
 		t.reregister()
 	}
@@ -268,7 +266,11 @@ func linuxTrayProperty(connection uintptr, sender, path, iface, property *byte, 
 		case "Category":
 			text = `"ApplicationStatus"`
 		case "Id":
-			text = trayQuote(fmt.Sprintf("%s-%d", t.owner.options.AppID, t.id))
+			prefix := t.owner.options.AppID
+			if prefix == "" {
+				prefix = "guigo"
+			}
+			text = trayQuote(fmt.Sprintf("%s-%d", prefix, t.id))
 		case "Title":
 			text = trayQuote(t.options.Title)
 		case "Status":
@@ -309,13 +311,10 @@ func linuxTrayProperty(connection uintptr, sender, path, iface, property *byte, 
 	return gdbus.Parse(0, text, 0, 0, failure)
 }
 
-// newTray 导出对象后在后台注册宿主，避免宿主回查属性时阻塞GTK回调
+// newTray 导出对象后在后台注册宿主，通过队列移交全部原生资源所有权以消除取消竞态
 // 入参: ctx 调用上下文, options 托盘配置
 // 返回: *Tray 托盘句柄, error 初始化错误
 func (n *nativeWindow) newTray(ctx context.Context, options TrayOptions) (*Tray, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
 	options, err := prepareTray(options, n.options.Title, n.iconData)
 	if err != nil {
 		return nil, err
@@ -351,19 +350,48 @@ func (n *nativeWindow) newTray(ctx context.Context, options TrayOptions) (*Tray,
 		}
 		return nil, fmt.Errorf("%w: %w", ErrTrayUnavailable, err)
 	}
-	t := &linuxTray{owner: n, pixmapVariant: pixmapVar, tooltipVariant: tooltipVar, id: uintptr(linuxTrayIDs.Add(1)), ids: make(map[string]int32)}
+	t := &linuxTray{owner: n, id: uintptr(linuxTrayIDs.Add(1)), ids: make(map[string]int32)}
 	t.updateMenu(options)
-	t.handle = &Tray{setOptions: t.setOptions, close: func() error { return t.onThread(context.Background(), t.release) }}
-	var exportErr error
-	err = t.onThread(ctx, func() { exportErr = t.export(connection) })
-	if err != nil {
-		gdbus.CloseAsync(connection, 0, 0, 0)
+	t.handle = &Tray{setOptions: t.setOptions, close: t.close}
+	connRef := gtk.Ref(connection)
+	releasePending := func() {
+		gdbus.CloseAsync(connRef, 0, 0, 0)
+		gtk.Unref(connRef)
 		gdbus.Unref(pixmapVar)
 		gdbus.Unref(tooltipVar)
+	}
+	exportDone := make(chan error, 1)
+	if err = n.enqueueCleanup(func() {
+		if err := ctx.Err(); err != nil {
+			releasePending()
+			exportDone <- err
+			return
+		}
+		if n.closed || t.closed {
+			releasePending()
+			exportDone <- ErrClosed
+			return
+		}
+		t.pixmapVariant = pixmapVar
+		t.tooltipVariant = tooltipVar
+		exportErr := t.export(connRef)
+		gtk.Unref(connRef)
+		exportDone <- exportErr
+	}, func() {
+		releasePending()
+		exportDone <- ErrClosed
+	}); err != nil {
+		releasePending()
 		return nil, err
 	}
-	if exportErr != nil {
-		return nil, exportErr
+	select {
+	case exportErr := <-exportDone:
+		if exportErr != nil {
+			return nil, exportErr
+		}
+	case <-ctx.Done():
+		_ = t.handle.Close()
+		return nil, ctx.Err()
 	}
 	reply, callErr := trayCall(ctx, connection, owner, "/StatusNotifierWatcher", trayWatcher, "RegisterStatusNotifierItem", `("/StatusNotifierItem",)`)
 	if reply != 0 {
@@ -383,47 +411,104 @@ func (n *nativeWindow) newTray(ctx context.Context, options TrayOptions) (*Tray,
 		}
 		return nil, fmt.Errorf("%w: %w", ErrTrayUnavailable, callErr)
 	}
-	var stopped bool
-	if err = t.onThread(ctx, func() {
-		stopped = t.closed || gdbus.Closed(connection) != 0
-		if !stopped {
-			t.handle.available.Store(true)
+	confirmDone := make(chan error, 1)
+	if err = n.enqueueCleanup(func() {
+		if err := ctx.Err(); err != nil {
+			confirmDone <- err
+			return
 		}
-	}); err != nil || stopped {
+		if n.closed {
+			confirmDone <- ErrClosed
+			return
+		}
+		if t.closed || t.connection == 0 || gdbus.Closed(t.connection) != 0 {
+			confirmDone <- ErrTrayUnavailable
+			return
+		}
+		t.handle.available.Store(true)
+		confirmDone <- nil
+	}, func() { confirmDone <- ErrClosed }); err != nil {
 		_ = t.handle.Close()
-		if err != nil {
-			return nil, err
-		}
-		return nil, ErrTrayUnavailable
+		return nil, err
+	}
+	select {
+	case err = <-confirmDone:
+	case <-ctx.Done():
+		err = ctx.Err()
+	}
+	if err != nil {
+		_ = t.handle.Close()
+		return nil, err
 	}
 	return t.handle, nil
 }
 
-// reregister 在桌面托盘宿主重启或重新上线后异步重新向监视服务注册
-func (t *linuxTray) reregister() {
-	if t.closed || t.connection == 0 || !t.reregistering.CompareAndSwap(false, true) {
+// checkHostOffline 异步复查监视服务是否已无在线托盘宿主，确认离线后再恢复窗口
+func (t *linuxTray) checkHostOffline() {
+	if t.closed || t.connection == 0 {
 		return
 	}
 	connection := gtk.Ref(t.connection)
 	go func() {
-		defer t.reregistering.Store(false)
 		defer gtk.Unref(connection)
-		owner, err := trayHost(t.owner.ctx, connection)
-		if err != nil {
+		if t.owner.ctx.Err() != nil || t.handle.closed.Load() {
 			return
 		}
-		reply, err := trayCall(t.owner.ctx, connection, owner, "/StatusNotifierWatcher", trayWatcher, "RegisterStatusNotifierItem", `("/StatusNotifierItem",)`)
-		if reply != 0 {
-			gdbus.Unref(reply)
+		if _, err := trayHost(t.owner.ctx, connection); err == nil {
+			return
 		}
-		if err != nil {
+		if t.owner.ctx.Err() != nil {
 			return
 		}
 		_ = t.owner.enqueue(func() {
-			if !t.closed && t.connection == connection && gdbus.Closed(connection) == 0 {
-				t.handle.available.Store(true)
+			if !t.closed && t.connection == connection && !t.reregistering.Load() && !t.reregisterPending.Load() {
+				t.handle.available.Store(false)
+				_ = t.owner.activate()
 			}
 		})
+	}()
+}
+
+// reregister 在桌面托盘宿主重启或重新上线后异步重新向监视服务注册，保留并发期间到达的重试信号
+func (t *linuxTray) reregister() {
+	if t.closed || t.connection == 0 {
+		return
+	}
+	t.reregisterPending.Store(true)
+	if !t.reregistering.CompareAndSwap(false, true) {
+		return
+	}
+	connection := gtk.Ref(t.connection)
+	go func() {
+		defer gtk.Unref(connection)
+		for {
+			t.reregisterPending.Store(false)
+			if t.owner.ctx.Err() != nil || t.handle.closed.Load() || gdbus.Closed(connection) != 0 {
+				t.reregistering.Store(false)
+				return
+			}
+			owner, err := trayHost(t.owner.ctx, connection)
+			if err == nil {
+				reply, callErr := trayCall(t.owner.ctx, connection, owner, "/StatusNotifierWatcher", trayWatcher, "RegisterStatusNotifierItem", `("/StatusNotifierItem",)`)
+				if reply != 0 {
+					gdbus.Unref(reply)
+				}
+				if callErr == nil {
+					_ = t.owner.enqueue(func() {
+						if !t.closed && t.connection == connection && gdbus.Closed(connection) == 0 {
+							t.handle.available.Store(true)
+						}
+					})
+				}
+			}
+			if t.reregisterPending.Load() {
+				continue
+			}
+			t.reregistering.Store(false)
+			if !t.reregisterPending.Load() || !t.reregistering.CompareAndSwap(false, true) {
+				return
+			}
+		}
 	}()
 }
 
@@ -441,13 +526,10 @@ func (t *linuxTray) runTrayCallback(fn func()) {
 	}()
 }
 
-// setOptions 在GTK线程替换配置并通知宿主重新读取，信号发送失败时完整回滚状态
+// setOptions 通过队列移交新值所有权并在GTK线程替换配置，信号失败时回滚状态且不回退已发revision
 // 入参: ctx 调用上下文, options 完整新配置
 // 返回: error 配置或通信错误
 func (t *linuxTray) setOptions(ctx context.Context, options TrayOptions) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
 	options, err := prepareTray(options, t.owner.options.Title, t.owner.iconData)
 	if err != nil {
 		return err
@@ -460,15 +542,20 @@ func (t *linuxTray) setOptions(ctx context.Context, options TrayOptions) error {
 	if err != nil {
 		return err
 	}
-	var updateErr error
-	applied := false
-	err = t.onThread(ctx, func() {
+	freeNew := func() {
+		gdbus.Unref(newPixmapVar)
+		gdbus.Unref(newTooltipVar)
+	}
+	done := make(chan error, 1)
+	if err = t.owner.enqueueCleanup(func() {
 		if err := ctx.Err(); err != nil {
-			updateErr = err
+			freeNew()
+			done <- err
 			return
 		}
 		if t.closed {
-			updateErr = ErrClosed
+			freeNew()
+			done <- ErrClosed
 			return
 		}
 		oldOptions := t.options
@@ -484,6 +571,7 @@ func (t *linuxTray) setOptions(ctx context.Context, options TrayOptions) error {
 		t.updateMenu(options)
 		t.pixmapVariant = newPixmapVar
 		t.tooltipVariant = newTooltipVar
+		layoutSent := false
 		rollback := func() {
 			t.options = oldOptions
 			t.ids = oldIDs
@@ -492,75 +580,73 @@ func (t *linuxTray) setOptions(ctx context.Context, options TrayOptions) error {
 			t.children = oldChildren
 			t.parents = oldParents
 			t.nextID = oldNextID
-			t.revision = oldRevision
+			if !layoutSent {
+				t.revision = oldRevision
+			}
 			t.pixmapVariant = oldPixmapVar
 			t.tooltipVariant = oldTooltipVar
+			freeNew()
 		}
 		for _, signal := range []string{"NewTitle", "NewIcon", "NewToolTip"} {
-			if updateErr = trayEmit(t.connection, "/StatusNotifierItem", trayNotifierInterface, signal, "()"); updateErr != nil {
+			if err := trayEmit(t.connection, "/StatusNotifierItem", trayNotifierInterface, signal, "()"); err != nil {
 				rollback()
+				done <- err
 				return
 			}
 		}
-		if updateErr = trayEmit(t.connection, "/StatusNotifierItem", "org.freedesktop.DBus.Properties", "PropertiesChanged", fmt.Sprintf("(%s, {'ItemIsMenu': <%t>}, @as [])", trayQuote(trayNotifierInterface), options.MenuOnActivate)); updateErr != nil {
+		if err := trayEmit(t.connection, "/StatusNotifierItem", "org.freedesktop.DBus.Properties", "PropertiesChanged", fmt.Sprintf("(%s, {'ItemIsMenu': <%t>}, @as [])", trayQuote(trayNotifierInterface), options.MenuOnActivate)); err != nil {
 			rollback()
+			done <- err
 			return
 		}
-		if updateErr = trayEmit(t.connection, "/MenuBar", trayMenuInterface, "LayoutUpdated", fmt.Sprintf("(uint32 %d, int32 0)", t.revision)); updateErr != nil {
+		if err := trayEmit(t.connection, "/MenuBar", trayMenuInterface, "LayoutUpdated", fmt.Sprintf("(uint32 %d, int32 0)", t.revision)); err != nil {
 			rollback()
+			done <- err
 			return
 		}
+		layoutSent = true
 		properties := make([]string, 0, len(t.order))
 		for _, id := range t.order {
 			properties = append(properties, fmt.Sprintf("(int32 %d,%s)", id, t.itemProperties(id, nil)))
 		}
-		if updateErr = trayEmit(t.connection, "/MenuBar", trayMenuInterface, "ItemsPropertiesUpdated", "(@a(ia{sv}) ["+strings.Join(properties, ",")+"], @a(ias) [])"); updateErr != nil {
+		if err := trayEmit(t.connection, "/MenuBar", trayMenuInterface, "ItemsPropertiesUpdated", "(@a(ia{sv}) ["+strings.Join(properties, ",")+"], @a(ias) [])"); err != nil {
 			rollback()
+			done <- err
 			return
 		}
-		applied = true
 		if oldPixmapVar != 0 {
 			gdbus.Unref(oldPixmapVar)
 		}
 		if oldTooltipVar != 0 {
 			gdbus.Unref(oldTooltipVar)
 		}
-	})
-	if !applied {
-		gdbus.Unref(newPixmapVar)
-		gdbus.Unref(newTooltipVar)
-	}
-	if err != nil {
-		return err
-	}
-	return updateErr
-}
-
-// onThread 同步执行GTK资源操作并响应上下文取消，窗口关闭时不遗留等待者
-// 入参: ctx 调用上下文, fn 原生资源操作
-// 返回: error 请求投递、取消或窗口关闭错误
-func (t *linuxTray) onThread(ctx context.Context, fn func()) error {
-	if ctx != nil {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-	}
-	done := make(chan error, 1)
-	if err := t.owner.enqueueCleanup(func() {
-		fn()
 		done <- nil
-	}, func() { done <- ErrClosed }); err != nil {
+	}, func() {
+		freeNew()
+		done <- ErrClosed
+	}); err != nil {
+		freeNew()
 		return err
-	}
-	if ctx == nil || ctx.Done() == nil {
-		return <-done
 	}
 	select {
-	case err := <-done:
+	case err = <-done:
 		return err
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// close 同步在GTK线程释放托盘对象与连接
+// 返回: error 投递或关闭错误
+func (t *linuxTray) close() error {
+	done := make(chan error, 1)
+	if err := t.owner.enqueueCleanup(func() {
+		t.release()
+		done <- nil
+	}, func() { done <- ErrClosed }); err != nil {
+		return err
+	}
+	return <-done
 }
 
 // export 在GTK线程注册对象和信号，确保GDBus回调使用GTK主上下文

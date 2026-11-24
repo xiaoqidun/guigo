@@ -30,17 +30,13 @@ import (
 	"golang.org/x/sys/windows/registry"
 )
 
-// associationMu 串行化同一进程内的关联读写
-var associationMu sync.Mutex
-
-// associationSetValue 写入任意注册表值类型，供登记和失败回滚使用
-var associationSetValue = windows.NewLazySystemDLL("advapi32.dll").NewProc("RegSetValueExW")
-
-// associationDeleteKey 删除64位注册表视图中的指定键
-var associationDeleteKey = windows.NewLazySystemDLL("advapi32.dll").NewProc("RegDeleteKeyExW")
-
-// associationNotify 通知系统刷新文件关联
-var associationNotify = windows.NewLazySystemDLL("shell32.dll").NewProc("SHChangeNotify")
+// 文件关联操作锁与系统注册表和外壳刷新接口
+var (
+	associationMu        sync.Mutex
+	associationSetValue  = windows.NewLazySystemDLL("advapi32.dll").NewProc("RegSetValueExW")
+	associationDeleteKey = windows.NewLazySystemDLL("advapi32.dll").NewProc("RegDeleteKeyExW")
+	associationNotify    = windows.NewLazySystemDLL("shell32.dll").NewProc("SHChangeNotify")
+)
 
 // associationValue 保存一个注册表值及其位置
 type associationValue struct {
@@ -128,17 +124,30 @@ func readAssociationValue(root registry.Key, path, name string) (associationValu
 		return value, err
 	}
 	defer key.Close()
-	size, kind, err := key.GetValue(name, nil)
+	size, _, err := key.GetValue(name, nil)
 	if errors.Is(err, windows.ERROR_FILE_NOT_FOUND) {
 		return value, nil
 	}
 	if err != nil {
 		return value, err
 	}
-	value.kind, value.data = kind, make([]byte, size)
-	_, value.kind, err = key.GetValue(name, value.data)
-	value.exists = err == nil
-	return value, err
+	for range 5 {
+		buf := make([]byte, size)
+		n, kind, err := key.GetValue(name, buf)
+		if errors.Is(err, registry.ErrShortBuffer) || errors.Is(err, windows.ERROR_MORE_DATA) {
+			size = n
+			continue
+		}
+		if errors.Is(err, windows.ERROR_FILE_NOT_FOUND) {
+			return value, nil
+		}
+		if err != nil {
+			return value, err
+		}
+		value.kind, value.data, value.exists = kind, buf[:n], true
+		return value, nil
+	}
+	return value, windows.ERROR_MORE_DATA
 }
 
 // writeAssociationValue 写入或删除指定键中的单个值

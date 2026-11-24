@@ -22,10 +22,10 @@ import (
 	"golang.org/x/sys/windows/registry"
 )
 
-// SupportsWindowMaterial 查询当前平台是否提供指定窗口材质，实际效果由系统外观设置决定
+// supportsWindowMaterial 查询当前平台是否提供指定窗口材质，实际效果由系统外观设置决定
 // 入参: material 窗口材质
 // 返回: bool 是否支持
-func SupportsWindowMaterial(material WindowMaterial) bool {
+func supportsWindowMaterial(material WindowMaterial) bool {
 	return material == WindowSolid || (material == WindowMicaAlt || material == WindowAcrylic) && windows.RtlGetVersion().BuildNumber >= 22621
 }
 
@@ -89,7 +89,7 @@ func (n *nativeWindow) applyWindowMaterial() error {
 	return n.applyTitleBarColors(n.currentTitleBarInfo().Active)
 }
 
-// initializeWindowMaterial 设置WebView透明底色，使页面透明区域透出宿主的系统材质
+// initializeWindowMaterial 在非纯色模式下初始化窗口材质与WebView透明底色
 // 返回: error WebView接口或背景设置错误
 func (n *nativeWindow) initializeWindowMaterial() error {
 	if n.options.WindowMaterial == WindowSolid {

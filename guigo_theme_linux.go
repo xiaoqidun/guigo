@@ -29,21 +29,19 @@ import (
 	"github.com/ebitengine/purego"
 )
 
-// linuxTheme 保存探测系统外观所需的GIO与GLib函数入口
-var linuxTheme linuxThemeAPI
-
-// linuxThemeOnce 保证系统外观探测所需的动态库只加载一次
-var linuxThemeOnce sync.Once
-
-// linuxThemeErr 记录系统外观动态库加载错误
-var linuxThemeErr error
+// 系统外观探测所需的GIO与GLib函数入口及加载状态
+var (
+	linuxTheme     linuxThemeAPI
+	linuxThemeOnce sync.Once
+	linuxThemeErr  error
+)
 
 // linuxThemeAPI 保存通过门户读取外观偏好的定长参数入口
 type linuxThemeAPI struct {
 	Address      func(int32, uintptr, **linuxError) *byte                                                                      `symbol:"g_dbus_address_get_for_bus_sync"`
 	Connect      func(string, uint32, uintptr, uintptr, **linuxError) uintptr                                                  `symbol:"g_dbus_connection_new_for_address_sync"`
 	ExitOnClose  func(uintptr, int32)                                                                                          `symbol:"g_dbus_connection_set_exit_on_close"`
-	Close        func(uintptr, uintptr, uintptr, uintptr)                                                                      `symbol:"g_dbus_connection_close"`
+	Close        func(uintptr, uintptr, **linuxError) int32                                                                    `symbol:"g_dbus_connection_close_sync"`
 	Call         func(uintptr, string, string, string, string, uintptr, uintptr, uint32, int32, uintptr, **linuxError) uintptr `symbol:"g_dbus_connection_call_sync"`
 	CancelNew    func() uintptr                                                                                                `symbol:"g_cancellable_new"`
 	Cancel       func(uintptr)                                                                                                 `symbol:"g_cancellable_cancel"`
@@ -118,7 +116,7 @@ func loadLinuxTheme() error {
 	return linuxThemeErr
 }
 
-// linuxPortalDark 通过XDG桌面门户查询系统色彩偏好，超时不超过150毫秒
+// linuxPortalDark 通过XDG桌面门户查询系统色彩偏好并设置150毫秒取消超时
 // 返回: bool 是否偏好深色外观, bool 是否获得明确结果
 func linuxPortalDark() (bool, bool) {
 	if os.Getenv("DBUS_SESSION_BUS_ADDRESS") == "" {
@@ -172,7 +170,11 @@ func linuxPortalDark() (bool, bool) {
 	}
 	linuxTheme.ExitOnClose(conn, 0)
 	defer func() {
-		linuxTheme.Close(conn, 0, 0, 0)
+		var closeErr *linuxError
+		linuxTheme.Close(conn, 0, &closeErr)
+		if closeErr != nil {
+			linuxTheme.ErrorFree(closeErr)
+		}
 		linuxTheme.ObjectUnref(conn)
 	}()
 	params := linuxTheme.Parse(0, `("org.freedesktop.appearance", "color-scheme")`, 0, 0, &failure)
@@ -195,6 +197,9 @@ func linuxPortalDark() (bool, bool) {
 		return false, false
 	}
 	cur := linuxTheme.Child(reply, 0)
+	if cur == 0 {
+		return false, false
+	}
 	for range 4 {
 		if nativeString(linuxTheme.TypeString(cur)) != "v" {
 			break
@@ -239,6 +244,7 @@ func linuxGTKSettingsDark() bool {
 		inSettings := false
 		hasPreferDark := false
 		preferDark := false
+		hasTheme := false
 		themeDark := false
 		for _, line := range strings.Split(string(data), "\n") {
 			line = strings.TrimSpace(line)
@@ -261,7 +267,8 @@ func linuxGTKSettingsDark() bool {
 			if key == "gtk-application-prefer-dark-theme" {
 				hasPreferDark = true
 				preferDark = val == "1" || val == "true"
-			} else if key == "gtk-theme-name" {
+			} else if key == "gtk-theme-name" && val != "" {
+				hasTheme = true
 				if strings.Contains(val, ":light") {
 					themeDark = false
 				} else {
@@ -272,8 +279,8 @@ func linuxGTKSettingsDark() bool {
 		if hasPreferDark {
 			return preferDark
 		}
-		if themeDark {
-			return true
+		if hasTheme {
+			return themeDark
 		}
 	}
 	return false

@@ -17,6 +17,7 @@ package guigo
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -29,24 +30,23 @@ import (
 	"unsafe"
 )
 
+// 临时响应文件的独占访问权限与关闭自动删除标志
 const (
-	// temporaryFileAccess 允许临时文件读写和句柄关闭时删除
 	temporaryFileAccess = syscall.GENERIC_READ | syscall.GENERIC_WRITE | 0x10000
-	// temporaryFileFlags 标记临时文件并在最后一个句柄关闭时删除
-	temporaryFileFlags = 0x100 | 0x04000000
+	temporaryFileFlags  = 0x100 | 0x04000000
 )
 
+// 原生IStream根表、虚函数表、缓存接口标识与常驻MTA调度状态
 var (
-	// streamRoots 持有活动原生流对象防止被垃圾回收
-	streamRoots sync.Map
-	// streamTable 保存原生IStream虚函数表地址
-	streamTable [14]uintptr
-	// mtaOnce 保证常驻COM MTA工作线程只初始化一次
-	mtaOnce sync.Once
-	// mtaQueue 接收需要在进程常驻MTA线程执行的FTM创建请求
-	mtaQueue chan mtaTask
-	// mtaErr 记录常驻MTA线程的初始化错误
-	mtaErr error
+	streamRoots         sync.Map
+	streamTable         [14]uintptr
+	iidUnknown          syscall.GUID
+	iidMarshal          syscall.GUID
+	iidStream           syscall.GUID
+	iidSequentialStream syscall.GUID
+	iidAgileObject      syscall.GUID
+	mtaMu               sync.Mutex
+	mtaQueue            chan mtaTask
 )
 
 // mtaTask 保存待常驻MTA线程执行的操作与结果Channel
@@ -68,7 +68,7 @@ type temporaryFile struct {
 	directory *temporaryDirectory
 }
 
-// responseSpool 为生产者和原生流提供有界内存的可寻址共享存储
+// responseSpool 为生产者和原生流提供基于可寻址流或临时文件的共享存储
 type responseSpool struct {
 	mu       sync.Mutex
 	file     io.ReadSeekCloser
@@ -105,7 +105,7 @@ type streamStat struct {
 	Reserved uint32
 }
 
-// init 固定原生流回调入口
+// init 固定原生流回调入口并缓存常用COM接口标识
 func init() {
 	streamTable = [14]uintptr{
 		syscall.NewCallback(streamQuery),
@@ -123,35 +123,64 @@ func init() {
 		syscall.NewCallback(streamGetStat),
 		syscall.NewCallback(streamClone),
 	}
+	iidUnknown = guid("{00000000-0000-0000-C000-000000000046}")
+	iidMarshal = guid("{00000003-0000-0000-C000-000000000046}")
+	iidStream = guid("{0000000C-0000-0000-C000-000000000046}")
+	iidSequentialStream = guid("{0C733A30-2A1C-11CE-ADE5-00AA0044773D}")
+	iidAgileObject = guid("{94EA2B94-E9CC-49E0-C0FF-EE64CA8F5B90}")
 }
 
-// runOnMTA 在进程常驻MTA线程执行操作，避免反复启停MTA破坏进程COM公寓
+// runOnMTA 在进程常驻MTA线程执行操作并隔离异常，遇到被污染的STA线程时销毁重试
 // 入参: fn 待执行操作
 // 返回: error 初始化或执行错误
 func runOnMTA(fn func() error) error {
-	mtaOnce.Do(func() {
-		ready := make(chan error, 1)
-		queue := make(chan mtaTask)
-		go func() {
-			runtime.LockOSThread()
-			hr, _, _ := ole32.NewProc("CoInitializeEx").Call(0, 0)
-			if err := hresult(hr); err != nil && uint32(hr) != 0x80010106 {
-				ready <- err
-				return
+	mtaMu.Lock()
+	queue := mtaQueue
+	if queue == nil {
+		var lastErr error
+		for range 8 {
+			ready := make(chan uintptr, 1)
+			candidate := make(chan mtaTask)
+			go func() {
+				runtime.LockOSThread()
+				hr, _, _ := ole32.NewProc("CoInitializeEx").Call(0, 0)
+				ready <- hr
+				if hresult(hr) != nil {
+					return
+				}
+				for task := range candidate {
+					var err error
+					func() {
+						defer func() {
+							if v := recover(); v != nil {
+								err = fmt.Errorf("MTA task panic: %v", v)
+							}
+						}()
+						err = task.fn()
+					}()
+					task.done <- err
+				}
+			}()
+			hr := <-ready
+			err := hresult(hr)
+			if err == nil {
+				queue = candidate
+				mtaQueue = candidate
+				break
 			}
-			mtaQueue = queue
-			ready <- nil
-			for task := range queue {
-				task.done <- task.fn()
+			lastErr = err
+			if uint32(hr) != 0x80010106 {
+				break
 			}
-		}()
-		mtaErr = <-ready
-	})
-	if mtaErr != nil {
-		return mtaErr
+		}
+		if queue == nil {
+			mtaMu.Unlock()
+			return lastErr
+		}
 	}
+	mtaMu.Unlock()
 	done := make(chan error, 1)
-	mtaQueue <- mtaTask{fn: fn, done: done}
+	queue <- mtaTask{fn: fn, done: done}
 	return <-done
 }
 
@@ -197,14 +226,21 @@ func streamQuery(self uintptr, iid *syscall.GUID, out *uintptr) (result uintptr)
 		return 0x80004005
 	}
 	g := *iid
-	if g == guid("{00000003-0000-0000-C000-000000000046}") && stream.marshal != nil {
-		return com(stream.marshal, 0, uintptr(unsafe.Pointer(iid)), uintptr(unsafe.Pointer(out)))
+	if g == iidMarshal && stream.marshal != nil {
+		if addRefPositive(&stream.refs) == 0 {
+			return 0x80004005
+		}
+		hr := com(stream.marshal, 0, uintptr(unsafe.Pointer(iid)), uintptr(unsafe.Pointer(out)))
+		streamRelease(self)
+		return hr
 	}
-	if g != guid("{00000000-0000-0000-C000-000000000046}") && g != guid("{0000000C-0000-0000-C000-000000000046}") && g != guid("{0C733A30-2A1C-11CE-ADE5-00AA0044773D}") && g != guid("{94EA2B94-E9CC-49E0-C0FF-EE64CA8F5B90}") {
+	if g != iidUnknown && g != iidStream && g != iidSequentialStream && g != iidAgileObject {
 		return 0x80004002
 	}
+	if addRefPositive(&stream.refs) == 0 {
+		return 0x80004005
+	}
 	*out = self
-	stream.refs.Add(1)
 	return 0
 }
 
@@ -221,10 +257,10 @@ func streamAddRef(self uintptr) (result uintptr) {
 	if !ok {
 		return 0
 	}
-	return uintptr(stream.refs.Add(1))
+	return uintptr(addRefPositive(&stream.refs))
 }
 
-// streamRelease 释放原生流引用并解除对象固定
+// streamRelease 释放原生流引用并在归零命中时解除对象固定
 // 入参: self 原生流地址
 // 返回: uintptr 引用计数
 func streamRelease(self uintptr) (result uintptr) {
@@ -237,12 +273,17 @@ func streamRelease(self uintptr) (result uintptr) {
 	if !ok {
 		return 0
 	}
-	refs := stream.refs.Add(-1)
-	if refs <= 0 {
-		streamRoots.Delete(self)
-		release(stream.marshal)
-		stream.spool.drop()
-		stream.pin.Unpin()
+	refs, decremented := releaseRefPositive(&stream.refs)
+	if !decremented {
+		return 0
+	}
+	if refs == 0 {
+		if _, loaded := streamRoots.LoadAndDelete(self); loaded {
+			release(stream.marshal)
+			stream.marshal = nil
+			stream.spool.drop()
+			stream.pin.Unpin()
+		}
 		return 0
 	}
 	return uintptr(refs)
@@ -295,7 +336,7 @@ func streamRead(self uintptr, buffer *byte, count uint32, read *uint32) (result 
 	if read != nil {
 		*read = uint32(n)
 	}
-	if err != nil && err != io.EOF {
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
 		return 0x8003001e
 	}
 	if uint32(n) < count {
@@ -491,7 +532,7 @@ func (d *temporaryDirectory) create(prefix string) (*temporaryFile, error) {
 			return nil, err
 		}
 		path := filepath.Join(d.path, fmt.Sprintf("%s%07d.tmp", prefix, n.Int64()))
-		handle, err := syscall.CreateFile(wide(path), temporaryFileAccess, syscall.FILE_SHARE_READ|syscall.FILE_SHARE_WRITE|syscall.FILE_SHARE_DELETE, nil, syscall.CREATE_NEW, temporaryFileFlags, 0)
+		handle, err := syscall.CreateFile(wide(path), temporaryFileAccess, 0, nil, syscall.CREATE_NEW, temporaryFileFlags, 0)
 		if err == syscall.ERROR_FILE_EXISTS || err == syscall.ERROR_ALREADY_EXISTS {
 			continue
 		}
