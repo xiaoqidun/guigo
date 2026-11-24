@@ -58,6 +58,7 @@ var (
 // nativeWindow 保存GTK线程拥有的窗口及页面状态
 type nativeWindow struct {
 	options                                          Options
+	title                                            string
 	windowID                                         uintptr
 	mu                                               sync.Mutex
 	queue                                            []linuxJob
@@ -188,9 +189,9 @@ func run(parent context.Context, o Options) error {
 
 // runLinux 创建GTK窗口并运行原生事件循环
 // 入参: parent 运行上下文, o 宿主选项
-// 返回: bool 是否需要执行OnClose, error 启动或上下文错误
-func runLinux(parent context.Context, o Options) (bool, error) {
-	n := &nativeWindow{options: o, windowID: uintptr(linuxWindowIDs.Add(1)), titleBarColors: o.TitleBarColors, bridgeToken: rand.Text(), receiveToken: rand.Text(), done: make(chan struct{}), resources: make(map[uintptr]bool), dialogsPending: make(map[uintptr]*linuxDialog)}
+// 返回: onCloseReady 是否需要执行OnClose, err 启动或上下文错误
+func runLinux(parent context.Context, o Options) (onCloseReady bool, err error) {
+	n := &nativeWindow{options: o, title: o.Title, windowID: uintptr(linuxWindowIDs.Add(1)), titleBarColors: o.TitleBarColors, bridgeToken: rand.Text(), receiveToken: rand.Text(), done: make(chan struct{}), resources: make(map[uintptr]bool), dialogsPending: make(map[uintptr]*linuxDialog)}
 	active.Store(n)
 	defer active.Store(nil)
 	if err := parent.Err(); err != nil {
@@ -352,6 +353,7 @@ func runLinux(parent context.Context, o Options) (bool, error) {
 		}
 		n.readyWG.Wait()
 		n.titleBarWG.Wait()
+		onCloseReady = n.onCloseReady.Load()
 	}()
 	defer n.shutdown()
 	stopCancel := context.AfterFunc(n.ctx, func() { _ = n.enqueue(n.shutdown) })
@@ -739,7 +741,7 @@ func openURL(raw string) error {
 	return linuxOpenURL(raw)
 }
 
-// linuxPolicy 限制页面导航到受信来源，仅允许用户手势触发的顶层或新窗口外链打开外部浏览器
+// linuxPolicy 限制页面导航到受信来源，允许顶层或新窗口外链打开外部浏览器
 // 入参: view 浏览器对象, decision 导航决策, kind 决策类型, data 用户数据
 // 返回: uintptr 是否已经处理
 func linuxPolicy(view, decision uintptr, kind int32, data uintptr) uintptr {
@@ -759,9 +761,8 @@ func linuxPolicy(view, decision uintptr, kind int32, data uintptr) uintptr {
 	if !externalURL(uri) || localURL(uri) {
 		return 1
 	}
-	userGesture := gtk.ActionUserGesture(action) != 0
 	frameName := nativeString(gtk.ActionFrameName(action))
-	if userGesture && (kind == 1 || frameName == "" || frameName == "_self" || frameName == "_top") {
+	if kind == 1 || frameName == "" || frameName == "_self" || frameName == "_top" {
 		go func() {
 			if err := openURL(uri); err != nil {
 				n.reportError(err)
@@ -1052,12 +1053,24 @@ func (n *nativeWindow) shutdown() {
 	}
 }
 
-// setTitle 修改原生窗口标题
+// currentTitle 读取当前窗口标题副本
+// 返回: string 当前窗口标题
+func (n *nativeWindow) currentTitle() string {
+	n.mu.Lock()
+	title := n.title
+	n.mu.Unlock()
+	return title
+}
+
+// setTitle 修改原生窗口标题并更新标题缓存
 // 入参: title 标题
 // 返回: error 关闭错误
 func (n *nativeWindow) setTitle(title string) error {
 	return n.invoke(func() error {
 		gtk.Title(n.window, title)
+		n.mu.Lock()
+		n.title = title
+		n.mu.Unlock()
 		return nil
 	})
 }

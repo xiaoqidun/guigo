@@ -70,7 +70,13 @@ type linuxPrintOperation struct {
 func linuxPrintFailed(operation uintptr, failure *linuxError, _ uintptr) {
 	if value, ok := linuxPrintOperations.Load(operation); ok {
 		job := value.(*linuxPrintOperation)
-		if failure != nil && failure.Message != nil {
+		if failure != nil && failure.Domain == gtk.PrintErrorQuark() && failure.Code == 500 {
+			if failure.Message != nil {
+				job.err = fmt.Errorf("%w: %s", ErrPrinterNotFound, nativeString(failure.Message))
+			} else {
+				job.err = ErrPrinterNotFound
+			}
+		} else if failure != nil && failure.Message != nil {
 			job.err = fmt.Errorf("printing failed: %s", nativeString(failure.Message))
 		} else {
 			job.err = fmt.Errorf("printing failed")

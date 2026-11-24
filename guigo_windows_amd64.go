@@ -136,6 +136,7 @@ type eventToken struct {
 // nativeWindow 保存STA线程拥有的原生对象
 type nativeWindow struct {
 	options          Options
+	title            string
 	bridgeToken      string
 	threadID         uint32
 	mu               sync.Mutex
@@ -457,7 +458,7 @@ func buildWindowsBridgeScript(token string, dropEnabled bool) string {
 // 入参: parent 运行上下文, o 宿主选项
 // 返回: error 启动或运行错误
 func run(parent context.Context, o Options) error {
-	n := &nativeWindow{options: o, bridgeToken: rand.Text(), done: make(chan struct{})}
+	n := &nativeWindow{options: o, title: o.Title, bridgeToken: rand.Text(), done: make(chan struct{})}
 	if !active.CompareAndSwap(nil, n) {
 		return ErrAlreadyRunning
 	}
@@ -1211,7 +1212,16 @@ func (n *nativeWindow) emit(raw string) error {
 	})
 }
 
-// setTitle 设置原生标题
+// currentTitle 读取当前窗口标题副本
+// 返回: string 当前窗口标题
+func (n *nativeWindow) currentTitle() string {
+	n.mu.Lock()
+	title := n.title
+	n.mu.Unlock()
+	return title
+}
+
+// setTitle 设置原生标题并更新标题缓存
 // 入参: title 窗口标题
 // 返回: error 设置错误
 func (n *nativeWindow) setTitle(title string) error {
@@ -1220,6 +1230,9 @@ func (n *nativeWindow) setTitle(title string) error {
 		if r == 0 {
 			return e
 		}
+		n.mu.Lock()
+		n.title = title
+		n.mu.Unlock()
 		return nil
 	})
 }
@@ -1508,6 +1521,9 @@ func (n *nativeWindow) setup() error {
 			}
 			if hasStatus && status == 14 {
 				if !n.contentCommitted {
+					if !n.initialLoaded && !n.closeRequested && !n.quitting {
+						n.fail(errors.New("navigation canceled"))
+					}
 					return 0
 				}
 			} else {
@@ -1518,6 +1534,7 @@ func (n *nativeWindow) setup() error {
 					release(args2)
 				}
 				if httpStatus <= 0 {
+					n.contentCommitted = false
 					if !n.initialLoaded {
 						n.fail(errors.New("navigation failed"))
 					}

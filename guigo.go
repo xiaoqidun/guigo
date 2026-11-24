@@ -110,7 +110,7 @@ type TitleBarInfo struct {
 
 // Options 定义窗口、资源和生命周期配置，客户区尺寸单位为逻辑像素，路径前缀/__guigo/由宿主保留
 // Instance传入OpenInstance返回的窗口入口并由调用方关闭；AppID与UserDataDir至少设置其一
-// TitleBarColors非零时需启用TitleBarContent并提供全部四种颜色；WindowMaterial非纯色需系统支持
+// TitleBarColors非零时需启用TitleBarContent并提供全部四种颜色；WindowMaterial非纯色需系统支持，否则返回ErrUnsupportedPlatform
 // Icon与IconPath互斥，均要求边长不超过2048像素且不超过16MiB的正方形PNG
 // Width/Height零值默认1024x768，Min/Max零值不限，FixedSize生效时忽略Maximized
 // Handler非空时忽略FS，ResourceHandler返回nil, nil时回退到Handler或FS
@@ -148,7 +148,7 @@ type Options struct {
 	OnError           func(error)
 }
 
-// Resource 提供已就绪的可寻址响应流，StatusCode零值默认200，Body所有权交给宿主并由宿主关闭
+// Resource 提供已就绪的可寻址响应流，StatusCode零值默认200，为204或304时允许Body为nil，非空Body所有权交给宿主并由宿主关闭
 // ResourceHandler返回nil, nil时回退到Handler或FS，范围请求需由处理器提供对应状态与区间内容
 type Resource struct {
 	StatusCode int
@@ -162,7 +162,7 @@ type FileFilter struct {
 	Pattern string
 }
 
-// DialogOptions 定义原生文件对话框标题、初始路径、默认文件名及文件类型过滤
+// DialogOptions 定义原生文件对话框标题、初始路径、默认文件名及文件类型过滤，OpenDirectory忽略DefaultName与Filters
 type DialogOptions struct {
 	Title       string
 	DefaultPath string
@@ -488,6 +488,7 @@ func (e *BridgeError) Error() string {
 }
 
 // Emit 向页面发送命名事件，前端通过window.guigo.on(name, listener)订阅，返回值表示已交给宿主而非已消费
+// 首屏就绪前最多缓存1024条待发事件，超限返回错误
 // 入参: name 非空事件名称, value 可JSON编码的数据
 // 返回: error 错误信息
 func (w *Window) Emit(name string, value any) error {
@@ -568,7 +569,7 @@ func (w *Window) SetTitleBarColors(colors TitleBarColors) error {
 	return w.native.setTitleBarColors(colors)
 }
 
-// SetWindowMaterial 更新窗口背景材质，空值视为WindowSolid，不支持的材质返回错误
+// SetWindowMaterial 更新窗口背景材质，空值视为WindowSolid，不支持的材质返回ErrUnsupportedPlatform
 // 入参: material 窗口材质，纯色关闭系统背景材质
 // 返回: error 材质或窗口错误
 func (w *Window) SetWindowMaterial(material WindowMaterial) error {

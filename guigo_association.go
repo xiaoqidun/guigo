@@ -40,7 +40,7 @@ type FileAssociation struct {
 	Extensions []string
 }
 
-// AssociationOptions 定义应用专用文件关联资源，由调用方保持标识和类型集合稳定
+// AssociationOptions 定义应用专用文件关联资源，重登和撤销会清理旧登记残留
 // Executable为程序绝对路径，Arguments为文件路径前的固定参数，撤销会整树删除专用键
 type AssociationOptions struct {
 	AppID       string

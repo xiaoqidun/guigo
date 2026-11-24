@@ -95,6 +95,7 @@ type linuxAPI struct {
 	IOErrorQuark        func() uint32                                                             `symbol:"g_io_error_quark"`
 	NetworkErrorQuark   func() uint32                                                             `symbol:"webkit_network_error_quark"`
 	PolicyErrorQuark    func() uint32                                                             `symbol:"webkit_policy_error_quark"`
+	PrintErrorQuark     func() uint32                                                             `symbol:"webkit_print_error_quark"`
 	UnixInput           func(int32, int32) uintptr                                                `symbol:"g_unix_input_stream_new"`
 	Init                func() int32                                                              `symbol:"gtk_init_check"`
 	Major               func() uint32                                                             `symbol:"gtk_get_major_version"`
@@ -220,7 +221,6 @@ type linuxAPI struct {
 	NavigationAction    func(uintptr) uintptr                                                     `symbol:"webkit_navigation_policy_decision_get_navigation_action"`
 	ActionRequest       func(uintptr) uintptr                                                     `symbol:"webkit_navigation_action_get_request"`
 	ActionFrameName     func(uintptr) *byte                                                       `symbol:"webkit_navigation_action_get_frame_name"`
-	ActionUserGesture   func(uintptr) int32                                                       `symbol:"webkit_navigation_action_is_user_gesture"`
 	NavigationURI       func(uintptr) string                                                      `symbol:"webkit_uri_request_get_uri"`
 	PolicyIgnore        func(uintptr)                                                             `symbol:"webkit_policy_decision_ignore"`
 	DropNew             func(uintptr, uint32) uintptr                                             `symbol:"gtk_drop_target_new"`

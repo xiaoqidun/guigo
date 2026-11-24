@@ -320,7 +320,7 @@ func linuxTrayProperty(connection uintptr, sender, path, iface, property *byte, 
 // 入参: ctx 调用上下文, options 托盘配置
 // 返回: *Tray 托盘句柄, error 初始化错误
 func (n *nativeWindow) newTray(ctx context.Context, options TrayOptions) (*Tray, error) {
-	options, err := prepareTray(options, n.options.Title, n.iconData)
+	options, err := prepareTray(options, n.currentTitle(), n.iconData)
 	if err != nil {
 		return nil, err
 	}
@@ -539,7 +539,7 @@ func (t *linuxTray) runTrayCallback(fn func()) {
 // 入参: ctx 调用上下文, options 完整新配置
 // 返回: error 配置或通信错误
 func (t *linuxTray) setOptions(ctx context.Context, options TrayOptions) error {
-	options, err := prepareTray(options, t.owner.options.Title, t.owner.iconData)
+	options, err := prepareTray(options, t.owner.currentTitle(), t.owner.iconData)
 	if err != nil {
 		return err
 	}

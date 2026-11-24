@@ -76,7 +76,7 @@ func (n *nativeWindow) newTray(ctx context.Context, options TrayOptions) (*Tray,
 	if taskbarCreatedMessage() == 0 {
 		return nil, errors.New("cannot register taskbar notification")
 	}
-	options, err := prepareTray(options, n.options.Title, n.iconData)
+	options, err := prepareTray(options, n.currentTitle(), n.iconData)
 	if err != nil {
 		return nil, err
 	}
@@ -198,7 +198,7 @@ func (t *windowsTray) register() bool {
 // 入参: ctx 调用上下文, options 完整新配置
 // 返回: error 配置或系统错误
 func (t *windowsTray) setOptions(ctx context.Context, options TrayOptions) error {
-	options, err := prepareTray(options, t.owner.options.Title, t.owner.iconData)
+	options, err := prepareTray(options, t.owner.currentTitle(), t.owner.iconData)
 	if err != nil {
 		return err
 	}
