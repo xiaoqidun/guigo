@@ -308,7 +308,7 @@ func readStoredAssociations(root registry.Key, o AssociationOptions) (map[string
 		if err != nil {
 			continue
 		}
-		if strings.HasPrefix(progID, prefix) && !strings.ContainsAny(progID, "\\\x00") {
+		if len(progID) > len(prefix) && strings.EqualFold(progID[:len(prefix)], prefix) && !strings.ContainsAny(progID, "\\\x00") {
 			stored[ext] = progID
 		}
 	}
@@ -344,7 +344,7 @@ func queryAssociation(root registry.Key, o AssociationOptions) (AssociationStatu
 	for _, kind := range o.Types {
 		id := o.AppID + "." + kind.ID
 		for _, ext := range kind.Extensions {
-			expectedExt[ext] = id
+			expectedExt[strings.ToLower(ext)] = id
 		}
 	}
 	stored, err := readStoredAssociations(root, o)
@@ -353,7 +353,7 @@ func queryAssociation(root registry.Key, o AssociationOptions) (AssociationStatu
 	}
 	for ext, progID := range stored {
 		status.Registered = true
-		if expectedExt[ext] != progID {
+		if expected, ok := expectedExt[strings.ToLower(ext)]; !ok || !strings.EqualFold(expected, progID) {
 			complete = false
 		}
 	}
@@ -443,28 +443,29 @@ func registerAssociation(root registry.Key, o AssociationOptions) (result error)
 	newProgIDs := make(map[string]bool)
 	for _, kind := range o.Types {
 		id := o.AppID + "." + kind.ID
-		newProgIDs[id] = true
+		newProgIDs[strings.ToLower(id)] = true
 		for _, ext := range kind.Extensions {
-			newExt[ext] = id
+			newExt[strings.ToLower(ext)] = id
 		}
 	}
 	capabilityExt := associationPath(o) + `\Capabilities\FileAssociations`
-	staleProgIDs := make(map[string]bool)
+	staleProgIDs := make(map[string]string)
 	for ext, oldProgID := range oldStored {
-		if newProgID, ok := newExt[ext]; !ok {
+		lowerExt := strings.ToLower(ext)
+		if newProgID, ok := newExt[lowerExt]; !ok {
 			_ = writeAssociationValue(root, associationValue{path: capabilityExt, name: ext})
 			openWith := `Software\Classes\` + ext + `\OpenWithProgids`
 			_ = writeAssociationValue(root, associationValue{path: openWith, name: oldProgID})
 			_ = removeAssociationEmptyKey(root, openWith)
-		} else if newProgID != oldProgID {
+		} else if !strings.EqualFold(newProgID, oldProgID) {
 			openWith := `Software\Classes\` + ext + `\OpenWithProgids`
 			_ = writeAssociationValue(root, associationValue{path: openWith, name: oldProgID})
 		}
-		if !newProgIDs[oldProgID] {
-			staleProgIDs[oldProgID] = true
+		if lowerOld := strings.ToLower(oldProgID); !newProgIDs[lowerOld] {
+			staleProgIDs[lowerOld] = oldProgID
 		}
 	}
-	for oldProgID := range staleProgIDs {
+	for _, oldProgID := range staleProgIDs {
 		_ = removeAssociationTree(root, `Software\Classes\`+oldProgID)
 	}
 	return nil
@@ -496,23 +497,23 @@ func unregisterAssociation(root registry.Key, o AssociationOptions) error {
 		result = errors.Join(result, err)
 	}
 	result = errors.Join(result, writeAssociationValue(root, associationValue{path: `Software\RegisteredApplications`, name: o.AppID}))
-	progIDs := make(map[string]bool)
+	progIDs := make(map[string]string)
 	for ext, oldProgID := range oldStored {
 		openWith := `Software\Classes\` + ext + `\OpenWithProgids`
 		result = errors.Join(result, writeAssociationValue(root, associationValue{path: openWith, name: oldProgID}))
 		result = errors.Join(result, removeAssociationEmptyKey(root, openWith))
-		progIDs[oldProgID] = true
+		progIDs[strings.ToLower(oldProgID)] = oldProgID
 	}
 	for _, kind := range o.Types {
 		id := o.AppID + "." + kind.ID
-		progIDs[id] = true
+		progIDs[strings.ToLower(id)] = id
 		for _, extension := range kind.Extensions {
 			openWith := `Software\Classes\` + extension + `\OpenWithProgids`
 			result = errors.Join(result, writeAssociationValue(root, associationValue{path: openWith, name: id}))
 			result = errors.Join(result, removeAssociationEmptyKey(root, openWith))
 		}
 	}
-	for id := range progIDs {
+	for _, id := range progIDs {
 		result = errors.Join(result, removeAssociationTree(root, `Software\Classes\`+id))
 	}
 	return errors.Join(result, removeAssociationTree(root, associationPath(o)))
